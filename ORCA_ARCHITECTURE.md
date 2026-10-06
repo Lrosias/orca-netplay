@@ -131,10 +131,10 @@ match. Orca's design avoids needing that knowledge.
 
 ### Brawlback (Super Smash Bros. Brawl)
 
-Brawlback pioneered rollback for Brawl, and its research gave us a head start. Over time it moved to
-whole-console snapshots, like Orca. It kept Slippi's model of triggering saves and loads from code
-inside the game, though, and its save and load happen at two different points in the frame. That
-combination means the CPU state can't be restored exactly, so a few pieces were left out:
+Brawlback pioneered rollback for Brawl, and its published research informed our first experiments.
+Over time it moved to whole-console snapshots, like Orca. It kept Slippi's model of triggering saves
+and loads from code inside the game, though, and its save and load happen at two different points in
+the frame. That combination means the CPU state can't be restored exactly, so a few pieces were left out:
 
 - the CPU registers and stack;
 - the audio state;
@@ -144,11 +144,12 @@ The rest of the design works around those differences. It uses about 16 hooks: s
 Brawl's code that call into the emulator. They skip the draw call on replays, cut graphics waits
 short and keep random seeds in sync.
 
-Orca's first prototype was built from Brawlback's code. When we ran our byte-for-byte test on it,
-every replayed frame differed in memory from the original. Restoring the missing pieces fixed that.
-On top of an exact restore, two of the hooks turned out to change the match by themselves: the draw
-skip and the shortened graphics waits. These are findings from our prototype under our test; we
-can't say which of them, if any, caused the desyncs Brawlback's players saw.
+Our first experiment, before Orca existed, ran our byte-for-byte test on Brawlback's approach. Every
+replayed frame differed in memory from the original, and restoring the missing pieces fixed that.
+With an exact restore, two of the hooks turned out to change the match by themselves: the draw skip
+and the shortened graphics waits. These are findings from that experiment under our test; we can't
+say which of them, if any, caused the desyncs Brawlback's players saw. What we learned there led to
+Orca's design, which we then built on current Dolphin with our own rollback code.
 
 ### Side by side
 
@@ -210,4 +211,5 @@ can't say which of them, if any, caused the desyncs Brawlback's players saw.
 > we could fix."
 
 **What not to say:** that Brawlback "did it wrong", or that Orca is faster per frame. Brawlback's
-research is a big part of why Orca came together quickly, and we haven't measured the speed claim.
+research informed the experiments that led to Orca's design, and we haven't measured the speed
+claim.
