@@ -112,8 +112,16 @@ struct CssHand
   u32 button = 0;
   float x = 0;
   float y = 0;
+  // The panel (0-3) whose button the hand points at (+0xB0; found under the harness, both games:
+  // port 1's hand over panel 2's player-type button reads 1, port 2's over its own 1), or -1 where
+  // it can't be read.
+  int panel = -1;
   bool operator==(const CssHand&) const = default;
 };
+// Port `port`'s (0-3) player area on the character select (muSelCharPlayerArea, at the select
+// task's +0x44 + 4 x port), or 0 anywhere else or before the task is built. Callers check the
+// fields they read.
+u32 ReadCssArea(const GuestMemory& memory, int port);
 // Port `port`'s (0-3) hand on the character select; invalid anywhere else.
 CssHand ReadCssHand(const GuestMemory& memory, int port);
 // Whether A may reach the game from this hand while the locks hold. `bottom` is the game's lower

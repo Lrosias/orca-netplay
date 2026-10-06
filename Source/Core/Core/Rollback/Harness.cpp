@@ -63,6 +63,17 @@ int EnvInt(const char* name, int fallback)
 }
 
 const int s_scenes = EnvInt("YG_SCENES", 0);
+// ORCA_UX_TEST_RESEAT_AT=<frame> (harness runs, not online): the player plays port 2 until that
+// frame and port 1 from it, the other port reporting no controller, as a former joiner does when it
+// comes home (OnlineMatch.cpp ComeHome). Port 1's script rules drive whichever port the player is
+// on. Returns the player's port (0 or 1) for `frame`, or -1 without the knob.
+int ReseatLocalPort(int frame)
+{
+  static const int s_at = EnvInt("ORCA_UX_TEST_RESEAT_AT", -1);
+  if (s_at < 0 || Orca::Online::Enabled())
+    return -1;
+  return frame < s_at ? 1 : 0;
+}
 const int s_synctest_k = EnvInt("YG_SYNCTEST", 0);
 const int s_synctest_from = EnvInt("YG_SYNCTEST_FROM", 300);
 const int s_exit_after = EnvInt("YG_EXIT_AFTER", 0);
@@ -1073,18 +1084,91 @@ u16 ComboButtons(int frame, u16 buttons)
     NOTICE_LOG_FMT(ROLLBACK, "Harness: the YouGame shortcut (Up + Start) at frame {}", frame);
   return step.buttons;
 }
+
+// ORCA_UX_TEST_UNPLUG_AT=<frame>:<port> (port 2-4, harness runs only): that test port leaves at
+// that frame, as when a friend leaves: it drops out of the frame hook's ports and its pad reports
+// no controller (UNPLUGGED_PAD).
+struct TestUnplug
+{
+  int from = -1;
+  int port = -1;  // 0-based
+};
+
+const TestUnplug& TestUnplugSpec()
+{
+  static const TestUnplug s_unplug = [] {
+    TestUnplug out;
+    const std::string spec = Orca::GetEnv("ORCA_UX_TEST_UNPLUG_AT");
+    if (spec.empty())
+      return out;
+    int from = -1, port = -1;
+    if (std::sscanf(spec.c_str(), "%d:%d", &from, &port) == 2 && from >= 0 && port >= 2 &&
+        port <= 4)
+    {
+      out.from = from;
+      out.port = port - 1;
+      NOTICE_LOG_FMT(ROLLBACK, "ORCA_UX_TEST_UNPLUG_AT: port {} leaves at frame {}", port, from);
+    }
+    else
+    {
+      ERROR_LOG_FMT(ROLLBACK, "ORCA_UX_TEST_UNPLUG_AT={}: not <frame>:<port 2-4>", spec);
+    }
+    return out;
+  }();
+  return s_unplug;
+}
+
+bool TestUnplugged(int port, int frame)
+{
+  const TestUnplug& u = TestUnplugSpec();
+  return u.from >= 0 && port == u.port && frame >= u.from && SnapshotModesAllowed();
+}
+
+// Whether test port `port` (0-based) reports no controller for `frame`: one that left
+// (ORCA_UX_TEST_UNPLUG_AT), and with ORCA_UX_TEST_PADS_FOLLOW_PLUGS=1 any port outside the frame
+// hook's ports for that frame (beyond ORCA_UX_TEST_NAMES, or before ORCA_UX_TEST_PLUG_AT), as in a
+// session. Port 1 always has its pad. Not for ORCA_TEST_QUEUE_PICK.
+bool TestPortUnplugged(int port, int frame)
+{
+  if (TestUnplugged(port, frame))
+    return true;
+  static const bool s_follow = Orca::GetEnv("ORCA_UX_TEST_PADS_FOLLOW_PLUGS") == "1";
+  if (!s_follow || port <= 0 || !SnapshotModesAllowed())
+    return false;
+  static const int s_names = [] {
+    const std::string names = Orca::GetEnv("ORCA_UX_TEST_NAMES");
+    if (names.empty())
+      return 1;
+    return std::min<int>(4, 1 + static_cast<int>(std::count(names.begin(), names.end(), ',')));
+  }();
+  static const int s_plug_at = EnvInt("ORCA_UX_TEST_PLUG_AT", -1);
+  if (port >= s_names)
+    return true;
+  return s_plug_at >= 0 && frame < s_plug_at;
+}
 }  // namespace
 
 std::optional<GCPadStatus> InputOverride(int port)
 {
+  // A test port nobody plugged in reports no controller, scripted or not.
+  if (TestPortUnplugged(port, s_frame))
+    return Orca::Net::DecodePad(Orca::Net::UNPLUGGED_PAD);
   if (Input().empty())
     return std::nullopt;
   const int f = s_frame;
+  // ORCA_UX_TEST_RESEAT_AT: port 1's rules play the player's port; the other reports no controller.
+  int rules_port = port;
+  if (const int local = ReseatLocalPort(f); local >= 0 && port < 2)
+  {
+    if (port != local)
+      return Orca::Net::DecodePad(Orca::Net::UNPLUGGED_PAD);
+    rules_port = 0;
+  }
   u16 buttons = 0;
   int sx = 128, sy = 128, cx = 128, cy = 128;
   for (const InputRule& r : Input())
   {
-    if (r.port != port)
+    if (r.port != rules_port)
       continue;
     int rf = f;  // frame in the rule's from/to terms
     if (!r.scene.empty())
@@ -1239,9 +1323,21 @@ void OnFrameBoundary(const Core::CPUThreadGuard& guard)
     // drops in.
     static const int s_plug_at = EnvInt("ORCA_UX_TEST_PLUG_AT", -1);
     const bool early = s_plug_at >= 0 && frame_here + 1 < s_plug_at && s_test_ports.size() > 1;
-    const std::vector<Orca::Events::PortInfo> base_ports =
+    std::vector<Orca::Events::PortInfo> base_ports =
         early ? std::vector<Orca::Events::PortInfo>(s_test_ports.begin(), s_test_ports.begin() + 1) :
                 s_test_ports;
+    // ORCA_UX_TEST_RESEAT_AT: only the player's port, as in a former joiner's solo game.
+    if (const int local = ReseatLocalPort(frame_here + 1); local >= 0)
+    {
+      Orca::Events::PortInfo own = s_test_ports.front();
+      own.port = local;
+      own.remote = false;
+      base_ports = {own};
+    }
+    // ORCA_UX_TEST_UNPLUG_AT=<frame>:<port>: that port leaves from that frame (TestUnplugged).
+    std::erase_if(base_ports, [&](const Orca::Events::PortInfo& p) {
+      return TestUnplugged(p.port, frame_here + 1);
+    });
     // ORCA_TEST_QUEUE_PICK=<frame>:<char>:<costume>:<x>:<y>[:<rating>]: port 2 plugs in at that
     // frame with that queue identity, as a matched player does.
     struct TestPick

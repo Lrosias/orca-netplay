@@ -102,6 +102,7 @@ constexpr u32 HAND_TARGET = 0x80;
 constexpr u32 HAND_X = 0x90;
 constexpr u32 HAND_Y = 0x94;
 constexpr u32 HAND_BUTTON = 0xAC;
+constexpr u32 HAND_PANEL = 0xB0;
 
 constexpr const char* SCENE_CSS = "scSelctCharacter";
 constexpr const char* SCENE_SSS = "scSelStage";
@@ -592,23 +593,26 @@ Rollback::InputGate::Masks SessionMasks(const GuestMemory& m)
   return masks;
 }
 
+u32 ReadCssArea(const GuestMemory& m, int port)
+{
+  if (port < 0 || port >= 4 || ReadSceneName(m) != SCENE_CSS || !Pointer(m, SCENE_MANAGER))
+    return 0;
+  const u32 manager = m.Read32(SCENE_MANAGER);
+  if (!Pointer(m, manager + MANAGER_SCENE))
+    return 0;
+  const u32 scene = m.Read32(manager + MANAGER_SCENE);
+  if (!Pointer(m, scene + SCENE_SELCHAR_TASK))
+    return 0;
+  const u32 task = m.Read32(scene + SCENE_SELCHAR_TASK);
+  const u32 area_at = task + TASK_AREAS + 4 * static_cast<u32>(port);
+  return Pointer(m, area_at) ? m.Read32(area_at) : 0;
+}
+
 CssHand ReadCssHand(const GuestMemory& m, int port)
 {
   CssHand hand;
-  if (port < 0 || port >= 4 || ReadSceneName(m) != SCENE_CSS || !Pointer(m, SCENE_MANAGER))
-    return hand;
-  const u32 manager = m.Read32(SCENE_MANAGER);
-  if (!Pointer(m, manager + MANAGER_SCENE))
-    return hand;
-  const u32 scene = m.Read32(manager + MANAGER_SCENE);
-  if (!Pointer(m, scene + SCENE_SELCHAR_TASK))
-    return hand;
-  const u32 task = m.Read32(scene + SCENE_SELCHAR_TASK);
-  const u32 area_at = task + TASK_AREAS + 4 * static_cast<u32>(port);
-  if (!Pointer(m, area_at))
-    return hand;
-  const u32 area = m.Read32(area_at);
-  if (!Pointer(m, area + AREA_HAND))
+  const u32 area = ReadCssArea(m, port);
+  if (!area || !Pointer(m, area + AREA_HAND))
     return hand;
   const u32 p = m.Read32(area + AREA_HAND);
   if (!Pointer(m, p + HAND_TARGET) || !Pointer(m, p + HAND_X) || !Pointer(m, p + HAND_Y) ||
@@ -619,6 +623,11 @@ CssHand ReadCssHand(const GuestMemory& m, int port)
   hand.valid = true;
   hand.target = m.Read32(p + HAND_TARGET);
   hand.button = m.Read32(p + HAND_BUTTON);
+  if (Pointer(m, p + HAND_PANEL))
+  {
+    const u32 panel = m.Read32(p + HAND_PANEL);
+    hand.panel = panel < 4 ? static_cast<int>(panel) : -1;
+  }
   hand.x = std::bit_cast<float>(m.Read32(p + HAND_X));
   hand.y = std::bit_cast<float>(m.Read32(p + HAND_Y));
   return hand;
@@ -645,20 +654,8 @@ bool CssHandMayPressA(const CssHand& hand, float bottom)
 CssToken ReadCssToken(const GuestMemory& m, int port)
 {
   CssToken token;
-  if (port < 0 || port >= 4 || ReadSceneName(m) != SCENE_CSS || !Pointer(m, SCENE_MANAGER))
-    return token;
-  const u32 manager = m.Read32(SCENE_MANAGER);
-  if (!Pointer(m, manager + MANAGER_SCENE))
-    return token;
-  const u32 scene = m.Read32(manager + MANAGER_SCENE);
-  if (!Pointer(m, scene + SCENE_SELCHAR_TASK))
-    return token;
-  const u32 task = m.Read32(scene + SCENE_SELCHAR_TASK);
-  const u32 area_at = task + TASK_AREAS + 4 * static_cast<u32>(port);
-  if (!Pointer(m, area_at))
-    return token;
-  const u32 area = m.Read32(area_at);
-  if (!Pointer(m, area + AREA_KIND) || !Pointer(m, area + AREA_CHARACTER) ||
+  const u32 area = ReadCssArea(m, port);
+  if (!area || !Pointer(m, area + AREA_KIND) || !Pointer(m, area + AREA_CHARACTER) ||
       !m.Valid(area + AREA_FLYING))
   {
     return token;

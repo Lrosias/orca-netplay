@@ -498,6 +498,12 @@ bool DropInPending()
   return s_prepare_join.load(std::memory_order_relaxed) || room->ArrivalPending();
 }
 
+bool ArrivalPending()
+{
+  const auto room = Room();
+  return room && room->GetState() != Net::RoomState::Ended && room->ArrivalPending();
+}
+
 int RoundTripMs(u32* sequence)
 {
   const auto room = Room();

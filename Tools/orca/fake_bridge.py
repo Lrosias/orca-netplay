@@ -21,6 +21,9 @@
 #                        without it, A is tapped every 2 s
 #   FAKE_PAD_LOOP        seconds after which the script starts over (default never)
 #   FAKE_PAD_GAMEPAD=1   send the script as a standard gamepad (W3C button indices) instead
+#   FAKE_PAD_LIVE=1      no script: the pad is neutral until a test sets it with POST /test-pad
+#                        {"buttons": <wire mask>, "axes": [x, y, cx, cy]} (authed); each holds
+#                        until the next
 # Wire mask: A 1, B 2, X 4, Y 8, Left 16, Right 32, Down 64, Up 128, Start 256, Z 512, R 1024, L 2048.
 import json, os, sys, threading, time, urllib.request, random, string, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,7 +44,12 @@ def helper_ms():
     t = time.time()
     return t * 1000 + HELPER_SKEW_MS + (t - STARTED) * 1000 * HELPER_DRIFT
 
+PAD_LIVE = os.environ.get("FAKE_PAD_LIVE") == "1"
+live_pad = {"buttons": 0, "axes": [128, 128, 128, 128]}
+
 def pad_script():
+    if PAD_LIVE:
+        return [{"t": 0, "buttons": 0}], 0.0
     path = os.environ.get("FAKE_PAD_SCRIPT")
     if not path:
         return [{"t": 0, "buttons": 0}, {"t": 1.9, "buttons": 1}, {"t": 2.0, "buttons": 0}], 2.0
@@ -88,6 +96,12 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code); self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(body))); self.end_headers(); self.wfile.write(body)
     def do_POST(self):
+        if self.path == "/test-pad" and self.authed() and PAD_LIVE:
+            msg = json.loads(self.rfile.read(int(self.headers["content-length"])))
+            with lock:
+                live_pad["buttons"] = int(msg.get("buttons", 0))
+                live_pad["axes"] = list(msg.get("axes", [128, 128, 128, 128]))
+            return self.reply(200, {"ok": True})
         if self.path != "/sdk" or not self.authed(): return self.reply(401, {"ok": False, "error": "no"})
         msg = json.loads(self.rfile.read(int(self.headers["content-length"])))
         t = msg.get("type")
@@ -138,6 +152,8 @@ class H(BaseHTTPRequestHandler):
                 step = steps[0]
                 for s in steps:
                     if s["t"] <= t: step = s
+                if PAD_LIVE:
+                    with lock: step = dict(live_pad)
                 seq += 1
                 event = {"type": "controllers", "snapshot": snapshot(session, seq, step, helper_ms())}
                 self.wfile.write(("data: " + json.dumps(event) + "\n\n").encode()); self.wfile.flush()

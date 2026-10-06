@@ -119,6 +119,9 @@ bool TakePrepareJoin();
 // is up, or the app's join or leave once its caps allow them. Ends a solo pause
 // (Rollback::OnlineMatch::SoloPauseAllowed). Any thread; never blocks for long.
 bool DropInPending();
+// Host: only the arrival half of DropInPending: a friend has arrived in the room and isn't taken
+// yet, while the room is up. Any thread.
+bool ArrivalPending();
 
 // Latest round trip to the room server in ms (-1 before the first). `sequence`, if given, changes
 // with each new measurement: feed Session::OnRoundTrip only when it changed.

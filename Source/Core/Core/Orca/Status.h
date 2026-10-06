@@ -10,7 +10,8 @@
 
 // Machine-readable status lines for the YouGame desktop app, printed on stdout in a session:
 //   orca state booting|lobby|playing|ended, plus drop-in states: joining <percent>, friend-joining,
-//     friend-joined, friend-left <why>, host-left, left, no-room, friend-holding, friend-waiting
+//     friend-joined, friend-left <why>, host-left, left, left lobby, no-room, friend-holding,
+//     friend-waiting ("left lobby": the host left its friends for a With Anyone queue pick)
 //   orca error <code> <sentence for the player>
 //   orca menu <event>       a pick in the game's own Online menu
 //   orca result <json>      a matchmade room's verdict (with the app's "results")
@@ -26,7 +27,9 @@ void State(std::string_view state);
 void Event(std::string_view state);
 void Error(std::string_view code, std::string_view sentence);
 // "orca menu <event>": "online casual", "online ranked" (with "local" appended when the app lacks
-// "host"), "online friends", or "cancel". An event, not a state: each pick prints once.
+// "host", or "kept" when a host keeps its friends because the app can't search that queue:
+// PICK_CAPS), "online friends", or "cancel". An event, not a state: each pick prints once (a kept
+// pick prints again, armed, once the friends are gone).
 void Menu(std::string_view event);
 // "orca result <json>" (with the "results" capability): a matchmade room's verdict on a game or a
 // ranked set. The whole line must fit in 300 bytes, the app's limit.
@@ -38,8 +41,9 @@ void Line(std::string_view line);
 void Report(std::string_view code, std::string_view sentence);
 
 // Capabilities: this build's list is printed once as "orca caps <list>" before "ready", and the app
-// sends its own as "caps <list>" on stdin. A feature is on only when both list it. See ORCA.md,
-// "Embedding".
+// sends its own as "caps <list>" on stdin. A later "caps" line replaces the whole answer, and each
+// feature is read where it acts, so the app may answer again mid-run. A feature is on only when
+// both list it. See ORCA.md, "Embedding".
 //   pause    Orca pauses a session while the player's game is alone in it
 //   delay    app may send "delay auto|1..6"
 //   perf     app may send "perf off|fps|detailed" (the frame meter)
@@ -58,7 +62,15 @@ inline constexpr const char* LOCKS_CAP = "locks";
 // `queue rating <n|->` and a ready timer. Offered with "locks"; when the app accepts it, Casual and
 // Ranked wait for `orca queue ready` before searching.
 inline constexpr const char* QUEUE2_CAP = "queue2";
-// This build's caps for the running profile: CAPS, plus "results" and "locks" where supported.
+// "pick-casual", "pick-ranked": the app can search that queue right now, and says so again on a
+// later "caps" line when that changes. A host with friends in its game leaves them for a With
+// Anyone pick only with that pick's cap; without it the pick prints in place, unarmed ("orca menu
+// online <queue> kept"), and arms once the friends are gone (Rollback/OnlineMatch.h
+// DecideLobbyPick, DecideKeptPick). Offered with "locks". A ruleset profile then offers 15 caps;
+// the app accepts at most 16.
+inline constexpr const char* PICK_CAPS = "pick-casual pick-ranked";
+// This build's caps for the running profile: CAPS, plus "results", "locks", "queue2" and the pick
+// caps where supported.
 std::string OfferedCaps();
 void PrintCaps();
 void SetAppCaps(std::string_view list);

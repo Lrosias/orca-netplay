@@ -18,6 +18,7 @@
 #include "Core/Orca/Session/Events.h"
 #include "Core/Orca/Session/Online.h"
 #include "Core/Orca/Status.h"
+#include "Core/Orca/UX/CssTitle.h"
 #include "Core/Orca/UX/MatchBlock.h"
 #include "Core/Orca/UX/NameTags.h"
 #include "Core/Orca/UX/Probe.h"
@@ -133,6 +134,7 @@ std::string_view MenuEventText(OnlinePick pick, bool queue)
 std::optional<OnlinePick> OnlineMenuReader::Boundary(const MenuState& state, bool resimulating,
                                                      bool alone, u64 resyncs)
 {
+  m_busy.reset();
   // Re-runs repeat frames already read, or ones a rollback undid.
   if (resimulating)
     return std::nullopt;
@@ -164,44 +166,141 @@ std::optional<OnlinePick> OnlineMenuReader::Boundary(const MenuState& state, boo
     return std::nullopt;
   m_seen = true;
   const std::optional<OnlinePick> pick = PickForExitCode(state.exit_code);
-  if (!pick || !alone)
+  if (!pick)
+    return std::nullopt;
+  // Made while friends play (or one is about to land): never announced, now or later; the session
+  // hears of it once (TakeBusyPick).
+  if (!alone)
+  {
+    m_busy = pick;
+    return std::nullopt;
+  }
+  return pick;
+}
+
+std::optional<OnlinePick> OnlineMenuReader::TakeBusyPick()
+{
+  return std::exchange(m_busy, std::nullopt);
+}
+
+namespace
+{
+// The frame hook's last first-run reading (CPU thread: the hook and the session's boundary).
+bool s_on_menus = false;
+// The main menu's exit to Casual or Ranked, while the game is between that menu and its next scene.
+std::optional<OnlinePick> s_leaving_pick;
+std::optional<OnlinePick> s_css_pick;
+std::optional<OnlinePick> s_lobby_pick;
+}  // namespace
+
+void AnnounceOnlinePick(OnlinePick pick, bool arm)
+{
+  // With the app's "host" capability, the queue searches while the player waits on the character
+  // select.
+  const bool queue = Orca::Status::Cap("host");
+  if (!arm)
+  {
+    // Kept: the friends stay, nothing starts, and the app knows this pick never searches here.
+    Orca::Status::Menu(fmt::format("{} kept", MenuEventText(pick, queue)));
+    return;
+  }
+  Orca::Status::Menu(MenuEventText(pick, queue));
+  // With `queue2` the app searches once the player is ready on the queue's own character select
+  // (UX/Queue.h). Without it, the search starts at the pick.
+  if (queue && pick != OnlinePick::Friends && Orca::Status::Cap("queue2"))
+  {
+    Search::End();
+    Queue::Begin(pick == OnlinePick::Ranked);
+  }
+  else if (queue && pick != OnlinePick::Friends)
+  {
+    Queue::End();
+    Search::Begin(pick == OnlinePick::Ranked);
+  }
+  else
+  {
+    Queue::End();
+    Search::End();
+  }
+}
+
+bool PickSearchable(OnlinePick pick)
+{
+  switch (pick)
+  {
+  case OnlinePick::Casual:
+    return Orca::Status::Cap("pick-casual");
+  case OnlinePick::Ranked:
+    return Orca::Status::Cap("pick-ranked");
+  case OnlinePick::Friends:
+    break;
+  }
+  return false;
+}
+
+std::optional<OnlinePick> TakeLobbyPick()
+{
+  return std::exchange(s_lobby_pick, std::nullopt);
+}
+
+bool MenusScene(std::string_view scene, std::string_view sequence)
+{
+  return (scene == "muMenuMain" || scene == "scSelctCharacter") && !SequenceHoldsDropIn(sequence);
+}
+
+bool OnTheMenus()
+{
+  return s_on_menus;
+}
+
+std::optional<OnlinePick> QueuePickForCssCode(u32 code)
+{
+  const std::optional<OnlinePick> pick = PickForExitCode(code);
+  if (pick == OnlinePick::Friends)
     return std::nullopt;
   return pick;
 }
 
+std::optional<OnlinePick> CssPick()
+{
+  return s_css_pick;
+}
+
+bool PickStands(OnlinePick pick)
+{
+  return s_leaving_pick == pick || s_css_pick == pick;
+}
+
 void ReadOnlineMenu(const Core::CPUThreadGuard& guard, bool resimulating, bool alone)
 {
+  // Whatever the session didn't take at the boundary it was seen is stale.
+  s_lobby_pick.reset();
   if (resimulating || !BrawlExecutable())
     return;
   static OnlineMenuReader s_reader;
   GuardMemory memory(guard);
   const MenuState state = ReadMenuState(memory);
-  // With the app's "host" capability, the queue searches while the player waits on the character
-  // select.
-  const bool queue = Orca::Status::Cap("host");
+  const std::string scene = ReadSceneName(memory);
+  s_on_menus = MenusScene(scene, ReadSequenceName(memory));
+  s_leaving_pick = state.where == MenuState::Where::Leaving ?
+                       QueuePickForCssCode(state.exit_code) :
+                       std::nullopt;
+  s_css_pick = scene == "scSelctCharacter" ? QueuePickForCssCode(CssTitle::ReadPick(memory)) :
+                                             std::nullopt;
   if (const auto pick = s_reader.Boundary(state, false, alone, Orca::Events::Resyncs()))
   {
     NOTICE_LOG_FMT(ROLLBACK, "Online menu: exit code {}: orca menu {}", state.exit_code,
-                   MenuEventText(*pick, queue));
-    Orca::Status::Menu(MenuEventText(*pick, queue));
-    // With `queue2` the app searches once the player is ready on the queue's own character select
-    // (UX/Queue.h). Without it, the search starts at the pick.
-    if (queue && *pick != OnlinePick::Friends && Orca::Status::Cap("queue2"))
-    {
-      Search::End();
-      Queue::Begin(*pick == OnlinePick::Ranked);
-    }
-    else if (queue && *pick != OnlinePick::Friends)
-    {
-      Queue::End();
-      Search::Begin(*pick == OnlinePick::Ranked);
-    }
-    else
-    {
-      Queue::End();
-      Search::End();
-    }
+                   MenuEventText(*pick, Orca::Status::Cap("host")));
+    AnnounceOnlinePick(*pick);
     return;
+  }
+  // Casual or Ranked picked with friends in this game (or one about to land): the session decides
+  // at this boundary, after the hook. With Friends while friends play stays theirs.
+  if (const auto busy = s_reader.TakeBusyPick(); busy && *busy != OnlinePick::Friends)
+  {
+    NOTICE_LOG_FMT(ROLLBACK, "Online menu: exit code {} ({}) while this game isn't alone",
+                   state.exit_code, MenuEventText(*busy, true));
+    s_lobby_pick = busy;
   }
   // Back on the main menu while searching, or while matched but still alone: the search is over.
   if (alone && state.where == MenuState::Where::Menu &&

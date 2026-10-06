@@ -23,8 +23,13 @@ class CPUThreadGuard;
 // file reads that pick and prints it on stdout ("orca menu online casual local", ...) for the app.
 //
 // Picks are read only on first runs, never on rollback re-runs, and announced only while this game
-// plays alone. After a resync (Events NoteResync) the reader starts over silently, so nothing stale
-// is printed.
+// plays alone. A Casual or Ranked pick made while it isn't alone (friends in it or about to land)
+// goes to the session instead (TakeLobbyPick): a host whose app can search that queue leaves its
+// friends and announces it, one that can't keeps them and announces it unarmed ("kept"), and a
+// joiner lets it go; once its host has left, it comes home on the character select that pick
+// opened and announces the pick that select holds (CssPick). Acting on a pick while inputs may
+// still be guessed is safe: the session ends at that boundary. After a resync (Events NoteResync)
+// the reader starts over silently, so nothing stale is printed.
 //
 // Scene manager at 0x805A0060: +4 the scene, whose name is at +0 ("muMenuMain", "scMemoryChange"
 // between scenes); +0x284 the main menu's exit code, written as the menu leaves.
@@ -92,6 +97,9 @@ public:
   // One frame. `resyncs` is Events::Resyncs(). Returns the pick to announce, if any.
   std::optional<OnlinePick> Boundary(const MenuState& state, bool resimulating, bool alone,
                                      u64 resyncs);
+  // The pick the last Boundary saw made while this game was not alone, which it never announces
+  // (the session decides what it means: TakeLobbyPick below). Once; the next Boundary forgets it.
+  std::optional<OnlinePick> TakeBusyPick();
 
 private:
   bool m_started = false;
@@ -100,7 +108,48 @@ private:
   bool m_from_menu = false;
   // This exit's code was already seen.
   bool m_seen = false;
+  std::optional<OnlinePick> m_busy;
 };
+
+// ---- Leaving the friends lobby for the queue, and coming home (ORCA.md "Drop-in", "Online
+// menu"). Casual and Ranked under With Anyone leave the friends lobby for a 2-player room the
+// matchmaker fills; a guest whose host left goes back to its own lobby. ----
+
+// Prints "orca menu online ..." for a pick ("... local" without the app's "host") and starts what
+// it means: the queue's own character select (with "queue2"), the search, or neither (Friends).
+// `arm` false prints the line alone, marked "kept": a host that keeps its friends because the app
+// can't search that queue now (PickSearchable), so the app says why and cancels, and nothing of the
+// queue reaches the friends' game.
+void AnnounceOnlinePick(OnlinePick pick, bool arm = true);
+
+// Whether the app can search this pick's queue right now ("pick-casual", "pick-ranked":
+// Orca::Status PICK_CAPS); never Friends. Any thread.
+bool PickSearchable(OnlinePick pick);
+
+// A Casual or Ranked pick the frame hook saw at this boundary while the game was not alone, which
+// nothing printed. The session takes it at the same boundary, after the hook: a host leaves its
+// friends for the queue and announces it (or, without the pick's cap, stays and announces it
+// unarmed); a joiner lets it go. Once. CPU thread.
+std::optional<OnlinePick> TakeLobbyPick();
+
+// Whether a scene counts as "the menus", where a former joiner moves to port 1 (Rollback/
+// OnlineMatch.cpp ComeHome): the main menu or a character select; never a fight, a stage select, a
+// results screen, a scene change or a single-player mode. Pure.
+bool MenusScene(std::string_view scene, std::string_view sequence);
+// MenusScene as the frame hook read it at this boundary (first runs; false before the first, and
+// for games other than Brawl rev 2 and Project+). CPU thread.
+bool OnTheMenus();
+
+// The Casual or Ranked pick the character select read at this boundary was opened for (the main
+// menu's exit code kept in sqVsMelee, CssTitle::ReadPick: 30, 31); nullopt anywhere else. A former
+// joiner that comes home there picks it up. First runs, as OnTheMenus. CPU thread.
+std::optional<OnlinePick> CssPick();
+// Whether a Casual or Ranked pick the session couldn't take when it was seen (Rollback/
+// OnlineMatch.cpp TakeLobbyPickNow) still stands: on the way out of the main menu with that pick's
+// exit code, or on the character select it opened. Anywhere else it is stale. CPU thread.
+bool PickStands(OnlinePick pick);
+// The Casual or Ranked pick (30, 31) a main menu exit code stands for. Pure.
+std::optional<OnlinePick> QueuePickForCssCode(u32 code);
 
 // Frame hook: reads the menu and prints "orca menu ...". Reads emulated memory only.
 void ReadOnlineMenu(const Core::CPUThreadGuard& guard, bool resimulating, bool alone);

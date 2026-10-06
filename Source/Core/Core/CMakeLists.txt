@@ -566,6 +566,8 @@ add_library(core
   Orca/UX/OnlineMenu.h
   Orca/UX/OnlineRules.cpp
   Orca/UX/OnlineRules.h
+  Orca/UX/OnlineSeats.cpp
+  Orca/UX/OnlineSeats.h
   Orca/UX/Overlay.cpp
   Orca/UX/Overlay.h
   Orca/UX/Probe.cpp

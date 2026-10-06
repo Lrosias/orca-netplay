@@ -42,6 +42,7 @@ and why. Paths are relative to `Source/Core/Core/` unless they start with `Sourc
 - [Online menu](#online-menu)
 - [Matchmaking and results](#matchmaking-and-results)
 - [Online rules](#online-rules)
+- [No CPUs online](#no-cpus-online)
 - [Ranked sets](#ranked-sets)
 - [Stage select](#stage-select)
 - [Character select](#character-select)
@@ -224,10 +225,11 @@ with dev tickets (nothing is recorded). Each takes one to three minutes.
 | Tool | What it covers |
 |---|---|
 | `Tools/orca/dropin-commands.py` | Join, leave, rejoin, the host leaving. |
-| `Tools/orca/dropin-rooms.py` | A room with no host, a friend first in the host's room, the host's connection dropping. |
+| `Tools/orca/dropin-rooms.py` | A room with no host, a friend first in the host's room, the host's connection dropping; a guest going home, leaving the friends lobby for the queue, a kept pick. |
 | `Tools/orca/dropin-delay.py` | The input delay for five minutes after a join, optionally on a simulated bad link. |
 | `Tools/orca/dropin-identity.py` | Each player's own name-tag controls in the other's game. |
 | `Tools/orca/direct-link.py` | Direct links: off/in/on, rebuilds, TURN, the ticket's switch. |
+| `Tools/orca/versus-cpu-dropin.py` | A friend dropping into Group > Brawl's character select with CPUs on it: both machines clear them and seat the friend at the same frame. |
 | `Tools/orca/online-menu.py`, `online-menu-dropin.py` | Every path through the Online menu (one Orca, offline, no network access allowed); a friend dropping in on it. |
 | `Tools/orca/queue-e2e.mjs` | The matchmaking flow: casual and ranked, rematch, skip, timeout, kill. Plays the page's half of the protocol. |
 | `Tools/orca/free-space.py` | That the match block and code caves are never touched by the game. |
@@ -412,8 +414,31 @@ game's own menus could have set them, at their exact size (64 bytes at most on t
   off from 2 s to 30 s, trying the same code first. A socket the server replaced (close code 4000:
   another run on the same account) is never taken back.
 - A host that leaves always opens a new room. A player on a port other than 1 after a session (it
-  joined someone and went solo) prints `orca state no-room`.
+  joined someone and went solo) goes home ([Going home](#going-home)).
 - A rollback the joiner can't make (an engine fault, not a desync) ends its session as `network`.
+
+### Going home
+
+A player on a port other than 1 after a session (it joined a friend's game, then it left, its host
+did, or the session failed) goes home (`OnlineMatch.cpp` `ComeHome`). At its first alone boundary on
+the menus (the main menu or a character select; never a fight, a stage select, a results screen, a
+scene change or a single-player mode: `OnlineMenu.h` `MenusScene`), with no session, nothing of
+drop-in under way and the old room gone, it moves to port 1 and opens a room of its own a second
+later, as after a queue room. Solo with no session, that boundary is a first run nothing re-runs,
+and only this game changes; the next friend's keyframe carries it.
+
+- Home on the character select a With Anyone pick opened, it announces that pick too ([Casual or
+  Ranked with friends in the game](#casual-or-ranked-with-friends-in-the-game)), so its Start
+  readies it on the queue's own character select.
+- On a character select the move comes a frame after the old host's port unplugged, so port 1's
+  panel keeps what the old host put there and the guest's hand now drives it, while its own old
+  panel closes and it picks again. Cosmetic: a With Anyone select starts with nobody's token down.
+- A player in a fight when its host goes prints `orca state no-room` once, after the old room has
+  told the page it is empty (so the page never shows that room again), and goes home once back on
+  the menus. The app can still send `join` meanwhile, which wins over going home.
+
+Harness knob: `ORCA_UX_TEST_RESEAT_AT=<frame>`: the player plays port 2 until that frame and port 1
+from it, as a guest going home does, for synctests of the move (`Tools/orca/inputs/bf-reseat.txt`).
 
 ### Keyframe store
 
@@ -820,7 +845,7 @@ away.
 | `+0x290`-`+0x297` | A friend's move from the menus |
 
 Any new header (another mode, ruleset, coin or room) starts every track's state fresh. Compatibility:
-anything that changes what the game computes bumps `UX::kCompatVersion` (currently `ux=18`), which is
+anything that changes what the game computes bumps `UX::kCompatVersion` (currently `ux=19`), which is
 in the compatibility key.
 
 ## Input gate
@@ -891,8 +916,9 @@ server is ever asked for anything; nothing about connecting looks like Nintendo'
   so the pack is not in the compatibility key.
 - **Events** (`OnlineMenu.h`): a reader in the frame hook follows the menu at every first-run
   boundary and reads the exit code. It prints an event only for a pick made while the player's game
-  is alone (no friend plugged in or on the way, nothing of drop-in pending). Going solo or loading a
-  keyframe starts it over, so nothing stale is printed.
+  is alone (no friend plugged in or on the way, nothing of drop-in pending); a Casual or Ranked pick
+  made with friends goes to the session instead (below). Going solo or loading a keyframe starts it
+  over, so nothing stale is printed.
 - **No IOS network access:** NET_KD_REQ, IP/Top and SSL refuse in a session, and
   `Tools/orca/online-menu.py` fails on any `/dev/net` open, network request or NAND access to the
   save, WiiConnect24 or network folders after boot.
@@ -900,9 +926,49 @@ server is ever asked for anything; nothing about connecting looks like Nintendo'
 | stdout | When |
 |---|---|
 | `orca menu online casual` / `ranked` | With Anyone > Casual or Ranked, with the app's `host`. |
+| `orca menu online casual kept` / `ranked kept` | The same with friends in a host's game, kept because the app can't search that queue now: nothing armed, never a search. Printed again unmarked once the friends are gone. |
 | `orca menu online casual local` / `ranked local` | The same without `host`: nothing searches. |
 | `orca menu online friends` | With Friends. |
 | `orca menu cancel` | The player backed out of searching, alone. Once. |
+
+### Casual or Ranked with friends in the game
+
+With Anyone > Casual or Ranked leaves the friends lobby for a 2-player room the matchmaker fills
+(`OnlineMatch.cpp` `TakeLobbyPickNow`, `DecideLobbyPick`, `ArmKeptPick`). The reader hands such a
+pick (never With Friends) to the session at the boundary that saw it, after the app's commands
+(`OnlineMenu.h` `TakeLobbyPick`). Either player's press picks in a shared menu, and every game sees
+it at the same frame and goes to the same Versus character select.
+
+- **The host** (port 1, with the app's `host` and the queue's pick cap, `pick-casual` or
+  `pick-ranked`), with friends in its game, waiting for a keyframe or arriving, leaves its room as
+  the app's Leave does, prints `orca state left lobby`, shows "Left the lobby for Ranked" (or
+  Casual), then announces the pick (`orca menu online casual|ranked`). From the next boundary it
+  plays alone on port 1, so the queue's own character select gets its header and Start readies. An
+  arrival not taken in yet counts as a friend: taken in later, it would refuse the queue's header.
+- **Each friend** lets the pick go (the game is its host's), hears `orca state host-left` and goes
+  home on that character select ([Going home](#going-home)). There it reads the pick the select was
+  opened for (`CssTitle::ReadPick`, 30 or 31: `OnlineMenu.h` `CssPick`) and announces it too,
+  whatever its own app can search, so its Start readies it without backing out.
+- **A queue the app can't search now** (it answers `pick-casual` / `pick-ranked` in its `caps` only
+  for a queue it can search; Ranked needs a signed-in player): leaving would drop the friends for
+  nothing. The host keeps them and prints the pick in place, unarmed (`orca menu online ranked
+  kept`): no queue select, no search, no queue header. The app answers with its reason and
+  `queue-cancel`, which changes nothing. Once the friends are gone and the host's game is alone on
+  that select (`DecideKeptPick`), the pick is armed as an alone pick (`orca menu online ranked`);
+  it is dropped once the game moves on from that select (`PickStands`) or a queue or search starts
+  anyway. The app sends `caps` again when what it can search changes; a later `caps` line replaces
+  the whole answer (`Status::SetAppCaps`).
+- **Nobody to leave by now** (the app's own leave went first, the last friend has gone, or only a
+  keyframe is kept for an invite): the pick is announced in place with no `left lobby`, and a kept
+  keyframe is dropped (never while a session still runs).
+- Without the app's `host` nothing would search, so the friends' game stays theirs and nothing is
+  printed. A queue room's menus are locked.
+- A pick seen at a boundary the commands can't take (mid re-run) waits for the next while it still
+  stands (`PickStands`), and is dropped once the game has moved on from it.
+
+Local: the session ends at the pick's boundary, so only the room's leave reaches the friends' games,
+and the compatibility key doesn't change. Tests: `OrcaOnlineMenuLobby.*`, `Tools/orca/dropin-rooms.py`
+steps 6-10.
 
 ### Boot and friends from the menus
 
@@ -916,6 +982,8 @@ the main menu has built its pages and run 30 frames, the frame hook leaves the m
 as With Friends does, so both games go to the character select at the same boundary. It counts from
 the menu's build (`+0xAC8` of muMenuMain), not its start: moving before the build made the menu's
 exit call destructors through uninitialised page slots and froze both games. Never in a queue room.
+That character select is online, so its CPUs go and a friend whose panel had one takes it at once
+([No CPUs online](#no-cpus-online)).
 
 **A join held in a single-player mode:** while the host plays Classic, All-Star, Events, Training,
 the Subspace Emissary and the like (`SequenceHoldsDropIn`), a friend who arrives waits: no keyframe
@@ -958,7 +1026,7 @@ before the players part.
 
 | stdout | |
 |---|---|
-| `orca caps ... host results locks` | `results` where the result reader is verified, `locks` where the profile has a ruleset (Brawl rev 2 and Project+). |
+| `orca caps ... host results locks queue2 pick-casual pick-ranked` | `results` where the result reader is verified; `locks`, `queue2` and the pick caps where the profile has a ruleset (Brawl rev 2 and Project+). The app answers a pick cap only for a queue it can search now. 15 caps at most: the app passes 16, and more needs a desktop release first (`OrcaOnlineMenuLobby.EveryCapFitsTheAppsCapsLine`). |
 | `orca result <json>` | The room's verdict, when it arrives. At most 300 bytes. |
 | `orca state friend-left match-over` / `host-left match-over` | A ranked room closed after its set. |
 
@@ -1026,6 +1094,89 @@ host would, in a harness run or a dev room. Tests: `OrcaOnlineRules*`.
 
 Not yet: Project+'s Giga Bowser and Wario-Man are not refused; its Code Menu values are not forced
 (their defaults are off and the menu can't open).
+
+## No CPUs online
+
+No CPU exists in any online mode, and online character selects show only the seats in use
+(`ux=19`, `Orca/UX/OnlineSeats.*`). Local Versus (Group > Brawl, offline) keeps its CPUs.
+
+**Where a CPU came from** (found under the harness with `ORCA_UX_PROBE` watches, both games):
+
+- The Versus character select builds its panels from a record the game keeps between visits,
+  gmSelCharData (`[0x805A00E0]+0x10`, `0x90180B40` in both games; each port at `+0xB8 + port x
+  0x5C`: `+0` the character, `+1` the player's state, 0 a human, 1 a CPU, 3 nobody). While building,
+  the select reads each port's state (`0x80685AFC`) into the player area's kind (`+0x1B4`: 0 empty,
+  1 human, 2 CPU). It saves its panels back into the record only as it goes on to the stage select
+  (`0x806878D4`), never when B leaves to the menu.
+- Vanilla Brawl resets the record's players whenever Versus starts from the main menu; Project+
+  doesn't. So in Project+ a CPU from a local game that reached the stage select came back on the
+  online selects and into the match (a three-way game 1, or a CPU on panel 2 the joiner could never
+  take). In Brawl, A on an empty panel's player-type button made a CPU on With Friends' select.
+- The stage select's end copies the record into the fight's players (sqVsMelee, `0x806DCF6C`, every
+  port whose state isn't 3), overwriting the fight's own data.
+
+**What is online** (`OnlineSeats::Online`, a pure function of memory and the synced ports): the match
+block's header locks, or the main menu's pick kept in sqVsMelee (`+0x18`) is With Friends (24-27),
+Casual (30) or Ranked (31), or two or more ports are plugged in (a friend dropped in, wherever the
+host was).
+
+**What Orca writes there** (the frame hook, first runs and re-runs, only bytes that differ):
+
+- **The record**, only between two scenes (`scMemoryChange`): a CPU's state becomes nobody's (3),
+  and so does a human's on a port nobody plugged in. The select then starts with only the players
+  who are there. Never on the stage select or in a fight: by then the copy into the fight is made,
+  so no fight loses a player to this. Characters stay; only states change.
+- **The panels**, on the character select: a CPU's (kind 2) becomes empty (0), which the select
+  saves as it leaves, so the CPU plays no fight. A human's panel whose port nobody plugged in (a
+  friend who left) is left to the game, which empties it 17 frames after the controller goes.
+- **The join** (the input gate, `OnlineSeats::PressesJoin`): a panel a CPU had can't be joined by
+  moving the hand into the grid, since its token went with the CPU. The game's own way back is A on
+  the panel's player-type button with that port's controller in. So on an online select without a
+  header, Orca presses A for a plugged-in port whose own panel is empty, its token neither in the
+  hand nor flying, while its hand rests on that panel's player-type button (hand `+0xB0`). A friend
+  who drops into a select whose CPU was on their panel takes it at once.
+- **The buttons** (the input gate): where no header locks (With Friends, a friend's drop-in, Casual
+  or Ranked before the queue's header lands), A never reaches a player-type button (`0x1D`) or a
+  name button (`0x1C`), nor any hand below y = -16.4 (the buttons start between -17.4 and -18.3 in
+  both games, and a hand moves at most 1.0 a frame). An unreadable hand gets no A either. A fresh
+  panel needs no A: a hand moved into the grid joins it. The gate reads the plugged ports from the
+  friends bytes the frame hook keeps (`MatchBlock::FRIENDS_SEEN`).
+- **The seats**, on any character select: an empty panel (kind 0) whose port nobody plugged in is
+  hidden while the select is online, except the opponent's seat of a queue select (panel 2: always
+  in a queue room, and on the queue's own select while it searches). Each panel is player area i's
+  39 models (MuObjects at area `+0xB0..+0x14C`; each one's nw4r `ScnMdl` at `+0xC`, its `ScnObj`
+  flags at `+0xCC`, `0xA0000000` in both games). Orca sets `0x60` (draw neither opaque nor
+  translucent) on the hidden ones and clears it on the others, only on a model whose flags are
+  exactly the game's (with or without those bits) and whose first word is a vtable in the
+  executable. The select never writes those flags and rebuilds them with itself, so nothing
+  outlives it. Hiding is drawing only: a hidden panel's logic and buttons stay, and the gates keep
+  them dead.
+
+So the queue's own select shows the player alone while picking, then the opponent's seat
+(SEARCHING) once it searches; a queue room shows both players; With Friends shows the players
+plugged in. Forcing the game's own 2-player layout (task `+0x648`, `0x806834D8`) was rejected: it
+changes game logic, is fixed when the select starts, and can't serve a 3-4 player friends room.
+
+**Determinism:** every write is a pure, idempotent function of emulated memory and the session's
+synced ports, at the frame hook (the record and panels after the online rules, the seats after the
+native text); the gate's masks and its join press read memory alone. A joiner loads the host's
+keyframe, which carries all of it.
+
+**Test inputs.** The default two-player inputs (`bf-mario-link-results.txt`, `pplus-1v1.txt`) join
+with A on the player's own player-type button. In a session two ports are plugged in, so the select
+is online and that A is masked: each player joins when the stick takes the hand into the grid.
+Two-Orca runs of these inputs therefore play differently from a pre-`ux=19` build's from the first
+character select on. Harness-only runs (one port plugged in, a local select) are unchanged, so the
+release hashlogs still compare. Harness knobs: a walk that plays ports 2-4 on an online select needs
+them plugged in (`ORCA_UX_TEST_NAMES`, and `ORCA_TEST_PADS=4` for ports 3 and 4);
+`ORCA_UX_TEST_PADS_FOLLOW_PLUGS=1` gives a port nobody plugged in no controller, as a session does;
+`ORCA_UX_TEST_UNPLUG_AT=<frame>:<port 2-4>` unplugs a port from that frame, as a friend's leave
+does.
+
+Tests: `OrcaOnlineSeats.*`; `Tools/orca/versus-cpu-dropin.py`; `queue-e2e.mjs --probe
+Tools/orca/inputs/pplus-cpu-record-probe.txt` (a queue match with CPUs in both players' records);
+inputs `pplus-cpu-online.txt`, `bf-cpu-friends.txt`, `*-cpu-dropin-live.txt`,
+`*-friend-leaves.txt`.
 
 ## Ranked sets
 
@@ -1133,7 +1284,9 @@ Not yet: the two cursors over a real two-Orca room and between a Mac and a PC; a
 
 On a later game's character select the hands come back on the bottom panels, each on its own
 player-type button, where A turns the player into a CPU. So while a header locks, the gate passes A
-only when the hand is in the character grid or on its own token (`OnlineRules.h`).
+only when the hand is in the character grid or on its own token (`OnlineRules.h`). Without a
+header, With Friends and a friend's drop-in keep A off the player-type and name buttons ([No CPUs
+online](#no-cpus-online)).
 
 - Player area i is the select task's (scene `+0x400`) `+0x44 + 4i`. `+0x1A8` is its hand: `+0x80`
   what it points at (2 or 7 the grid, 3 its own token, 6 and 8 the token moving, 4 a leave button,
@@ -1303,8 +1456,9 @@ only when the box moves inside the window.
 | `notice <kind> <name> <text> [<key> <verb>]` | One of the YouGame overlay's lines (join, leave, invite, ...). Never logged. |
 | `quit` | Stop at once and exit. |
 
-Most commands are gated by capabilities (`caps`) that Orca and the app agree on; a command without
-its cap, or a malformed one, answers `unsupported <command>`. Any other line goes to stderr. Drawing
+Most commands are gated by capabilities (`caps`) that Orca and the app agree on; a later `caps` line
+replaces the whole answer. A command without its cap, or a malformed one, answers
+`unsupported <command>`. Any other line goes to stderr. Drawing
 commands (`view`, `dim`, `perf`, `chat`, `orb`, `notice`) are host-only: never in game memory or
 the compatibility key.
 

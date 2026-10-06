@@ -66,6 +66,117 @@ constexpr int HEADER_FAIL_BOUNDARIES = 300;
 // `*waited` counts the boundaries waited so far.
 HeaderWait StepHeaderWait(int* waited, bool in_place, bool someone_waiting, bool queue_room);
 
+// Coming home: a player who joined a friend's game and then went solo (the host left, it left, or
+// its session ended) still plays on the port it was given, with no room. Nobody can drop in, and
+// the queue's own character select wants port 1, so Start would do nothing. At its first alone
+// boundary on the menus it moves to port 1 and opens a room of its own. See ORCA.md, "Drop-in".
+struct HomeInputs
+{
+  // The port it plays (0: port 1, nothing to do).
+  int local_seat = 0;
+  // Joining a friend's game, or in a session: not alone.
+  bool joining = false;
+  bool session = false;
+  // The room it was in is still up (a ranked room waiting for the verdict, or kept after the set):
+  // that room's ending takes it home (Linger, SetOverLeave).
+  bool room_up = false;
+  // SoloIdle, and no drop-in pending for the next boundary (Orca::Online::DropInPending: the app's
+  // join wins).
+  bool solo_idle = false;
+  bool drop_in_pending = false;
+  // On the menus at this boundary (UX/OnlineMenu.h OnTheMenus): the main menu or a character
+  // select only.
+  bool on_menus = false;
+  // A queue room left this player's own game to restore (MaybeRestoreQueueImage), which moves it
+  // to port 1 by itself.
+  bool queue_image = false;
+  // Waiting in a ranked room for its verdict (Linger).
+  bool lingering = false;
+};
+bool MayComeHome(const HomeInputs& in);
+
+// What the session does, at the same boundary, with a With Anyone pick (Casual or Ranked) the frame
+// hook saw while the game wasn't alone (UX/OnlineMenu.h TakeLobbyPick). Casual and Ranked leave the
+// friends lobby for a 2-player room the matchmaker fills, but only when the page can search that
+// queue now (the app's "pick-casual" / "pick-ranked" caps); otherwise the friends would be dropped
+// for nothing. In a shared menu either player's press makes the pick, and every game sees it at
+// the same frame.
+enum class LobbyPickStep
+{
+  // Nothing. A joiner's game follows its host (it comes home on that pick's character select and
+  // announces it there: AnnounceHomePick); a queue room's menus are locked; and without the app's
+  // "host" cap nothing would search, so the friends keep their game.
+  Ignore,
+  // Only announce the pick. Either nobody is left to leave (the app's leave or join went first, or
+  // the session only idles out its last frames), or a host with friends whose page can't search
+  // the picked queue keeps them and announces the pick unarmed (`orca menu online <queue> kept`),
+  // so its page says why and cancels. Once the friends are gone the pick is armed (DecideKeptPick).
+  Announce,
+  // A host with friends in its game or on their way, whose page can search the picked queue: it
+  // leaves the room (the friends play on: `orca state host-left`), prints `orca state left lobby`,
+  // and announces the pick.
+  Leave,
+};
+struct LobbyPickInputs
+{
+  // Joining; the port it plays (a former joiner hosts nobody); in a matchmade room; the app's
+  // "host" cap; the app's cap for the picked queue (UX/OnlineMenu.h PickSearchable).
+  bool joining = false;
+  int local_seat = 0;
+  bool queue_room = false;
+  bool host_cap = false;
+  bool pick_cap = false;
+  // A session, and whether it only idles out its last frames with nobody in it or on the way
+  // (Session::Idle, IDLE_GRACE_FRAMES).
+  bool session = false;
+  bool session_idle = false;
+  // A friend waiting for its keyframe, plugging in or seated.
+  bool drop_in_friends = false;
+  // A friend's arrival the host hasn't taken yet (Online::ArrivalPending). Taken in later, that
+  // friend would get a game under the queue's header and refuse it (`orca error mismatch`).
+  bool arrival_pending = false;
+  // A keyframe stored, being made, or wanted (a prepare-join) for an invite nobody has taken yet.
+  bool keyframe_kept = false;
+};
+struct LobbyPickPlan
+{
+  LobbyPickStep step = LobbyPickStep::Ignore;
+  // Drop the invite's keyframe (made before the pick), so a friend who comes later gets one of the
+  // queue's own character select. Never while a session runs or friends are kept.
+  bool drop_keyframe = false;
+  // The announcement also starts the pick (UX/OnlineMenu.h AnnounceOnlinePick: the queue's own
+  // character select, or the search). False for a host that keeps its friends: the queue's header
+  // would reach a friend on the way, who would refuse it, and the page cancels anyway.
+  bool arm = true;
+};
+LobbyPickPlan DecideLobbyPick(const LobbyPickInputs& in);
+
+// Whether a former joiner coming home (ComeHome) on a character select that a With Anyone pick
+// opened (UX/OnlineMenu.h CssPick) announces that pick there, so its Start readies the queue as its
+// host's did. Only with the app's "host" cap, and never over a queue or search under way. The pick
+// caps don't apply: it is alone, and its page answers as for any alone pick.
+bool AnnounceHomePick(bool css_pick, bool host_cap, bool queue_or_search);
+
+// A pick a host announced unarmed to keep its friends (LobbyPickPlan::arm false), checked at each
+// later boundary (ArmKeptPick). It is armed once the game is alone on that pick's character select,
+// so Start there readies it, and dropped once the game leaves that select (UX/OnlineMenu.h
+// PickStands) or a queue or search is under way anyway.
+enum class KeptPickStep
+{
+  Wait,
+  Arm,
+  Drop,
+};
+struct KeptPickInputs
+{
+  // The pick still stands where the frame hook last read the game (PickStands).
+  bool stands = false;
+  // This game plays alone on port 1 (AloneAt, not joining).
+  bool alone = false;
+  bool queue_or_search = false;
+};
+KeptPickStep DecideKeptPick(const KeptPickInputs& in);
+
 // True while this process plays online (solo in its room, or with friends).
 bool Active();
 // Logs the session's stats.

@@ -21,6 +21,7 @@
 #include "Core/Orca/UX/NativeText.h"
 #include "Core/Orca/UX/OnlineRules.h"
 #include "Core/Orca/UX/OnlineMenu.h"
+#include "Core/Orca/UX/OnlineSeats.h"
 #include "Core/Orca/UX/Overlay.h"
 #include "Core/Orca/UX/Probe.h"
 #include "Core/Orca/UX/Queue.h"
@@ -76,6 +77,9 @@ void Init()
     // No Z on the results screen in any session. Its replay save is a dead end online.
     Merge(masks, Rules::SessionMasks(memory));
     Merge(masks, Rules::GateMasks(memory));
+    // No CPUs online: where no header locks, A never reaches a player-type or name button, and is
+    // pressed for a plugged-in player whose panel a CPU left (OnlineSeats.h).
+    Merge(masks, OnlineSeats::GateMasks(memory));
     Merge(masks, RankedPPlus::Masks(memory));
     BrawlStages::GateMasks(guard, &masks);
     Rollback::InputGate::Masks order = CharOrder::GateFrame(guard);
@@ -175,6 +179,8 @@ void Init()
         plugged |= static_cast<u8>(1 << p.port);
     }
     Rules::OnFrame(guard, frame, resimulating, alone, plugged);
+    // No CPUs online: clears CPUs from the character select's record and panels (OnlineSeats.h).
+    OnlineSeats::ClearFrame(guard, frame, resimulating, plugged);
     // A ranked set's character order for later games. The input gate reads its state from the
     // match block.
     CharOrder::Frame(guard, frame, resimulating, ports);
@@ -187,6 +193,9 @@ void Init()
     const Relabel::Shown labels = Relabel::Frame(guard, resimulating, ports);
     // Orca's text in the character select's own text boxes: player names and the rules bar line.
     NativeText::Frame(guard, resimulating, ports, Relabel::ClockInBand(labels));
+    // Only the seats in use on an online character select: hides empty panels nobody plugged into
+    // (OnlineSeats.h).
+    OnlineSeats::SeatsFrame(guard, frame, resimulating, plugged);
     // Must run last. Toggled patch groups follow the state the writers above left, so a re-run of
     // this boundary decides the same and writes nothing new.
     ApplyToggledGamePatches(guard);
