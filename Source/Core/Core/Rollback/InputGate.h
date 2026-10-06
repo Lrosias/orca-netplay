@@ -55,11 +55,14 @@ struct Mask
   // Centres the main stick while A is held (raw or forced), so a cursor stays where it is through
   // the A press that selects. Applied last.
   bool a_centres_stick = false;
+  // Buttons that read released while the player holds both L and R (TriggerHeld), e.g. a cheat
+  // menu's L+R+Down chord. L and R themselves stay the player's.
+  u16 drop_with_lr = 0;
 
   bool Empty() const
   {
     return buttons == 0 && !main_stick && !c_stick && press == 0 && a_as == 0 && !steer &&
-           !a_centres_stick;
+           !a_centres_stick && drop_with_lr == 0;
   }
   bool operator==(const Mask&) const = default;
 };
@@ -68,6 +71,14 @@ constexpr u16 ALL_BUTTONS = 0x1F7F;
 constexpr Mask ALL{ALL_BUTTONS, true, true};
 
 using Masks = std::array<Mask, PORTS>;
+
+// A trigger counts as held when its button is down or its analog value reaches a quarter press,
+// above a worn trigger's rest value.
+constexpr u8 TRIGGER_HELD = 0x40;
+constexpr bool TriggerHeld(bool button, u8 analog)
+{
+  return button || analog >= TRIGGER_HELD;
+}
 
 // `pad` as the game sees it through `mask`. Pure. Origin/error bits and isConnected are kept, and
 // an unplugged pad is returned unchanged.

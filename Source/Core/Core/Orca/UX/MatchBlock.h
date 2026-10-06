@@ -29,7 +29,8 @@
 //   +0x10..+0x7F   Project+ set state (casual uses +0x10 fight count, +0x40 preferred stages)
 //   +0x80..+0xBF   stage flow steps (Project+ State below; Brawl in BrawlStages.h)
 //   +0xC0..+0xCF   ranked character select ready timer
-//   +0xD0..+0xF3   the player's own rules, saved when the header is written
+//   +0xD0..+0xF3   the player's own rules, saved when the header is written (+0xDA: Project+'s
+//                  Code Menu activation)
 //   +0xF4..+0xFF   shared stage select cursors (StageCursors.h)
 //   +0x100..+0x1A7 Project+ stage switch data, saved when the header is written
 //   +0x1B4..+0x1BF stage select cursors (StageCursors.h)
@@ -110,12 +111,15 @@ constexpr u32 PHASE1_SIZE = 0x10;
 
 // ---- The player's own settings, saved when the header is written and restored on clear ----
 constexpr u32 SAVED_RULES = BASE + 0xD0;   // 10 bytes, gmSetRule +0x02..+0x0B
+// Project+ only: u8, its Code Menu Activation before the lock (OnlineRules.h).
+constexpr u32 SAVED_CODE_MENU = BASE + 0xDA;
 constexpr u32 SAVED_ITEMS = BASE + 0xE0;   // 3 words: menu data +0x00, +0x08, +0x0C
 constexpr u32 SAVED_STAGES = BASE + 0xEC;  // 2 words: menu data +0x20, +0x24
 // Project+ only: its stage switch data (RSS_EXDATA) before the lock.
 constexpr u32 SAVED_RSS = BASE + 0x100;
 constexpr u32 SAVED_RSS_SIZE = 0xA8;
-constexpr u32 SAVED_FLAGS = BASE + 0x1F0;  // u8: bit 0 rules saved, bit 1 RSS saved
+// u8: bit 0 rules saved, bit 1 RSS saved, bit 2 Code Menu activation saved
+constexpr u32 SAVED_FLAGS = BASE + 0x1F0;
 
 // ---- Stage select cursors (StageCursors.h) ----
 constexpr u32 STAGE_CURSORS_SHARED = BASE + 0xF4;
@@ -148,6 +152,7 @@ constexpr u32 FRIENDS_MENU_SINCE = FRIENDS + 4;
 constexpr u32 FRIENDS_END = FRIENDS + 8;
 
 static_assert(SAVED_RSS + SAVED_RSS_SIZE <= SAVED_FLAGS);
+static_assert(SAVED_RULES + 10 <= SAVED_CODE_MENU && SAVED_CODE_MENU < SAVED_ITEMS);
 static_assert(SAVED_STAGES + 8 <= STAGE_CURSORS_SHARED &&
               STAGE_CURSORS_SHARED + STAGE_CURSORS_SHARED_SIZE <= SAVED_RSS);
 static_assert(SAVED_RSS + SAVED_RSS_SIZE <= STAGE_CURSORS &&

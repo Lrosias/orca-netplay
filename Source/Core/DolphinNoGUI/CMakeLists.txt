@@ -27,11 +27,19 @@ endif()
 
 if(APPLE)
   option(ORCA_MACOS_BUNDLE "Build the NoGUI frontend as Orca.app, a self-contained bundle" OFF)
-  set(ORCA_VERSION "0.1.0" CACHE STRING "The Orca version in the bundle's Info.plist")
 endif()
+set(ORCA_VERSION "0.1.0" CACHE STRING "The Orca version (macOS Info.plist, Windows version resource)")
 
 if (WIN32)
   target_sources(dolphin-nogui PRIVATE DolphinNoGUI.exe.manifest DolphinNoGUI.rc)
+  # Orca.exe's version resource (DolphinNoGUI.rc), what Windows and antivirus show: ORCA_VERSION as
+  # a string and as the four numbers VERSIONINFO wants.
+  string(REGEX MATCHALL "[0-9]+" ORCA_VERSION_PARTS "${ORCA_VERSION}")
+  list(APPEND ORCA_VERSION_PARTS 0 0 0 0)
+  list(SUBLIST ORCA_VERSION_PARTS 0 4 ORCA_VERSION_PARTS)
+  list(JOIN ORCA_VERSION_PARTS "," ORCA_VERSION_NUM)
+  configure_file(orca-version.h.in "${CMAKE_CURRENT_BINARY_DIR}/orca-version.h" @ONLY)
+  target_include_directories(dolphin-nogui PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
   set_target_properties(dolphin-nogui PROPERTIES
     DEBUG_POSTFIX    D

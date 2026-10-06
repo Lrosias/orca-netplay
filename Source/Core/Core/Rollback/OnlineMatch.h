@@ -141,8 +141,8 @@ struct LobbyPickInputs
 struct LobbyPickPlan
 {
   LobbyPickStep step = LobbyPickStep::Ignore;
-  // Drop the invite's keyframe (made before the pick), so a friend who comes later gets one of the
-  // queue's own character select. Never while a session runs or friends are kept.
+  // Drop the invite's keyframe (made before the pick); a friend who comes later ends the queue
+  // first (FriendEndsQueue). Never while a session runs or friends are kept.
   bool drop_keyframe = false;
   // The announcement also starts the pick (UX/OnlineMenu.h AnnounceOnlinePick: the queue's own
   // character select, or the search). False for a host that keeps its friends: the queue's header
@@ -176,6 +176,54 @@ struct KeptPickInputs
   bool queue_or_search = false;
 };
 KeptPickStep DecideKeptPick(const KeptPickInputs& in);
+
+// A friend on the way while the host is on the queue (its own character select, or searching).
+// The friend wins: the queue ends, so the header goes back to none at the next boundary and the
+// friend's keyframe has no queue header (a friends room's joiner refuses one).
+struct FriendQueueInputs
+{
+  // A friend arrived, or the app's prepare-join came, at this boundary.
+  bool friend_coming = false;
+  bool queue_or_search = false;
+  // The port it plays (a host plays port 1), and whether it is joining a friend's game.
+  int local_seat = 0;
+  bool joining = false;
+  // The room's welcome came and said "private" (never a matched room, even before its welcome).
+  bool friends_room = false;
+};
+bool FriendEndsQueue(const FriendQueueInputs& in);
+
+// A joiner whose keyframe just loaded into a friends room (not `queue_room`): its own queue ends
+// and the game kept for after a queue room (`queue_image`) is dropped, since only a queue room's
+// end puts it back and, kept, it blocks going home (MayComeHome).
+bool JoinEndsQueue(bool queue_room, bool queue_or_search, bool queue_image);
+
+// A host whose queue ended for a friend (FriendEndsQueue), at each later boundary: once a friend
+// came in and all of them left, and the game is alone again on that pick's character select, the
+// pick is armed again (`orca menu online <queue>`) so Start searches. Never for an invite nobody
+// took yet. Dropped once a queue or search is under way, without the cap, or when joining
+// elsewhere.
+enum class FriendsPickStep
+{
+  Wait,
+  Arm,
+  Drop,
+};
+struct FriendsPickInputs
+{
+  // A friend came in since the queue ended.
+  bool played = false;
+  // AloneAt, on port 1, not joining, nobody seated.
+  bool alone = false;
+  // The last character select read was opened for that pick (UX/OnlineMenu.h CssPick).
+  bool on_pick_select = false;
+  // The app's "host" cap and the pick's cap.
+  bool host_cap = false;
+  bool queue_or_search = false;
+  // Joining a friend's game, or on a port other than 1.
+  bool elsewhere = false;
+};
+FriendsPickStep DecideFriendsPick(const FriendsPickInputs& in);
 
 // True while this process plays online (solo in its room, or with friends).
 bool Active();

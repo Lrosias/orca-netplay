@@ -440,6 +440,30 @@ and only this game changes; the next friend's keyframe carries it.
 Harness knob: `ORCA_UX_TEST_RESEAT_AT=<frame>`: the player plays port 2 until that frame and port 1
 from it, as a guest going home does, for synctests of the move (`Tools/orca/inputs/bf-reseat.txt`).
 
+### Play again after a ranked set
+
+After a set both games are back on their own Ranked character select, each hosting a friends room.
+The page's Play again invites the opponent (`prepare-join` to the inviter, `join <code>` to the
+invitee). Through 0.3.27 that join failed: the inviter's game still carried the queue select's header,
+its keyframe carried it, and the friend refused it (`orca error mismatch`). The same happened to any
+invite from a With Anyone character select. Now the newest intent wins
+(`OnlineMatch.cpp` `EndQueueForFriend`, `EndQueueForJoin`, `RearmFriendsPick`):
+
+- **The host** (port 1, not joining, its room's welcome said `private`): a friend arriving, or a
+  `prepare-join`, while the player is on the queue (its own select, or searching) ends the queue and
+  the search and prints `orca menu cancel`. The header goes back to none at the next boundary, a
+  keyframe made under the old one is dropped, and the friend's keyframe has none. Never in a matched
+  room, nor before a room's welcome.
+- **Once the friends are gone** (one came in, all left, and the host is alone again on that pick's
+  character select), the pick is armed again if the page can search it (`orca menu online ranked`),
+  so Start searches. Never for an invite nobody took yet.
+- **The friend** whose keyframe loads into a friends room ends its own queue the same way and drops
+  the game it kept for after a queue room, which would otherwise block going home. A join that fails
+  before the keyframe loads keeps all of it.
+
+Local: only the host's own solo boundaries and process state change; nothing a session runs on two
+machines, so no compatibility change. Tests: `OrcaOnlineMenuLobby.*` (the three play-again tests).
+
 ### Keyframe store
 
 `HttpKeyframeStore` in `Orca/Session/Keyframe.cpp`. Tests use `ORCA_TEST_KEYFRAME_DIR`: the store
@@ -857,7 +881,8 @@ so no game code has to be patched per control (`Rollback/InputGate.*`).
 - **A mask** makes buttons read released (L and R also zero their analog value) and sticks centred.
   An unplugged port stays unplugged. A mask can also **press** buttons for the game
   (`Mask::press`), **steer** a stick (`Mask::steer`), or read the stick centred while A is down
-  (`a_centres_stick`), so an A acts where the hand stood.
+  (`a_centres_stick`), so an A acts where the hand stood. `drop_with_lr` releases buttons only
+  while L and R are both held (pressed, or a quarter press): Project+'s Code Menu chord.
 - **Where.** `Rollback::InputOverride`, called for every SI poll and for the relatch. Everything else
   stays raw: the local pad sampled for the wire, the session's pads, the harness's recording. Both
   machines apply the same masks to the same pads, and a re-run applies them again.
@@ -929,7 +954,7 @@ server is ever asked for anything; nothing about connecting looks like Nintendo'
 | `orca menu online casual kept` / `ranked kept` | The same with friends in a host's game, kept because the app can't search that queue now: nothing armed, never a search. Printed again unmarked once the friends are gone. |
 | `orca menu online casual local` / `ranked local` | The same without `host`: nothing searches. |
 | `orca menu online friends` | With Friends. |
-| `orca menu cancel` | The player backed out of searching, alone. Once. |
+| `orca menu cancel` | The player backed out of searching, alone. Once. Also when a friend on the way, or a friends room joined, ends the queue ([Play again](#play-again-after-a-ranked-set)). |
 
 ### Casual or Ranked with friends in the game
 
@@ -960,7 +985,8 @@ it at the same frame and goes to the same Versus character select.
   the whole answer (`Status::SetAppCaps`).
 - **Nobody to leave by now** (the app's own leave went first, the last friend has gone, or only a
   keyframe is kept for an invite): the pick is announced in place with no `left lobby`, and a kept
-  keyframe is dropped (never while a session still runs).
+  keyframe is dropped (never while a session still runs). A friend who comes later ends that queue
+  first ([Play again](#play-again-after-a-ranked-set)).
 - Without the app's `host` nothing would search, so the friends' game stays theirs and nothing is
   printed. A queue room's menus are locked.
 - A pick seen at a boundary the commands can't take (mid re-run) waits for the next while it still
@@ -1079,7 +1105,9 @@ opponent unplugs; ranked stays locked while the set is open.
 | Rules | stock, 3 stocks, 8:00, handicap off, team attack on, pause off | the same with 4 stocks |
 | Items | none | none |
 | Legal stages | Battlefield, Final Destination, Delfino, Yoshi's Island, Lylat, Smashville, Pokemon Stadium; FD off while a human picked Ice Climbers | the 2024 Proposed list (preset 3, `Switch03.rss`): 9 stages, hazards off |
-| Input gate | character select: A only in the grid, B only to take the token back up; stage select: every port while the two cursors run (they act instead); fight: Start | the same, plus the D-pad on the character select (its Code Menu) |
+| Input gate | character select: A only in the grid, B only to take the token back up; stage select: every port while the two cursors run (they act instead); fight: Start | the same, plus the D-pad on the character select, and D-pad Down while L and R are held in every scene (the Code Menu's chord) |
+| Code Menu | (none) | off, closed, every cheat and gameplay value at its default (below) |
+| Fighters | any | Giga Bowser and Wario-Man play as Bowser and Wario |
 
 - **No way back to the menus.** A toggled patch group conditioned on the header flips the character
   select's "back to the menu" exit to "character select again", so BACK reloads the select.
@@ -1092,8 +1120,33 @@ opponent unplugs; ranked stays locked while the set is open.
 Test knob: `ORCA_TEST_QUEUE=casual|ranked[:<coin>][:q2|:solo]` writes the header as a queue room's
 host would, in a harness run or a dev room. Tests: `OrcaOnlineRules*`.
 
-Not yet: Project+'s Giga Bowser and Wario-Man are not refused; its Code Menu values are not forced
-(their defaults are off and the menu can't open).
+### Project+'s Code Menu and banned fighters
+
+Project+'s netplay codeset carries its Code Menu (`pf/menu3/dnet.cmnu`, loaded as is to
+`0x804E0000`). Any port opens it with L+R+D-pad Down in any scene, mid-fight too, and it pauses both
+games while open; from it a player could turn on flight, infinite shield and debug displays, swap a
+port's character (Giga Bowser, Wario-Man) and change hitstun, shield and other constants, all in
+sync. Its character select also turns a Bowser or Wario pick into Giga Bowser or Wario-Man, both
+banned, when the player holds shield (L) as the select ends. Under any locking header (casual,
+ranked, the queue's own character select), since `ux=20`:
+
+- **The menu is off and closed.** Code Menu Activation is OFF, its state is closed (an open menu
+  closes as its own Start does and the game's pause word comes back), and 73 cheat and gameplay
+  values are held at the file's defaults at every boundary. The four Character Select lines follow
+  the fighters and are left alone; so are the replay, tag, costume, crowd and HUD colour lines.
+  Nothing is written unless the memory has the pinned release's layout (`Rules::CodeMenuPresent`).
+- **The chord is dropped:** the gate drops D-pad Down while L and R both read held (button, or
+  analog at a quarter press), in every scene (`drop_with_lr`). That also stops the debug codes' own
+  L+R+Down toggle. Activation OFF is what keeps the menu shut; the drop is a backup.
+- **Banned fighters** become Bowser (`0x0C`) and Wario (`0x17`) on the character select, the stage
+  select and between scenes, in the match's init data and in the character select's record
+  (gmSelCharData), which the way to the fight copies into the init data again.
+- The header saves the player's own activation and its clear gives it back; the values stay at
+  Project+'s defaults afterwards. Friends rooms keep the menu as it is.
+
+Tests: `OrcaOnlineRules.*CodeMenu*`, `OrcaOnlineRules.ProjectPlus*`,
+`OrcaInputGate.DownDropsOnlyWhileLAndRAreBothHeld`. Two Orcas: `queue-e2e.mjs --pplus <dol> --q2
+--queue ranked --pick bowser --giga --chord`. More in ORCA_NOTES.md, "Project+'s Code Menu".
 
 ## No CPUs online
 

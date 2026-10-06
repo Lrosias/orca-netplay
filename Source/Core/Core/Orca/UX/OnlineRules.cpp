@@ -3,6 +3,7 @@
 
 #include "Core/Orca/UX/OnlineRules.h"
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <map>
@@ -19,6 +20,7 @@
 #include "Core/Orca/Session/Online.h"
 #include "Core/Orca/UX/NameTags.h"
 #include "Core/Orca/UX/OnlineMenu.h"
+#include "Core/Orca/UX/OnlineSeats.h"
 #include "Core/Orca/UX/Probe.h"
 #include "Core/Orca/UX/Queue.h"
 #include "Core/Orca/UX/SetBlock.h"
@@ -252,6 +254,168 @@ void ForceStages(Writer& w, const Header& h, const std::string& scene)
   }
 }
 
+// dnet.cmnu's default for every cheat and gameplay line (each line's value word, at line + 8), with
+// Code Menu Activation OFF. Not here: the Character Select lines (they follow the fighters), and
+// the replay, tag, costume, crowd and HUD colour lines.
+constexpr std::array<CodeMenuWord, 73> CODE_MENU_DEFAULTS{{
+    // Endless Friendlies mode and stages, Alternate Stages, Autoskip Results, Activation (OFF)
+    {0x804E0910, 0},
+    {0x804E098C, 0},
+    {0x804E09E4, 0},
+    {0x804E0A38, 0},
+    {CODE_MENU_ACTIVATION, CODE_MENU_OFF},
+    // Debug Mode, Hitbox and Collision Display, Stage Collisions, Camera Lock, Draw DI, FPS, HUD
+    {0x804E0D3C, 0},
+    {0x804E0D68, 0},
+    {0x804E0DB8, 0},
+    {0x804E0DEC, 0},
+    {0x804E0E40, 0},
+    {0x804E0E70, 0},
+    {0x804E0E9C, 0},
+    {0x804E0ECC, 1},
+    // P1-P4: Infinite Shield, Select Percent (0.0), Press DPad to select percent, Disable DPad,
+    // Input Buffer, Automatic L-Cancelling, ALC Modifier (0.5), Red Flash on L-Cancel Failure
+    {0x804E0F08, 0},
+    {0x804E1198, 0},
+    {0x804E11D0, 0},
+    {0x804E1210, 0},
+    {0x804E1240, 0},
+    {0x804E12B4, 0},
+    {0x804E1308, 0x3F000000},
+    {0x804E1340, 0},
+    {0x804E13F0, 0},
+    {0x804E145C, 0},
+    {0x804E1494, 0},
+    {0x804E14D4, 0},
+    {0x804E1504, 0},
+    {0x804E1534, 0},
+    {0x804E156C, 0x3F000000},
+    {0x804E15A4, 0},
+    {0x804E1654, 0},
+    {0x804E16C0, 0},
+    {0x804E16F8, 0},
+    {0x804E1738, 0},
+    {0x804E1768, 0},
+    {0x804E1798, 0},
+    {0x804E17D0, 0x3F000000},
+    {0x804E1808, 0},
+    {0x804E18B8, 0},
+    {0x804E1924, 0},
+    {0x804E195C, 0},
+    {0x804E199C, 0},
+    {0x804E19CC, 0},
+    {0x804E19FC, 0},
+    {0x804E1A34, 0x3F000000},
+    {0x804E1A6C, 0},
+    // Random Angle, War and Big Head modes
+    {0x804E1B8C, 0},
+    {0x804E1BEC, 0},
+    {0x804E1C18, 0},
+    // Gameplay constants (floats): hitstun, hitlag, hitlag max, electric hitlag, SDI, ASDI,
+    // walljump, shield size min, shield damage, base shield damage, shield size, shield tilt, wall
+    // bounce, knockback decay
+    {0x804E1E28, 0x3ECCCCCD},
+    {0x804E1E64, 0x3EAAAAAB},
+    {0x804E1EA0, 0x41F00000},
+    {0x804E1ED8, 0x3FC00000},
+    {0x804E1F1C, 0x40C00000},
+    {0x804E1F50, 0x40400000},
+    {0x804E1F88, 0x3F666666},
+    {0x804E1FD0, 0x3E19999A},
+    {0x804E2014, 0x3F800000},
+    {0x804E2054, 0},
+    {0x804E2090, 0x3F800000},
+    {0x804E20D0, 0x3F000000},
+    {0x804E2110, 0x3F4CCCCD},
+    {0x804E2158, 0x3D50E560},
+    // Staling, item grab toggle, jumpsquat mode, value, minimum and maximum
+    {0x804E2194, 0},
+    {0x804E21E0, 0},
+    {0x804E2228, 0},
+    {0x804E22D8, 3},
+    {0x804E2318, 1},
+    {0x804E2360, 0xE10},
+    // Flight Mode, its speeds and accelerations
+    {0x804E23BC, 0},
+    {0x804E23EC, 0x40000000},
+    {0x804E2428, 0x40000000},
+    {0x804E24A0, 0x3F800000},
+    {0x804E24E0, 0x3F800000},
+}};
+static_assert(std::ranges::all_of(CODE_MENU_DEFAULTS, [](const CodeMenuWord& word) {
+  return word.address >= CODE_MENU && word.address % 4 == 0 && word.address + 4 <= CODE_MENU_END;
+}));
+
+// Project+'s Code Menu under a locking header: off, closed, every value at its default.
+void ForceCodeMenu(Writer& w)
+{
+  if (!CodeMenuPresent(w.m))
+    return;
+  // Open: close it as its own Start does, giving the game its pause word back.
+  if (w.m.Read32(CODE_MENU_STATE) == CODE_MENU_OPEN)
+    w.U32(CODE_MENU_GAME_PAUSE, w.m.Read32(CODE_MENU_SAVED_PAUSE));
+  // Every other state too: 1 opens without the activation check, 3 swaps characters.
+  w.U32(CODE_MENU_STATE, 0);
+  // One read per word: CodeMenuPresent checked the range is mapped.
+  for (const CodeMenuWord& word : CODE_MENU_DEFAULTS)
+  {
+    if (w.m.Read32(word.address) != word.value)
+      w.U32(word.address, word.value);
+  }
+}
+
+// gmSelCharData, the character select's record: each port's slot at +0x0A + 4 x port, its
+// character at OnlineSeats::RECORD_PLAYERS + port x RECORD_PLAYER_SIZE. Project+'s character select
+// writes Giga Bowser or Wario-Man there as it ends, when the player holds shield (L; R is a costume
+// button) on a Bowser or Wario pick. On the way to the fight the record's characters are copied
+// into the init data again.
+constexpr u32 RECORD_SLOTS = 0x0A;
+constexpr u32 RECORD_SLOT_SIZE = 4;
+constexpr u8 SLOT_BOWSER = 0x0C;
+constexpr u8 SLOT_WARIO = 0x15;
+constexpr u8 SLOT_GIGA_BOWSER = 0x38;
+constexpr u8 SLOT_WARIO_MAN = 0x36;
+
+// `v` with `from` replaced by `to`.
+u8 Swap(u8 v, u8 from, u8 to)
+{
+  return v == from ? to : v;
+}
+
+// Project+'s banned fighters become Bowser and Wario, from the character select until the fight
+// loads: in the match's init data and in the record the init data is copied from.
+void ForceLegalFighters(Writer& w, const std::string& scene)
+{
+  if (scene != SCENE_CSS && scene != SCENE_SSS && scene != SCENE_BETWEEN)
+    return;
+  const auto legal = [](u8 c) {
+    return Swap(Swap(c, CHARACTER_GIGA_BOWSER, CHARACTER_BOWSER), CHARACTER_WARIO_MAN,
+                CHARACTER_WARIO);
+  };
+  if (const u32 melee = GlobalField(w.m, GLOBAL_MODE_MELEE);
+      melee && w.m.Valid(melee + MELEE_PLAYERS + 4 * MELEE_PLAYER_SIZE - 1))
+  {
+    for (u32 i = 0; i < 4; ++i)
+    {
+      const u32 p = melee + MELEE_PLAYERS + i * MELEE_PLAYER_SIZE;
+      w.U8(p, legal(w.m.Read8(p)));
+    }
+  }
+  namespace S = OnlineSeats;
+  if (const u32 record = GlobalField(w.m, S::GLOBAL_SEL_CHAR);
+      record && w.m.Valid(record + S::RECORD_PLAYERS + 4 * S::RECORD_PLAYER_SIZE - 1))
+  {
+    for (u32 i = 0; i < 4; ++i)
+    {
+      const u32 p = record + S::RECORD_PLAYERS + i * S::RECORD_PLAYER_SIZE;
+      w.U8(p, legal(w.m.Read8(p)));
+      const u32 slot = record + RECORD_SLOTS + i * RECORD_SLOT_SIZE;
+      w.U8(slot, Swap(Swap(w.m.Read8(slot), SLOT_GIGA_BOWSER, SLOT_BOWSER), SLOT_WARIO_MAN,
+                      SLOT_WARIO));
+    }
+  }
+}
+
 // Ranked character select no-ready timer (MatchBlock CSS_TIMER, CSS_NO_SHOW). Elapsed time is the
 // frame number minus CSS_TIMER_START, never an incremented counter, so rollback re-runs agree.
 void ReadyTimer(Writer& w, const Header& h, const std::string& scene, int frame)
@@ -403,6 +567,24 @@ std::array<PlayerPick, 4> ReadPicks(const GuestMemory& m)
   return Picks(m);
 }
 
+std::span<const CodeMenuWord> CodeMenuDefaults()
+{
+  return CODE_MENU_DEFAULTS;
+}
+
+bool CodeMenuPresent(const GuestMemory& m)
+{
+  if (!m.Valid(CODE_MENU) || !m.Valid(CODE_MENU_END - 1) || !Pointer(m, CODE_MENU_GAME_PAUSE))
+    return false;
+  // The page shown, within the file; the root page, as the menu itself checks; and two lines'
+  // sizes and pointers (Code Menu Activation, Flight Mode).
+  const u32 page = m.Read32(CODE_MENU);
+  return page >= CODE_MENU_ROOT && page < CODE_MENU_END &&
+         m.Read32(CODE_MENU + 4) == CODE_MENU_ROOT && m.Read16(0x804E0C30) == 0x0058 &&
+         m.Read32(0x804E0C48) == 0x804E0C30 &&
+         m.Read16(0x804E23B4) == 0x0030 && m.Read32(0x804E23CC) == 0x804E0F00;
+}
+
 namespace
 {
 // A header, for the log.
@@ -460,6 +642,9 @@ int WriteHeader(GuestMemory& m, Mode mode, Ruleset ruleset, u8 coin, u32 room, u
       for (u32 i = 0; i < B::SAVED_RSS_SIZE; ++i)
         w.U8(PPLUS_RSS + i, m.Read8(B::SAVED_RSS + i));
     }
+    // Project+'s Code Menu opens again as the player had it. Its values stay at their defaults.
+    if ((flags & 4) && CodeMenuPresent(m) && m.Read8(B::SAVED_CODE_MENU) <= CODE_MENU_OFF)
+      w.U32(CODE_MENU_ACTIVATION, m.Read8(B::SAVED_CODE_MENU));
     w.Zero(B::BASE, B::SIZE);
     // Also clear the character order and ranked set beyond the first 512 bytes.
     w.Zero(B::CHAR_ORDER, B::FULL_SIZE - (B::CHAR_ORDER - B::BASE));
@@ -503,6 +688,12 @@ int WriteHeader(GuestMemory& m, Mode mode, Ruleset ruleset, u8 coin, u32 room, u
         w.U8(B::SAVED_RSS + i, m.Read8(PPLUS_RSS + i));
       flags |= 2;
     }
+    if (ruleset == Ruleset::PPlus && CodeMenuPresent(m) &&
+        m.Read32(CODE_MENU_ACTIVATION) <= CODE_MENU_OFF)
+    {
+      w.U8(B::SAVED_CODE_MENU, static_cast<u8>(m.Read32(CODE_MENU_ACTIVATION)));
+      flags |= 4;
+    }
     w.U8(B::SAVED_FLAGS, flags);
   }
   // Write the magic last so a reader never sees a half-written header. Then start a fresh set.
@@ -525,6 +716,11 @@ int ApplyLocks(GuestMemory& m, int frame)
   Writer w{m};
   const std::string scene = ReadSceneName(m);
   ForceRules(w, h);
+  if (h.ruleset == Ruleset::PPlus)
+  {
+    ForceCodeMenu(w);
+    ForceLegalFighters(w, scene);
+  }
   ForceStages(w, h, scene);
   ReadyTimer(w, h, scene, frame);
   return w.changed;
@@ -537,6 +733,12 @@ Rollback::InputGate::Masks GateMasks(const GuestMemory& m)
   if (!h.Locked())
     return masks;
   const std::string scene = ReadSceneName(m);
+  // Project+'s Code Menu and debug codes open on L+R+Down: Down is dropped while both are held.
+  if (h.ruleset == Ruleset::PPlus)
+  {
+    for (Rollback::InputGate::Mask& mask : masks)
+      mask.drop_with_lr = PAD_BUTTON_DOWN;
+  }
   u16 buttons = 0;
   if (scene == SCENE_CSS)
   {

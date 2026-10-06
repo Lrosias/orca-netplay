@@ -185,6 +185,47 @@ TEST(OrcaInputGate, TheStickCentresWhileAIsDown)
   EXPECT_EQ(Apply(none, mask).stickX, 200);
 }
 
+TEST(OrcaInputGate, DownDropsOnlyWhileLAndRAreBothHeld)
+{
+  // Project+'s Code Menu chord: D-pad Down reads released while L and R are both held, by button or
+  // by a quarter press. Shield (L, R, their analog values) and the rest stay the player's.
+  Mask mask;
+  mask.drop_with_lr = PAD_BUTTON_DOWN;
+  EXPECT_FALSE(mask.Empty());
+  GCPadStatus pad{};
+  pad.isConnected = true;
+  pad.button = PAD_TRIGGER_L | PAD_TRIGGER_R | PAD_BUTTON_DOWN | PAD_BUTTON_A;
+  pad.triggerLeft = 0xFF;
+  pad.triggerRight = 0xFF;
+  GCPadStatus out = Apply(pad, mask);
+  EXPECT_EQ(out.button, PAD_TRIGGER_L | PAD_TRIGGER_R | PAD_BUTTON_A);
+  EXPECT_EQ(out.triggerLeft, 0xFF);
+  EXPECT_EQ(out.triggerRight, 0xFF);
+  EXPECT_TRUE(Same(Apply(out, mask), out));
+  // Analog only, at a quarter press each: still the chord.
+  pad.button = PAD_BUTTON_DOWN;
+  pad.triggerLeft = TRIGGER_HELD;
+  pad.triggerRight = 0xC0;
+  EXPECT_EQ(Apply(pad, mask).button, 0);
+  // One trigger resting, or released: Down is a taunt again.
+  pad.triggerLeft = TRIGGER_HELD - 1;
+  EXPECT_EQ(Apply(pad, mask).button, PAD_BUTTON_DOWN);
+  pad.button = PAD_TRIGGER_R | PAD_BUTTON_DOWN;
+  pad.triggerLeft = 0;
+  EXPECT_EQ(Apply(pad, mask).button, PAD_TRIGGER_R | PAD_BUTTON_DOWN);
+  pad.button = PAD_TRIGGER_L | PAD_BUTTON_DOWN;
+  pad.triggerRight = 0x10;
+  EXPECT_EQ(Apply(pad, mask).button, PAD_TRIGGER_L | PAD_BUTTON_DOWN);
+  // L and R themselves are never dropped by the chord.
+  Mask triggers;
+  triggers.drop_with_lr = PAD_TRIGGER_L | PAD_TRIGGER_R | PAD_BUTTON_DOWN;
+  pad.button = PAD_TRIGGER_L | PAD_TRIGGER_R | PAD_BUTTON_DOWN;
+  pad.triggerLeft = pad.triggerRight = 0xFF;
+  out = Apply(pad, triggers);
+  EXPECT_EQ(out.button, PAD_TRIGGER_L | PAD_TRIGGER_R);
+  EXPECT_EQ(out.triggerLeft, 0xFF);
+}
+
 TEST(OrcaInputGate, AllIsANeutralConnectedPadButOriginBitsStay)
 {
   const GCPadStatus out = Apply(Busy(), ALL);

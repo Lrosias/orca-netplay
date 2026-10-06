@@ -114,7 +114,13 @@ GCPadStatus Apply(const GCPadStatus& pad, const Mask& mask)
   if (!pad.isConnected || mask.Empty())
     return pad;
   GCPadStatus out = pad;
-  const u16 buttons = mask.buttons & ALL_BUTTONS;
+  u16 buttons = mask.buttons & ALL_BUTTONS;
+  if (TriggerHeld((pad.button & PAD_TRIGGER_L) != 0, pad.triggerLeft) &&
+      TriggerHeld((pad.button & PAD_TRIGGER_R) != 0, pad.triggerRight))
+  {
+    // Only digital bits: L and R keep their analog values.
+    buttons |= mask.drop_with_lr & ALL_BUTTONS & ~(PAD_TRIGGER_L | PAD_TRIGGER_R);
+  }
   out.button = static_cast<u16>(pad.button & ~buttons);
   if (buttons & PAD_TRIGGER_L)
     out.triggerLeft = 0;

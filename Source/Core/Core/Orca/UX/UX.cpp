@@ -47,6 +47,7 @@ void Merge(Rollback::InputGate::Masks& masks, const Rollback::InputGate::Masks& 
     masks[port].main_stick = masks[port].main_stick || more[port].main_stick;
     masks[port].c_stick = masks[port].c_stick || more[port].c_stick;
     masks[port].a_centres_stick = masks[port].a_centres_stick || more[port].a_centres_stick;
+    masks[port].drop_with_lr |= more[port].drop_with_lr;
     if (more[port].steer)
     {
       masks[port].steer = true;

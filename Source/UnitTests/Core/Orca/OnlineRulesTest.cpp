@@ -1030,3 +1030,333 @@ TEST(OrcaOnlineRules, AQueueRoomNeverMakesAKeyframeWithoutItsHeader)
   for (int i = 0; i < 2 * HEADER_FAIL_BOUNDARIES; ++i)
     EXPECT_NE(StepHeaderWait(&waited, false, true, false), HeaderWait::Fail);
 }
+
+// ---- Project+'s Code Menu and banned fighters (OnlineRules.h) ----
+namespace
+{
+constexpr u32 FLIGHT = 0x804E23BC;
+constexpr u32 P1_SHIELD = 0x804E0F08;
+constexpr u32 P2_ALC = 0x804E1534;
+constexpr u32 HITSTUN = 0x804E1E28;
+constexpr u32 DEBUG_MODE = 0x804E0D3C;
+
+// Project+'s Code Menu as its netplay codeset loads it: the layout CodeMenuPresent checks, the
+// defaults, a player's cheats on top, and the game's pause word.
+void LoadCodeMenu(FakeMemory& m, u32 activation = 0)
+{
+  m.Fill(CODE_MENU, CODE_MENU_END - CODE_MENU);
+  m.Write32(CODE_MENU, CODE_MENU_ROOT);
+  m.Write32(CODE_MENU + 4, CODE_MENU_ROOT);
+  m.Write16(0x804E0C30, 0x0058);
+  m.Write32(0x804E0C48, 0x804E0C30);
+  m.Write16(0x804E23B4, 0x0030);
+  m.Write32(0x804E23CC, 0x804E0F00);
+  for (const CodeMenuWord& word : CodeMenuDefaults())
+    m.Write32(word.address, word.value);
+  m.Write32(CODE_MENU_ACTIVATION, activation);
+  for (int port = 0; port < 4; ++port)
+    m.Write32(CODE_MENU_CHARACTERS[port], 0x0C);
+  m.Fill(CODE_MENU_GAME_PAUSE, 4);
+  m.writes = 0;
+}
+
+void Cheat(FakeMemory& m)
+{
+  m.Write32(FLIGHT, 1);
+  m.Write32(P1_SHIELD, 1);
+  m.Write32(P2_ALC, 1);
+  m.Write32(HITSTUN, 0x3F800000);
+  m.Write32(DEBUG_MODE, 1);
+  m.Write32(CODE_MENU_ACTIVATION, 0);
+}
+
+FakeMemory PPlusWithCodeMenu(Mode mode, std::string_view scene, u8 flags = 0)
+{
+  FakeMemory m = Game(scene);
+  LoadCodeMenu(m);
+  WriteHeader(m, mode, Ruleset::PPlus, 0, 0, flags);
+  m.writes = 0;
+  return m;
+}
+
+std::map<u32, u8> CodeMenuBytes(const FakeMemory& m)
+{
+  std::map<u32, u8> out;
+  for (u32 a = CODE_MENU; a < CODE_MENU_END; ++a)
+    out[a] = m.Read8(a);
+  return out;
+}
+}  // namespace
+
+// The table holds 73 distinct words inside the file, activation as OFF, and never a Character
+// Select line.
+TEST(OrcaOnlineRules, TheCodeMenuDefaultsAreTheFilesWords)
+{
+  const auto defaults = CodeMenuDefaults();
+  EXPECT_EQ(defaults.size(), 73u);
+  std::map<u32, u32> seen;
+  for (const CodeMenuWord& word : defaults)
+  {
+    EXPECT_GE(word.address, CODE_MENU_ROOT);
+    EXPECT_LT(word.address + 3, CODE_MENU_END);
+    EXPECT_EQ(word.address % 4, 0u);
+    EXPECT_TRUE(seen.emplace(word.address, word.value).second) << std::hex << word.address;
+    for (u32 character : CODE_MENU_CHARACTERS)
+      EXPECT_NE(word.address, character);
+  }
+  EXPECT_EQ(seen[CODE_MENU_ACTIVATION], CODE_MENU_OFF);
+  EXPECT_EQ(seen[FLIGHT], 0u);
+  EXPECT_EQ(seen[0x804E0ECC], 1u);  // HUD on
+}
+
+// Under every locking header (casual, ranked, the queue's own character select), in every scene:
+// the menu off, its cheats back to the defaults, the characters left to the fighters. Twice is
+// once.
+TEST(OrcaOnlineRules, TheCodeMenuIsOffAndAtItsDefaultsUnderAProjectPlusHeader)
+{
+  for (const u8 flags : {u8{0}, u8{MB::FLAG_QUEUE2}, u8(MB::FLAG_SOLO | MB::FLAG_QUEUE2)})
+  {
+    for (Mode mode : {Mode::Casual, Mode::Ranked})
+    {
+      for (const char* scene : {"scSelctCharacter", "scSelStage", "scMemoryChange", "scMelee",
+                                "scVsResult"})
+      {
+        FakeMemory m = PPlusWithCodeMenu(mode, scene, flags);
+        Cheat(m);
+        m.Write32(CODE_MENU_CHARACTERS[1], 0x2C);
+        EXPECT_GT(ApplyLocks(m, NextFrame()), 0) << scene;
+        EXPECT_EQ(m.Read32(CODE_MENU_ACTIVATION), CODE_MENU_OFF) << scene;
+        EXPECT_EQ(m.Read32(FLIGHT), 0u);
+        EXPECT_EQ(m.Read32(P1_SHIELD), 0u);
+        EXPECT_EQ(m.Read32(P2_ALC), 0u);
+        EXPECT_EQ(m.Read32(DEBUG_MODE), 0u);
+        EXPECT_EQ(m.Read32(HITSTUN), 0x3ECCCCCDu);
+        for (const CodeMenuWord& word : CodeMenuDefaults())
+          EXPECT_EQ(m.Read32(word.address), word.value) << std::hex << word.address;
+        EXPECT_EQ(m.Read32(CODE_MENU_CHARACTERS[0]), 0x0Cu);
+        EXPECT_EQ(m.Read32(CODE_MENU_CHARACTERS[1]), 0x2Cu);
+        m.writes = 0;
+        EXPECT_EQ(ApplyLocks(m, NextFrame()), 0) << scene;
+        EXPECT_EQ(m.writes, 0);
+      }
+    }
+  }
+}
+
+// Open, the menu pauses the game. The locks close it the way its own Start does, giving the pause
+// word back; any other state closes too (1 would open without the activation check, 3 swaps
+// characters).
+TEST(OrcaOnlineRules, AnOpenCodeMenuClosesAndTheGameRunsAgain)
+{
+  FakeMemory m = PPlusWithCodeMenu(Mode::Ranked, "scMelee");
+  m.Write32(CODE_MENU_STATE, CODE_MENU_OPEN);
+  m.Write32(CODE_MENU_SAVED_PAUSE, 0);
+  m.Write32(CODE_MENU_GAME_PAUSE, 1);
+  ApplyLocks(m, NextFrame());
+  EXPECT_EQ(m.Read32(CODE_MENU_STATE), 0u);
+  EXPECT_EQ(m.Read32(CODE_MENU_GAME_PAUSE), 0u);
+  m.writes = 0;
+  EXPECT_EQ(ApplyLocks(m, NextFrame()), 0);
+  for (u32 state : {1u, 2u, 3u})
+  {
+    m.Write32(CODE_MENU_STATE, state);
+    // Paused some other way: left alone.
+    m.Write32(CODE_MENU_GAME_PAUSE, 1);
+    ApplyLocks(m, NextFrame());
+    EXPECT_EQ(m.Read32(CODE_MENU_STATE), 0u) << state;
+    EXPECT_EQ(m.Read32(CODE_MENU_GAME_PAUSE), 1u) << state;
+  }
+}
+
+// Nothing is written without a Project+ header, with Brawl's, or when the memory isn't the pinned
+// menu's layout.
+TEST(OrcaOnlineRules, TheCodeMenuIsLeftAloneWithoutItsHeaderOrItsLayout)
+{
+  {
+    FakeMemory m = Game("scMelee");
+    LoadCodeMenu(m);
+    Cheat(m);
+    const auto before = CodeMenuBytes(m);
+    EXPECT_EQ(ApplyLocks(m, NextFrame()), 0);
+    EXPECT_EQ(CodeMenuBytes(m), before);
+  }
+  {
+    FakeMemory m = Game("scMelee");
+    LoadCodeMenu(m);
+    WriteHeader(m, Mode::Ranked, Ruleset::Brawl);
+    Cheat(m);
+    const auto before = CodeMenuBytes(m);
+    ApplyLocks(m, NextFrame());
+    EXPECT_EQ(CodeMenuBytes(m), before);
+  }
+  const struct
+  {
+    u32 address;
+    u32 value;
+  } breaks[] = {
+      {CODE_MENU, 0x804E0000},     {CODE_MENU, CODE_MENU_END}, {CODE_MENU + 4, 0x804E0800},
+      {0x804E0C30, 0x00540000},   {0x804E0C48, 0x804E0C34},   {0x804E23B4, 0x00340000},
+      {0x804E23CC, 0x804E0F40},
+  };
+  for (const auto& broken : breaks)
+  {
+    FakeMemory m = PPlusWithCodeMenu(Mode::Ranked, "scMelee");
+    m.Write32(broken.address, broken.value);
+    EXPECT_FALSE(CodeMenuPresent(m)) << std::hex << broken.address;
+    Cheat(m);
+    m.Write32(CODE_MENU_STATE, CODE_MENU_OPEN);
+    const auto before = CodeMenuBytes(m);
+    ApplyLocks(m, NextFrame());
+    EXPECT_EQ(CodeMenuBytes(m), before) << std::hex << broken.address;
+  }
+  // Not mapped (the game still loading): nothing.
+  FakeMemory empty = Locked(Mode::Ranked, Ruleset::PPlus, "scMelee");
+  EXPECT_FALSE(CodeMenuPresent(empty));
+}
+
+// The header saves the player's activation and its clear gives it back; the values stay at their
+// defaults. A later header (the queue's own character select, then the room's) keeps the first
+// save.
+TEST(OrcaOnlineRules, ClearingGivesBackTheCodeMenusActivation)
+{
+  FakeMemory m = Game("scSelctCharacter");
+  LoadCodeMenu(m, 1);  // PM 3.6
+  m.Write32(FLIGHT, 1);
+  WriteHeader(m, Mode::Ranked, Ruleset::PPlus, 0, 0, MB::FLAG_SOLO | MB::FLAG_QUEUE2);
+  EXPECT_EQ(m.Read8(MB::SAVED_CODE_MENU), 1);
+  EXPECT_EQ(m.Read8(MB::SAVED_FLAGS) & 4, 4);
+  ApplyLocks(m, NextFrame());
+  EXPECT_EQ(m.Read32(CODE_MENU_ACTIVATION), CODE_MENU_OFF);
+  WriteHeader(m, Mode::Ranked, Ruleset::PPlus, 1, 0x1234, MB::FLAG_QUEUE2);
+  ApplyLocks(m, NextFrame());
+  EXPECT_EQ(m.Read8(MB::SAVED_CODE_MENU), 1);
+  EXPECT_GT(WriteHeader(m, Mode::None, Ruleset::PPlus), 0);
+  EXPECT_EQ(m.Read32(CODE_MENU_ACTIVATION), 1u);
+  EXPECT_EQ(m.Read32(FLIGHT), 0u);
+  // Without the menu when the header came, there is nothing to give back.
+  FakeMemory late = Game("scSelctCharacter");
+  WriteHeader(late, Mode::Casual, Ruleset::PPlus);
+  EXPECT_EQ(late.Read8(MB::SAVED_FLAGS) & 4, 0);
+  LoadCodeMenu(late, 0);
+  ApplyLocks(late, NextFrame());
+  WriteHeader(late, Mode::None, Ruleset::PPlus);
+  EXPECT_EQ(late.Read32(CODE_MENU_ACTIVATION), CODE_MENU_OFF);
+  // Brawl's header never saves one.
+  FakeMemory brawl = Game("scSelctCharacter");
+  LoadCodeMenu(brawl, 0);
+  WriteHeader(brawl, Mode::Casual, Ruleset::Brawl);
+  EXPECT_EQ(brawl.Read8(MB::SAVED_FLAGS) & 4, 0);
+}
+
+// Giga Bowser and Wario-Man (Project+'s character select makes them from a Bowser or Wario pick
+// with shield held as it ends) go to the fight as Bowser and Wario: in the init data and in the
+// character select's record (gmSelCharData: slots at +0x0A + 4 x port, characters at +0xB8 + port x
+// 0x5C), on the character select, the stage select and between. The fight itself and other
+// characters are left alone.
+namespace
+{
+constexpr u32 RECORD = 0x90180B40;
+u32 RecordCharacter(int port)
+{
+  return RECORD + 0xB8 + static_cast<u32>(port) * 0x5C;
+}
+u32 RecordSlot(int port)
+{
+  return RECORD + 0x0A + static_cast<u32>(port) * 4;
+}
+void BuildRecord(FakeMemory& m)
+{
+  m.Write32(0x90181300 + 0x10, RECORD);
+  m.Fill(RECORD, 0xB8 + 4 * 0x5C);
+  for (int port = 0; port < 4; ++port)
+  {
+    m.Write8(RecordCharacter(port), NONE);
+    m.Write8(RecordSlot(port), 0x28);
+  }
+}
+}  // namespace
+
+TEST(OrcaOnlineRules, ProjectPlusBannedFightersPlayAsTheirBaseFighters)
+{
+  for (Mode mode : {Mode::Casual, Mode::Ranked})
+  {
+    for (const char* scene : {"scSelctCharacter", "scSelStage", "scMemoryChange"})
+    {
+      FakeMemory m = Locked(mode, Ruleset::PPlus, scene);
+      BuildRecord(m);
+      SetPick(m, 0, HUMAN, CHARACTER_GIGA_BOWSER);
+      SetPick(m, 1, HUMAN, CHARACTER_WARIO_MAN);
+      SetPick(m, 2, NOBODY, 0x11);  // Sopo stays
+      m.Write8(RecordCharacter(0), CHARACTER_GIGA_BOWSER);
+      m.Write8(RecordCharacter(1), CHARACTER_WARIO_MAN);
+      m.Write8(RecordCharacter(2), 0x11);
+      m.Write8(RecordSlot(0), 0x38);
+      m.Write8(RecordSlot(1), 0x36);
+      m.Write8(RecordSlot(2), 0x37);  // Sopo's slot stays
+      ApplyLocks(m, NextFrame());
+      EXPECT_EQ(ReadPicks(m)[0].character, CHARACTER_BOWSER) << scene;
+      EXPECT_EQ(ReadPicks(m)[1].character, CHARACTER_WARIO) << scene;
+      EXPECT_EQ(m.Read8(MELEE + 0x98 + 2 * 0x5C), 0x11);
+      EXPECT_EQ(m.Read8(RecordCharacter(0)), CHARACTER_BOWSER) << scene;
+      EXPECT_EQ(m.Read8(RecordCharacter(1)), CHARACTER_WARIO) << scene;
+      EXPECT_EQ(m.Read8(RecordCharacter(2)), 0x11);
+      EXPECT_EQ(m.Read8(RecordSlot(0)), 0x0C) << scene;
+      EXPECT_EQ(m.Read8(RecordSlot(1)), 0x15) << scene;
+      EXPECT_EQ(m.Read8(RecordSlot(2)), 0x37);
+      m.writes = 0;
+      EXPECT_EQ(ApplyLocks(m, NextFrame()), 0);
+    }
+  }
+  FakeMemory fight = Locked(Mode::Ranked, Ruleset::PPlus, "scMelee");
+  BuildRecord(fight);
+  SetPick(fight, 0, HUMAN, CHARACTER_GIGA_BOWSER);
+  fight.Write8(RecordSlot(0), 0x38);
+  ApplyLocks(fight, NextFrame());
+  EXPECT_EQ(ReadPicks(fight)[0].character, CHARACTER_GIGA_BOWSER);
+  EXPECT_EQ(fight.Read8(RecordSlot(0)), 0x38);
+  FakeMemory brawl = Locked(Mode::Ranked, Ruleset::Brawl);
+  SetPick(brawl, 0, HUMAN, CHARACTER_GIGA_BOWSER);
+  ApplyLocks(brawl, NextFrame());
+  EXPECT_EQ(ReadPicks(brawl)[0].character, CHARACTER_GIGA_BOWSER);
+  FakeMemory friends = Game("scSelctCharacter");
+  SetPick(friends, 0, HUMAN, CHARACTER_WARIO_MAN);
+  ApplyLocks(friends, NextFrame());
+  EXPECT_EQ(ReadPicks(friends)[0].character, CHARACTER_WARIO_MAN);
+}
+
+// D-pad Down never reaches a Project+ game while L and R are held, in every scene under a header:
+// the Code Menu's chord. Brawl and friends games keep it.
+TEST(OrcaOnlineRules, ProjectPlusNeverSeesTheCodeMenusChord)
+{
+  for (const char* scene : {"scSelctCharacter", "scSelStage", "scMemoryChange", "scMelee",
+                            "scVsResult", "muMenuMain"})
+  {
+    FakeMemory p = Locked(Mode::Ranked, Ruleset::PPlus, scene);
+    for (const auto& mask : GateMasks(p))
+      EXPECT_EQ(mask.drop_with_lr, PAD_BUTTON_DOWN) << scene;
+    FakeMemory b = Locked(Mode::Ranked, Ruleset::Brawl, scene);
+    for (const auto& mask : GateMasks(b))
+      EXPECT_EQ(mask.drop_with_lr, 0) << scene;
+    FakeMemory friends = Game(scene);
+    for (const auto& mask : GateMasks(friends))
+      EXPECT_TRUE(mask.Empty()) << scene;
+  }
+  // In the fight, Start stays masked and nothing else.
+  FakeMemory fight = Locked(Mode::Casual, Ruleset::PPlus, "scMelee");
+  for (const auto& mask : GateMasks(fight))
+    EXPECT_EQ(mask.buttons, PAD_BUTTON_START);
+}
+
+// A re-run from the same memory writes the same bytes (the Code Menu and the fighters included).
+TEST(OrcaOnlineRules, TheCodeMenuLockIsAPureFunctionOfMemory)
+{
+  FakeMemory a = PPlusWithCodeMenu(Mode::Ranked, "scSelStage");
+  Cheat(a);
+  a.Write32(CODE_MENU_STATE, CODE_MENU_OPEN);
+  a.Write32(CODE_MENU_SAVED_PAUSE, 0);
+  a.Write32(CODE_MENU_GAME_PAUSE, 1);
+  SetPick(a, 0, HUMAN, CHARACTER_WARIO_MAN);
+  FakeMemory b = a;
+  EXPECT_EQ(ApplyLocks(a, 700), ApplyLocks(b, 700));
+  EXPECT_EQ(a.bytes, b.bytes);
+}

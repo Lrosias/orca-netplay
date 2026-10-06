@@ -5,6 +5,7 @@
 
 #include <array>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -20,7 +21,8 @@ class CPUThreadGuard;
 // Online rules for casual and ranked queue matches. The host writes a header (mode, ruleset, coin,
 // room hash) into the match block while its game is not yet shared, and the joiner checks it after
 // loading the keyframe. While the header locks, every frame enforces the ruleset's rules, the
-// stage choice, the legal stage list and the input gate's masks.
+// stage choice, the legal stage list, Project+'s Code Menu and fighters, and the input gate's
+// masks.
 // Everything except writing the header is a pure function of emulated memory, so it runs the same
 // on both machines and on rollback re-runs. Friends rooms have no header and only get SessionMasks.
 // See ORCA.md, "Online rules".
@@ -70,7 +72,9 @@ bool HeaderIs(const Header& in_memory, const Header& wanted);
 // `frame` drives the ranked ready timer. Returns the bytes changed (0 without a locking header).
 int ApplyLocks(GuestMemory& memory, int frame);
 
-// What the input gate masks for the frame about to run (read only).
+// What the input gate masks for the frame about to run (read only). In Project+, D-pad Down never
+// reaches the game while L and R are held, in every scene: the Code Menu's chord and the debug
+// codes' own.
 Rollback::InputGate::Masks GateMasks(const GuestMemory& memory);
 
 // ---- Every session, with or without a header ----
@@ -178,6 +182,44 @@ constexpr u32 BRAWL_FINAL_DESTINATION_BIT = 0x00000002;
 // gmCharacterKind values. The character select writes each pick into the match's init data.
 constexpr int CHARACTER_ICE_CLIMBERS = 0x10;
 constexpr int CHARACTER_NONE = 0x3E;
+// Project+'s banned fighters (its character select makes them from a Bowser or Wario pick with L
+// held as it ends) and the fighters the locks play instead.
+constexpr int CHARACTER_BOWSER = 0x0C;
+constexpr int CHARACTER_WARIO = 0x17;
+constexpr int CHARACTER_GIGA_BOWSER = 0x2C;
+constexpr int CHARACTER_WARIO_MAN = 0x2D;
+
+// ---- Project+'s Code Menu ----
+// Project+'s netplay codeset loads its Code Menu (pf/menu3/dnet.cmnu) verbatim at CODE_MENU. Any
+// port opens it with L+R+Down in any scene, mid-fight too, or with the main menu's button. Open, it
+// pauses both games; from it a player can turn on flight, infinite shield and debug displays, swap
+// any port's character and change gameplay constants, all in sync. Under a locking header the
+// locks turn it off, close it and hold every cheat and gameplay value at the file's default. The
+// Character Select lines follow the fighters and are left alone. Friends rooms keep the menu.
+constexpr u32 CODE_MENU = 0x804E0000;
+constexpr u32 CODE_MENU_END = 0x804E2520;
+// The root page, the first after the file's header. The menu checks the word at CODE_MENU + 4.
+constexpr u32 CODE_MENU_ROOT = 0x804E07D8;
+// u32: 0 closed, 1 the main menu's button (A or Start opens), 2 opening, 3 closing, 4 open.
+constexpr u32 CODE_MENU_STATE = 0x804E0034;
+constexpr u32 CODE_MENU_OPEN = 4;
+// u32: the game's pause word as the menu opened. Open, the menu writes 1 there every frame.
+constexpr u32 CODE_MENU_SAVED_PAUSE = 0x804E006C;
+constexpr u32 CODE_MENU_GAME_PAUSE = 0x805B8A08;
+// u32 Code Menu Activation: 0 Default (any scene), 1 PM 3.6 (not mid-fight), 2 OFF.
+constexpr u32 CODE_MENU_ACTIVATION = 0x804E0C38;
+constexpr u32 CODE_MENU_OFF = 2;
+// P1-P4's Character Select values.
+constexpr std::array<u32, 4> CODE_MENU_CHARACTERS{0x804E0F48, 0x804E1424, 0x804E1688, 0x804E18EC};
+struct CodeMenuWord
+{
+  u32 address;
+  u32 value;
+};
+// The words the locks hold: dnet.cmnu's defaults for every cheat and gameplay line, activation OFF.
+std::span<const CodeMenuWord> CodeMenuDefaults();
+// Whether memory holds the pinned release's menu, by its layout. Nothing is written without it.
+bool CodeMenuPresent(const GuestMemory& memory);
 
 // One port's pick, from the match's init data (gmGlobalModeMelee +0x98 + port * 0x5C).
 struct PlayerPick

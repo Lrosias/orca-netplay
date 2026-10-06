@@ -1954,3 +1954,73 @@ TEST(OrcaOnlineMenuLobby, AFormerJoinersMoveToPort1NeverTakesTheMenuToWithFriend
     EXPECT_EQ(RunUntilMove(in, 120), -1);
   }
 }
+
+// ---- Play again after a ranked set (ORCA.md "Drop-in") ----
+
+TEST(OrcaOnlineMenuLobby, AFriendOnTheWayEndsTheHostsQueue)
+{
+  using Rollback::OnlineMatch::FriendEndsQueue;
+  using Rollback::OnlineMatch::FriendQueueInputs;
+  // On its own Ranked select after a set, hosting a friends room; an invite or an arrival ends it.
+  FriendQueueInputs in;
+  in.friend_coming = true;
+  in.queue_or_search = true;
+  in.friends_room = true;
+  EXPECT_TRUE(FriendEndsQueue(in));
+  const auto without = [&in](auto change) {
+    FriendQueueInputs other = in;
+    change(other);
+    return FriendEndsQueue(other);
+  };
+  // Nobody on the way (the queue's own character select as it is).
+  EXPECT_FALSE(without([](FriendQueueInputs& i) { i.friend_coming = false; }));
+  // Not on the queue: nothing to end (With Friends' character select, the menus).
+  EXPECT_FALSE(without([](FriendQueueInputs& i) { i.queue_or_search = false; }));
+  // A matched room, or one whose welcome hasn't come yet.
+  EXPECT_FALSE(without([](FriendQueueInputs& i) { i.friends_room = false; }));
+  // Not a host: joining, or on another port.
+  EXPECT_FALSE(without([](FriendQueueInputs& i) { i.joining = true; }));
+  EXPECT_FALSE(without([](FriendQueueInputs& i) { i.local_seat = 1; }));
+}
+
+TEST(OrcaOnlineMenuLobby, JoiningAFriendsRoomEndsTheJoinersQueue)
+{
+  using Rollback::OnlineMatch::JoinEndsQueue;
+  // From its own Ranked select, from the set's room (game kept), or searching: all of it ends.
+  EXPECT_TRUE(JoinEndsQueue(false, true, true));
+  EXPECT_TRUE(JoinEndsQueue(false, true, false));
+  EXPECT_TRUE(JoinEndsQueue(false, false, true));
+  // Nothing of the queue: nothing to do.
+  EXPECT_FALSE(JoinEndsQueue(false, false, false));
+  // A queue room's keyframe is the match: the queue and the kept game stay.
+  EXPECT_FALSE(JoinEndsQueue(true, true, true));
+  EXPECT_FALSE(JoinEndsQueue(true, false, true));
+}
+
+TEST(OrcaOnlineMenuLobby, AHostsPickIsArmedAgainOnceTheFriendsItEndedForAreGone)
+{
+  using Rollback::OnlineMatch::DecideFriendsPick;
+  using Rollback::OnlineMatch::FriendsPickInputs;
+  using Rollback::OnlineMatch::FriendsPickStep;
+  // The friend came in, played and left; alone again on the Ranked select: armed, Start searches.
+  FriendsPickInputs in;
+  in.played = true;
+  in.alone = true;
+  in.on_pick_select = true;
+  in.host_cap = true;
+  EXPECT_EQ(DecideFriendsPick(in), FriendsPickStep::Arm);
+  const auto with = [&in](auto change) {
+    FriendsPickInputs other = in;
+    change(other);
+    return DecideFriendsPick(other);
+  };
+  // An invite nobody took yet: wait for the friend.
+  EXPECT_EQ(with([](FriendsPickInputs& i) { i.played = false; }), FriendsPickStep::Wait);
+  // A friend still in or on the way, or the game elsewhere.
+  EXPECT_EQ(with([](FriendsPickInputs& i) { i.alone = false; }), FriendsPickStep::Wait);
+  EXPECT_EQ(with([](FriendsPickInputs& i) { i.on_pick_select = false; }), FriendsPickStep::Wait);
+  // A queue or search under way, no cap, or joined elsewhere.
+  EXPECT_EQ(with([](FriendsPickInputs& i) { i.queue_or_search = true; }), FriendsPickStep::Drop);
+  EXPECT_EQ(with([](FriendsPickInputs& i) { i.host_cap = false; }), FriendsPickStep::Drop);
+  EXPECT_EQ(with([](FriendsPickInputs& i) { i.elsewhere = true; }), FriendsPickStep::Drop);
+}
