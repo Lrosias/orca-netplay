@@ -594,7 +594,8 @@ void MemoryManager::DoState(PointerWrap& p)
     return;
   }
 
-  // Rollback snapshots copy RAM themselves (Core/Rollback), page by page on load.
+  // Rollback snapshots copy RAM themselves (Core/Rollback), page by page on load. This skip follows
+  // Brawlback's (Project-Plus-Dolphin, GPL-2.0-or-later), which reached Orca through our prototype.
   const bool skip_ram = Rollback::InSnapshotDoState();
   if (!skip_ram)
   {

@@ -131,10 +131,11 @@ match. Orca's design avoids needing that knowledge.
 
 ### Brawlback (Super Smash Bros. Brawl)
 
-Brawlback pioneered rollback for Brawl, and its published research informed our first experiments.
-Over time it moved to whole-console snapshots, like Orca. It kept Slippi's model of triggering saves
-and loads from code inside the game, though, and its save and load happen at two different points in
-the frame. That combination means the CPU state can't be restored exactly, so a few pieces were left out:
+Brawlback pioneered rollback for Brawl, and our work began on its code: our first prototype was a
+fork of it (below). Over time Brawlback moved to whole-console snapshots, like Orca. It kept Slippi's
+model of triggering saves and loads from code inside the game, though, and its save and load happen
+at two different points in the frame. That combination means the CPU state can't be restored
+exactly, so a few pieces were left out:
 
 - the CPU registers and stack;
 - the audio state;
@@ -144,12 +145,21 @@ The rest of the design works around those differences. It uses about 16 hooks: s
 Brawl's code that call into the emulator. They skip the draw call on replays, cut graphics waits
 short and keep random seeds in sync.
 
-Our first experiment, before Orca existed, ran our byte-for-byte test on Brawlback's approach. Every
-replayed frame differed in memory from the original, and restoring the missing pieces fixed that.
-With an exact restore, two of the hooks turned out to change the match by themselves: the draw skip
-and the shortened graphics waits. These are findings from that experiment under our test; we can't
-say which of them, if any, caused the desyncs Brawlback's players saw. What we learned there led to
-Orca's design, which we then built on current Dolphin with our own rollback code.
+Before Orca, we built a private prototype by forking Brawlback's Dolphin rollback branch
+(Project-Plus-Dolphin, GPL-2.0-or-later) and adding our own test harness. Running our byte-for-byte
+test on it, every replayed frame differed in memory from the original, and restoring the missing
+pieces fixed that. With an exact restore, two of Brawlback's hooks changed the match by themselves:
+the draw skip and the shortened graphics waits. These are findings from our prototype under our
+test; we can't say which of them, if any, caused the desyncs Brawlback's players saw.
+
+On 2026-10-01 we retired the prototype and started Orca as a separate fork of mainline Dolphin
+(release 2609), with rollback code we wrote ourselves. Some of our own code from the prototype
+carried over: the test harness and the emulator-side render skip. From Brawlback, Orca uses facts:
+two Brawl memory addresses (the end of the frame loop and the scene manager) and its documented
+findings. We compared Orca's code line by line with Brawlback's fork and found no copied code,
+with one exception: about four lines in `Source/Core/Core/HW/Memmap.cpp` that skip RAM when a
+rollback snapshot serializes memory follow Brawlback's version of the same block, and came to Orca
+through the prototype. They are credited in the code.
 
 ### Side by side
 
@@ -176,40 +186,17 @@ Orca's design, which we then built on current Dolphin with our own rollback code
 - **[Dolphin](https://github.com/dolphin-emu/dolphin)** is the emulator Orca is built on.
 - **[Slippi](https://github.com/project-slippi)** is the reference for how rollback should feel. We
   took ideas and constants from it, not code.
-- **[Brawlback](https://github.com/Brawlback-Team)** gave us Brawl's hook addresses and documented
-  findings. Orca contains no Brawlback code.
+- **[Brawlback](https://github.com/Brawlback-Team)**: our pre-Orca prototype was a fork of its Dolphin
+  rollback branch. Orca uses its Brawl addresses and findings, and one small block in `Memmap.cpp`
+  follows its code.
 - **The Brawl modding community:** some of Orca's game patches come from community Gecko codes
   (cheat-code-style patches), and
   are credited where they are used.
 
-## Explaining it to people
+## Correction, 2026-10-06
 
-**One sentence:**
-
-> "Rollback means rewinding the console a few frames and replaying them. We rewind all of it, at
-> one exact moment, so a replayed frame comes out identical to the original."
-
-**Thirty seconds:**
-
-> "When your opponent's input arrives late, the game rewinds a few frames and replays them with the
-> right input. That only works if the replay is identical to the original. Earlier approaches for
-> Brawl rewound most of the console and patched the gaps with hooks inside the game. We rewind the
-> whole console at one exact point, and we test it by rewinding every frame of full matches and
-> checking memory byte for byte. Once that passes, the game needs no changes at all."
-
-**An analogy:**
-
-> "Imagine rewinding a chess game. One approach puts the pieces back but leaves the clocks and the
-> scoresheet as they were, then adds house rules to cover the mismatches. We put back the pieces,
-> the clocks and the scoresheet, so no house rules are needed."
-
-**If someone asks what the new idea was:**
-
-> "There wasn't a new technique. Restoring the whole machine exactly is the textbook way to do
-> rollback in an emulator. The difference was testing: we made the emulator prove a rewound frame is
-> byte-for-byte identical before writing any netcode. That turned vague desyncs into specific bugs
-> we could fix."
-
-**What not to say:** that Brawlback "did it wrong", or that Orca is faster per frame. Brawlback's
-research informed the experiments that led to Orca's design, and we haven't measured the speed
-claim.
+An earlier version of this page said "Orca's first prototype was built from Brawlback's code." We
+reworded it the same day to "Our first experiment, before Orca existed, ran our byte-for-byte test
+on Brawlback's approach." That made it harder to see that the experiment was a fork of Brawlback's
+code, which was a mistake. The Brawlback section above gives the full account. The source of each
+released Orca is tagged in this repository as `orca-<version>`.
