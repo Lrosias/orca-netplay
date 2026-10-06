@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "Core/HW/SI/SI_DeviceGCController.h"
+#include "Core/Rollback/Rollback.h"
 
 #include "Common/ChunkFile.h"
 #include "Common/CommonTypes.h"
@@ -150,6 +151,10 @@ GCPadStatus CSIDevice_GCController::GetPadStatus()
   }
 
   HandleMoviePadStatus(m_system.GetMovie(), m_device_number, &pad_status);
+
+  // Rollback: the session (remote players) or the test harness supplies this port's input.
+  if (const auto pad = Rollback::InputOverride(m_device_number))
+    pad_status = *pad;
 
   // Our GCAdapter code sets PAD_GET_ORIGIN when a new device has been connected.
   // Watch for this to calibrate real controllers on connection.

@@ -396,6 +396,7 @@ add_library(core
   IOS/FS/HostBackend/File.cpp
   IOS/FS/HostBackend/FS.cpp
   IOS/FS/HostBackend/FS.h
+  IOS/FS/HostBackend/Journal.cpp
   IOS/IOS.cpp
   IOS/IOS.h
   IOS/IOSC.cpp
@@ -506,6 +507,97 @@ add_library(core
   NetPlayCommon.h
   NetPlayServer.cpp
   NetPlayServer.h
+  Orca/Branding.cpp
+  Orca/Branding.h
+  Orca/Disc.cpp
+  Orca/Disc.h
+  Orca/JitWarm.cpp
+  Orca/JitWarm.h
+  Orca/Launch.cpp
+  Orca/Launch.h
+  Orca/Profile.cpp
+  Orca/Profile.h
+  Orca/Status.cpp
+  Orca/Status.h
+  Orca/ThreadPriority.cpp
+  Orca/Session/DirectLink.cpp
+  Orca/Session/DirectLink.h
+  Orca/Session/Events.cpp
+  Orca/Session/Events.h
+  Orca/Session/Keyframe.cpp
+  Orca/Session/Keyframe.h
+  Orca/Session/Online.cpp
+  Orca/Session/Online.h
+  Orca/Session/PadCodec.h
+  Orca/Session/Session.cpp
+  Orca/Session/Session.h
+  Orca/Session/YouGameRoom.cpp
+  Orca/Session/YouGameRoom.h
+  Orca/UX/BrawlStages.cpp
+  Orca/UX/BrawlStages.h
+  Orca/UX/CharOrder.cpp
+  Orca/UX/CharOrder.h
+  Orca/UX/Chat.cpp
+  Orca/UX/Chat.h
+  Orca/UX/CssTitle.cpp
+  Orca/UX/CssTitle.h
+  Orca/UX/Controllers.cpp
+  Orca/UX/Controllers.h
+  Orca/UX/ControllerSource.cpp
+  Orca/UX/ControllerSource.h
+  Orca/UX/FreeSpace.h
+  Orca/UX/GameFont.cpp
+  Orca/UX/GameFont.h
+  Orca/UX/GamePatches.cpp
+  Orca/UX/GamePatches.h
+  Orca/UX/Kit.cpp
+  Orca/UX/Kit.h
+  Orca/UX/SetBlock.cpp
+  Orca/UX/SetBlock.h
+  Orca/UX/MatchBlock.cpp
+  Orca/UX/MatchBlock.h
+  Orca/UX/MenuText.cpp
+  Orca/UX/MenuText.h
+  Orca/UX/NameTags.cpp
+  Orca/UX/NameTags.h
+  Orca/UX/NativeText.cpp
+  Orca/UX/NativeText.h
+  Orca/UX/OnlineMenu.cpp
+  Orca/UX/OnlineMenu.h
+  Orca/UX/OnlineRules.cpp
+  Orca/UX/OnlineRules.h
+  Orca/UX/Overlay.cpp
+  Orca/UX/Overlay.h
+  Orca/UX/Probe.cpp
+  Orca/UX/Probe.h
+  Orca/UX/Queue.cpp
+  Orca/UX/Queue.h
+  Orca/UX/RankedSet.cpp
+  Orca/UX/RankedSet.h
+  Orca/UX/RankedPPlus.cpp
+  Orca/UX/RankedPPlus.h
+  Orca/UX/RankedSteps.cpp
+  Orca/UX/RankedSteps.h
+  Orca/UX/Relabel.cpp
+  Orca/UX/Relabel.h
+  Orca/UX/Results.cpp
+  Orca/UX/Results.h
+  Orca/UX/SetEnd.cpp
+  Orca/UX/SetEnd.h
+  Orca/UX/StageCursors.cpp
+  Orca/UX/StageCursors.h
+  Orca/UX/UX.cpp
+  Orca/UX/UX.h
+  Orca/UX/Widgets.cpp
+  Orca/UX/Widgets.h
+  Orca/UX/YgCard.cpp
+  Orca/UX/YgCard.h
+  Orca/UX/OrbCombo.cpp
+  Orca/UX/OrbCombo.h
+  Orca/UX/YgOrb.cpp
+  Orca/UX/YgOrb.h
+  Orca/UX/YgOrbDraw.cpp
+  Orca/UX/YgOrbDraw.h
   NetworkCaptureLogger.cpp
   NetworkCaptureLogger.h
   PatchEngine.cpp
@@ -569,6 +661,24 @@ add_library(core
   PowerPC/SignatureDB/MEGASignatureDB.h
   PowerPC/SignatureDB/SignatureDB.cpp
   PowerPC/SignatureDB/SignatureDB.h
+  Rollback/Cow.cpp
+  Rollback/Cow.h
+  Rollback/Diag.cpp
+  Rollback/Diag.h
+  Rollback/Harness.cpp
+  Rollback/Harness.h
+  Rollback/InputGate.cpp
+  Rollback/InputGate.h
+  Rollback/Loopback.cpp
+  Rollback/Loopback.h
+  Rollback/OnlineMatch.cpp
+  Rollback/OnlineMatch.h
+  Rollback/Rollback.cpp
+  Rollback/Rollback.h
+  Rollback/SessionPort.cpp
+  Rollback/SessionPort.h
+  Rollback/UndoLog.cpp
+  Rollback/UndoLog.h
   State.cpp
   State.h
   SyncIdentifier.h
@@ -697,6 +807,10 @@ PUBLIC
   videosoftware
 
 PRIVATE
+  CURL::libcurl
+  imgui
+  LibJuice::LibJuice
+  zstd::zstd
   FatFs
   fmt::fmt
   LZO::LZO
@@ -849,6 +963,18 @@ if(MSVC)
   target_link_libraries(core PRIVATE use_pch)
 endif()
 
+# Orca and Rollback work out values every peer must agree on (the input gate's steering and
+# presses, what the hooks write to emulated memory) on different hosts and compilers, so no fused
+# multiply-adds there: Apple clang contracts a * b + c into one by default on ARM64, which rounds
+# once where x86-64 rounds twice. That code keeps to integers anyway (ORCA.md "Determinism across hosts");
+# this is the belt to those braces. MSVC needs nothing: /fp:precise (CMakeLists.txt) never
+# contracts in VS 2022 and later, and the x86-64 baseline (no /arch:AVX2) has no FMA to emit.
+if(NOT MSVC)
+  get_target_property(ORCA_DETERMINISTIC_SOURCES core SOURCES)
+  list(FILTER ORCA_DETERMINISTIC_SOURCES INCLUDE REGEX "^(Orca|Rollback)/.*\\.cpp$")
+  set_property(SOURCE ${ORCA_DETERMINISTIC_SOURCES} APPEND PROPERTY COMPILE_OPTIONS -ffp-contract=off)
+endif()
+
 if(USE_RETRO_ACHIEVEMENTS)
   target_link_libraries(core PUBLIC rcheevos)
   target_compile_definitions(core PUBLIC -DUSE_RETRO_ACHIEVEMENTS)
@@ -857,3 +983,6 @@ if(USE_RETRO_ACHIEVEMENTS)
     target_compile_definitions(core PUBLIC -DRC_CLIENT_SUPPORTS_RAINTEGRATION)
   endif()
 endif()
+
+# Orca rollback harness hashes RAM with xxHash
+target_link_libraries(core PRIVATE xxhash::xxhash)

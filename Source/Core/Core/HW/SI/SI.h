@@ -56,6 +56,10 @@ public:
   void RemoveEvent(int device_number);
 
   void UpdateDevices();
+  // Orca: fill every channel's input buffer now from the session's pads, as a poll would, but
+  // without the host input update, device changes, status bits or interrupt. Unplugged channels
+  // wait for the next poll.
+  void RelatchInputs();
   u32 GetInLength() const { return m_com_csr.INLNGTH; }
 
   void RemoveDevice(int device_number);

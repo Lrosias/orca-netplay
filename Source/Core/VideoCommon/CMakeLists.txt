@@ -145,6 +145,8 @@ add_library(videocommon
   PostProcessing.cpp
   PostProcessing.h
   Present.cpp
+  PresentLayout.cpp
+  PresentLayout.h
   Present.h
   RenderState.cpp
   RenderState.h

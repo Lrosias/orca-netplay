@@ -37,6 +37,7 @@
 #include "Core/HotkeyManager.h"
 #include "Core/IOS/IOS.h"
 #include "Core/IOS/STM/STM.h"
+#include "Core/Orca/Profile.h"
 #include "Core/System.h"
 #include "Core/WiiRoot.h"
 
@@ -484,6 +485,10 @@ void SetUserDirectory(std::string custom_path)
 
 bool TriggerSTMPowerEvent()
 {
+  // Orca: the power button would reach only this player's game; callers stop the core instead.
+  if (Orca::SessionActive())
+    return false;
+
   const auto ios = Core::System::GetInstance().GetIOS();
   if (!ios)
     return false;

@@ -32,6 +32,7 @@
 #include "Core/FifoPlayer/FifoPlayer.h"
 #include "Core/FifoPlayer/FifoRecorder.h"
 #include "Core/HW/Memmap.h"
+#include "Core/Orca/Profile.h"
 #include "Core/System.h"
 
 #include "VideoCommon/AbstractFramebuffer.h"
@@ -57,6 +58,7 @@
 #include "VideoCommon/VertexManagerBase.h"
 #include "VideoCommon/VideoCommon.h"
 #include "VideoCommon/VideoConfig.h"
+#include "VideoCommon/VideoState.h"
 
 static const u64 TEXHASH_INVALID = 0;
 // Sonic the Fighters (inside Sonic Gems Collection) loops a 64 frames animation
@@ -2214,6 +2216,11 @@ void TextureCacheBase::CopyRenderTargetToTexture(
   bool copy_to_ram =
       !(is_xfb_copy ? g_ActiveConfig.bSkipXFBCopyToRam : g_ActiveConfig.bSkipEFBCopyToRam) ||
       !copy_to_vram;
+  // Orca: in a session, copies write only the constant placeholder to RAM, on every backend, so
+  // both players' memory stays identical whatever their GPUs render.
+  static const bool s_orca_session = Orca::SessionActive();
+  if (s_orca_session)
+    copy_to_ram = false;
 
   // tex_w and tex_h are the native size of the texture in the GC memory.
   // The size scaled_* represents the emulated texture. Those differ
@@ -2264,6 +2271,20 @@ void TextureCacheBase::CopyRenderTargetToTexture(
   if (dst == nullptr)
   {
     ERROR_LOG_FMT(VIDEO, "Trying to copy from EFB to invalid address {:#010x}", dstAddr);
+    return;
+  }
+
+  // Orca: no GPU copy on a skipped frame. A texture-only copy still writes its placeholder, so
+  // RAM matches a rendered frame; a copy to RAM leaves the old pixels.
+  if (VideoCommon_IsSkippingRender())
+  {
+    if (!copy_to_ram)
+    {
+      if (is_xfb_copy)
+        UninitializeXFBMemory(dst, dstStride, bytes_per_row, num_blocks_y);
+      else
+        UninitializeEFBMemory(dst, dstStride, bytes_per_row, num_blocks_y);
+    }
     return;
   }
 

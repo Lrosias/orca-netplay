@@ -805,6 +805,14 @@ void EmulationKernel::EnqueueIPCReply(const Request& request, const s32 return_v
   memory.Write_U32(request.command, request.address + 8);
   // IOS also overwrites the command type with the reply type.
   memory.Write_U32(IPC_REPLY, request.address);
+  if (CoreTiming::g_rollback_event_trace)  // Orca: rollback diagnostics
+  {
+    const auto& device = request.fd < IPC_MAX_FDS ? m_fdmap[request.fd] : nullptr;
+    CoreTiming::g_rollback_event_trace->push_back(fmt::format(
+        "  reply {} cmd={} ret={} +{} at {} from={}", device ? device->GetDeviceName() : "?",
+        static_cast<u32>(request.command), return_value, cycles_in_future,
+        system.GetCoreTiming().GetTicks(), static_cast<int>(from)));
+  }
   system.GetCoreTiming().ScheduleEvent(cycles_in_future, s_event_enqueue, request.address, from);
 }
 
@@ -909,6 +917,12 @@ void EmulationKernel::DoState(PointerWrap& p)
           m_fdmap[i]->DoState(p);
           break;
         }
+      }
+      else
+      {
+        // A descriptor opened after the state was saved must not survive the load, or the next
+        // open returns a different fd than it did when the state was current.
+        m_fdmap[i].reset();
       }
     }
   }

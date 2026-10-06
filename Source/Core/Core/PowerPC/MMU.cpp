@@ -50,9 +50,11 @@
 #include "Core/HW/MMIO.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/ProcessorInterface.h"
+#include "Core/Orca/Profile.h"
 #include "Core/PowerPC/GDBStub.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/PowerPC.h"
+#include "Core/Rollback/Diag.h"
 #include "Core/System.h"
 
 #include "VideoCommon/EFBInterface.h"
@@ -557,6 +559,9 @@ TryReadInstResult MMU::TryReadInstruction(u32 address)
   {
     hex = m_ppc_state.iCache.ReadInstruction(m_memory, m_ppc_state, address);
   }
+  // Orca: game code a loader rewrote that the session keeps running as the game's own (Profile.h
+  // kept_code). Every core fetches through here: the JITs' compiles and the interpreters.
+  hex = Orca::KeptInstruction(address, hex);
   return TryReadInstResult{true, from_bat, hex, address};
 }
 
@@ -1206,6 +1211,16 @@ TranslateResult MMU::JitCache_TranslateAddress(u32 address)
 
   const bool from_bat = tlb_addr.result == TranslateAddressResultEnum::BAT_TRANSLATED;
   return TranslateResult{from_bat, tlb_addr.address};
+}
+
+std::optional<u32> MMU::InstructionBATTranslate(u32 address) const
+{
+  if (!m_ppc_state.msr.IR)
+    return address;
+  bool wi = false;
+  if (!TranslateBatAddress(m_ibat_table, &address, &wi))
+    return std::nullopt;
+  return address;
 }
 
 void MMU::GenerateDSIException(u32 effective_address, bool write)
@@ -2023,6 +2038,8 @@ void MMU::DBATUpdated()
 #endif
 
   // IsOptimizable*Address and dcbz depends on the BAT mapping, so we need a flush here.
+  if (Rollback::Diag::g_jit_code_log)
+    Rollback::Diag::JitCodeNote("DBAT update");
   m_system.GetJitInterface().ClearSafe();
 }
 
@@ -2039,6 +2056,8 @@ void MMU::IBATUpdated()
     UpdateFakeMMUBat(m_ibat_table, 0x40000000);
     UpdateFakeMMUBat(m_ibat_table, 0x70000000);
   }
+  if (Rollback::Diag::g_jit_code_log)
+    Rollback::Diag::JitCodeNote("IBAT update");
   m_system.GetJitInterface().ClearSafe();
 }
 
