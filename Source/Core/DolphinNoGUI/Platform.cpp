@@ -24,11 +24,12 @@
 #include "Core/Orca/Session/Online.h"
 #include "Core/Orca/Status.h"
 #include "Core/Orca/UX/Chat.h"
-#include "Core/Orca/UX/YgOrb.h"
+#include "Core/Orca/UX/NameTags.h"
 #include "Core/Orca/UX/OnlineMenu.h"
 #include "Core/Orca/UX/Overlay.h"
 #include "Core/Orca/UX/Queue.h"
 #include "Core/Orca/UX/SetEnd.h"
+#include "Core/Orca/UX/YgOrb.h"
 #include "Core/Rollback/OnlineMatch.h"
 #include "Core/System.h"
 #include "VideoCommon/FrameDumper.h"
@@ -49,6 +50,7 @@ void Platform::UpdateRunningFlag()
 {
   ProcessEmbedCommands();
   EndSoloPauseForDropIn();
+  WatchRoomWhilePaused();
   UpdateTitle();
   if (m_shutdown_requested.TestAndClear())
   {
@@ -85,6 +87,27 @@ void Platform::EndSoloPauseForDropIn()
   Core::SetState(system, Core::State::Running);
   if (m_embed.enabled || m_test_commands)
     Embed::Out("state running");
+}
+
+void Platform::WatchRoomWhilePaused()
+{
+  auto& system = Core::System::GetInstance();
+  if (!Rollback::OnlineMatch::Pausing() || !Orca::SessionActive() || !Orca::Online::Enabled() ||
+      Core::GetState(system) != Core::State::Paused)
+  {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now < m_next_room_watch)
+    return;
+  m_next_room_watch = now + std::chrono::seconds(2);
+  // A room that ended gets the boundary's handling on the CPU thread, which the pause leaves idle;
+  // so does the one that replaced it, once, to clear the lost room's notice.
+  const bool ended = Orca::Online::RoomEnded();
+  if (!ended && !(m_room_watch_lost && Orca::Online::InRoom()))
+    return;
+  m_room_watch_lost = ended;
+  Core::RunOnCPUThread(system, [] { Rollback::OnlineMatch::WatchRoomWhilePaused(); });
 }
 
 void Platform::UpdateTitle()
@@ -455,6 +478,15 @@ void Platform::ProcessEmbedCommands()
                                                 Orca::UX::Perf::Off);
       else
         Embed::Out("unsupported perf");
+    }
+    else if (cmd == "controls")
+    {
+      // The player's in-game controls from the page (UX/NameTags.h): their tag gets them at the
+      // next character select, and a game they join or host carries them.
+      std::string hex;
+      in >> hex;
+      if (!Orca::UX::SetOwnControlsFromApp(hex))
+        Embed::Out("unsupported controls");
     }
     else if (cmd == "chat")
     {

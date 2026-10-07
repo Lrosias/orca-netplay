@@ -34,10 +34,12 @@
 #include "Core/HW/SI/SI_Device.h"
 #include "Core/HW/Sram.h"
 #include "Core/HW/Wiimote.h"
+#include "Core/Orca/Disc.h"
 #include "Core/Orca/Session/Session.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "DiscIO/Volume.h"
+#include "DiscIO/VolumeDisc.h"
 #include "VideoCommon/VideoConfig.h"
 
 namespace Orca
@@ -760,14 +762,16 @@ bool PrepareLauncherBoot(Profile* profile, const std::string& executable_path,
     return false;
   }
 
-  const std::unique_ptr<DiscIO::Volume> disc =
-      disc_path.empty() ? nullptr : DiscIO::CreateVolume(disc_path);
+  const std::unique_ptr<DiscIO::VolumeDisc> disc =
+      disc_path.empty() ? nullptr : DiscIO::CreateDisc(disc_path);
   if (!disc)
   {
     *error = fmt::format("Orca: profile {} boots {} from the drive, and no disc is set",
                          profile->game_id, profile->disc);
     return false;
   }
+  // The boot inserts the disc with the same alias (Boot.cpp).
+  AliasRevision(*disc);
   const u16 disc_revision = disc->GetRevision().value_or(0);
   if (disc->GetGameID() != profile->disc || disc_revision != profile->revision)
   {

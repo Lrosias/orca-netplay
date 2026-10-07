@@ -2058,6 +2058,24 @@ TEST(OrcaSessionDelay, StallsOnAPeerHitchRaiseNothing)
   EXPECT_GT(match.CompareConfirmed(), 800);
 }
 
+TEST(OrcaSessionDelay, ALoadHitchCountsApartAndItsStallsDont)
+{
+  // A frame only a game load made slow: counted apart from hitches, never reported to the other
+  // side, and a stall around it doesn't count, as around a hitch.
+  Match match(Config{}, 1, 0);
+  match.Play(700);
+  match.a->session.OnLoadHitch();
+  LateBurst(match, false, 14);
+  match.Play(120);
+  ExpectClean(match);
+  const auto a = match.a->session.GetStats();
+  EXPECT_EQ(a.stalls, 1);
+  EXPECT_EQ(a.counted_stalls, 0);
+  EXPECT_EQ(a.hitches, 0);
+  EXPECT_EQ(a.load_hitches, 1);
+  EXPECT_EQ(match.b->session.GetStats().peer_hitches, 0);
+}
+
 TEST(OrcaSessionDelay, NoStallCountsWhileSettling)
 {
   // No stall counts in the first ten seconds after controllers plug in (boot, loading, a drop-in

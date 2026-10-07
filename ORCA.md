@@ -12,8 +12,8 @@ How Orca's rollback works and how it compares with Slippi and Brawlback: [ORCA_A
   Orca is rebased onto later releases deliberately.
 - **Design:** an exact whole-machine snapshot at each frame boundary; controller input injected at
   the SI device; re-run frames that parse the GPU command stream but skip host rendering; per-game
-  profiles. Super Smash Bros. Brawl (`RSBE01` rev 2) and Project+ v3.2 (a launcher profile on top of
-  Brawl) are the supported games.
+  profiles. Super Smash Bros. Brawl (`RSBE01` rev 2, and rev 1 played as rev 2) and Project+ v3.2 (a
+  launcher profile on top of Brawl) are the supported games.
 - **Online:** through YouGame rooms. Friends drop in to a running game; strangers come from
   YouGame's matchmaking queue (casual or ranked).
 
@@ -95,6 +95,7 @@ game) is seat 0, controller port 1; a friend's seat is its room slot.
 | `ORCA_THREAD_QOS` | `0`: no raised thread priority; `1`: also for a scripted harness run. |
 | `ORCA_JITWARM` | `0`: no JIT warm-up ([Match start](#match-start)). |
 | `ORCA_SHADER_WAIT_S` | Set by the app: how long boot may wait for shaders (60-900 s). |
+| `ORCA_CONTROLS` | Set by the app: the player's own controls, 92 hex ([Each player's own controls](#each-players-own-controls)). |
 
 Test-only variables (most are "test overrides": they change the compatibility key, so only two Orcas
 with the same value meet):
@@ -132,6 +133,17 @@ in `Config/Orca.ini` `[Disc] Path`. A file given with `-e` is checked before any
 a missing file prints `orca error disc_missing <path>`, an unreadable one `orca error
 disc_unreadable <path>`, and Orca exits 1 within a second. Orca's alert handler is registered before
 the boot file is read, so no hidden message box can block a run.
+
+Brawl (USA) (Rev 1) plays as Rev 2. The two dumps differ only in the revision byte of both disc
+headers and in one main.dol instruction (`0x8001BC9C`, the version in the disc ID the game builds at
+boot); every file, the file table, the partition layout, the IOS and the title version are the same.
+Every disc a session boots, and the launcher profile's disc, goes through `Orca::AliasRevision`
+(`Orca/Disc.h`): for that exact dump (the content hash in its TMD) reads of those three bytes return
+Rev 2's (`VolumeDisc::SetReadPatches`), so the console reads a Rev 2 disc and Rev 1 and Rev 2 players
+meet in the same rooms. The TMD and ticket still differ in hashes, signatures and the ticket ID; the
+game never reads them: a Rev 1 and a Rev 2 run of the default inputs (Brawl and Project+) give the
+same hashlog. Other revisions and modified Rev 1 copies are refused, and so is a launcher's disc that
+doesn't read as Rev 2 at boot (`Orca::SessionDiscReady`, e.g. after a read error).
 
 Sessions start from an empty NAND (save hash 0); the game makes its save in-session on both
 machines. A session with no `Config/GCPadNew.ini` gets `Sys/Orca/Input/GCPadNew.ini`: port 1 on the
@@ -184,7 +196,8 @@ each start two emulators.
 ninja tests && ./Binaries/Tests/tests --gtest_filter='Orca*'
 ```
 
-Live, network and disc tests skip without their switches. `ORCA_LIVE_TEST=1` runs `OrcaLive.*`
+Live, network and disc tests skip without their switches (`ORCA_TEST_DISC` for a Rev 2 image,
+`ORCA_TEST_DISC_REV1` for Rev 1). `ORCA_LIVE_TEST=1` runs `OrcaLive.*`
 against real rooms on yougame.co.
 
 ### The harness
@@ -401,18 +414,41 @@ The host decides each port's values and the frame they apply from; every machine
 it runs that frame (`Session::RequireValues`). Values from another machine reach the tag only as the
 game's own menus could have set them, at their exact size (64 bytes at most on the wire).
 
+### Each player's own controls
+
+A player's own controls are 46 bytes: rumble, then a tag's layout (`NameTags.h`), written as 92 hex.
+They come from `ORCA_CONTROLS` at boot, else the file Orca kept for this game
+(`<user>/Config/OrcaControls-<game>.txt`), and from the app's `controls <hex>` mid-run. While the
+player is alone, a change they make to the tag they wear (the controls menu, Project+'s name list)
+becomes their own controls: Orca prints `orca controls <hex>` and keeps the file. Orca's own writes,
+a save that isn't theirs (after a resync) and re-runs never count. Controls loaded from the file
+(no `ORCA_CONTROLS`) are printed the same way once at boot, so the page shows what Orca plays.
+
+- **Solo**, the own port's values carry them from the frame they change, so the YouGame tag gets them
+  on every character select: Training, the queue's own select, With Friends. A friend who joins
+  later gets those entries with the keyframe. A session's host and joiner carry them as before
+  (`RefreshOwnValues`, the hello).
+- **The name button** takes A on With Friends' selects (the hand's own panel) and on the queue's own
+  select while not searching, with the stick centred while A is down; its list takes A and the stick,
+  never L (Project+'s hold-L leaves for its controls scene). Start never readies with the list open.
+  A queue room's select keeps A in the grid: there each player wears their YouGame tag with their
+  own controls.
+
 ### Rooms
 
 - Orca asks for 4-seat private rooms with a game-owned lobby. Seats are lobby slots. A hello carries
   the compatibility key and whether the sender is the host. The host must hold slot 0; one that
   finds itself elsewhere opens a fresh room.
+- The room's ticket (`mpTicket`, minted by the page) waits up to 30 s for a reply and is asked for
+  once more if none came; then the room ends with `network`.
 - A joiner that hears no host hello within 8 s of its welcome ends with `peer_left`.
 - The server answers a ping every second; 8 s without any message ends the room as a dropped
   connection (close code 4001), so the server holds the seat for 90 s. Not much less than 8 s: a
   keyframe upload can fill a home uplink and delay the pings.
 - A host whose room ends without it leaving prints `orca error network <why>` and reopens, backing
   off from 2 s to 30 s, trying the same code first. A socket the server replaced (close code 4000:
-  another run on the same account) is never taken back.
+  another run on the same account) is never taken back. During the player's pause the host loop
+  does the same every 2 s on the CPU thread (`WatchRoomWhilePaused`), so a paused game keeps a room.
 - A host that leaves always opens a new room. A player on a port other than 1 after a session (it
   joined someone and went solo) goes home ([Going home](#going-home)).
 - A rollback the joiner can't make (an engine fault, not a desync) ends its session as `network`.
@@ -471,13 +507,18 @@ refuses dev tickets.
 
 - `https://yougame.co/api/orca/keyframes/<room>/<id>`, `id` = `kf-<frame>-<8 hex of XXH3-64>`.
   Auth: `Authorization: Ticket <ticket>` with the room's ticket (accepted up to 6 h past expiry; on
-  401 `ticket` Orca mints a fresh one once).
+  401 `ticket` or 403 `signed_out` Orca mints a fresh one once).
 - **PUT** with `Content-Length` (at most 128 MB), `X-Orca-Frame`, `X-Orca-Hash`. 409 `exists` counts
   as done. 6 PUTs a minute per account.
 - **GET** streams with `Content-Length` (for join progress); Orca checks size and hash, then
   decrypts. 404 `gone` means expired.
 - **DELETE** by the joiner after loading, best effort; by the host when replacing or leaving.
-- Network errors, 429 and 5xx retry 4 times with 0.5/1/2 s backoff; anything else is final.
+- Network errors, 429 and 5xx retry 4 times with 0.5/1/2 s backoff; anything else is final. A host
+  whose keyframe is refused for good (a refusal with YouGame's code; a bare 4xx from the edge only
+  fails that keyframe) makes no more for the friends waiting: it drops them with
+  `signed_out` (YouGame's code) or `refused`, prints `orca state friend-left <that>`, and each of
+  them ends with `orca error signed_out` or `network`. A joiner whose own download is refused with
+  `signed_out` reports that code too.
 
 ### Room messages
 
@@ -583,8 +624,10 @@ The adaptive delay rises only for what rollback can't cover, and only where a li
     seconds) raises the delay within half a minute or so.
   - Random spikes that outlast the window by anything up to six frames raise nothing: a frame more
     would spare only the shortest. They cost their stalls, as they would in Slippi.
-  - Stalls don't count around a hitch on either machine, when this player's own stall set them off,
-    while a controller is catching up, or in the first 10 s after a plug-in.
+  - Stalls don't count around a hitch on either machine (a frame that took this machine over a
+    frame period more than the game itself took) or a frame a game load slowed here, when this
+    player's own stall set them off, while a controller is catching up, or in the first 10 s after
+    a plug-in.
 - Rollbacks and time-sync waits never move the delay.
 - **Coming down.** A link-raised delay follows the link down after 3 s. A stall-raised one steps
   down after 5 quiet seconds, then a frame each further quiet second while each packet's reach (how
@@ -869,7 +912,7 @@ away.
 | `+0x290`-`+0x297` | A friend's move from the menus |
 
 Any new header (another mode, ruleset, coin or room) starts every track's state fresh. Compatibility:
-anything that changes what the game computes bumps `UX::kCompatVersion` (currently `ux=19`), which is
+anything that changes what the game computes bumps `UX::kCompatVersion` (currently `ux=21`), which is
 in the compatibility key.
 
 ## Input gate
@@ -1189,9 +1232,11 @@ host was).
   hand nor flying, while its hand rests on that panel's player-type button (hand `+0xB0`). A friend
   who drops into a select whose CPU was on their panel takes it at once.
 - **The buttons** (the input gate): where no header locks (With Friends, a friend's drop-in, Casual
-  or Ranked before the queue's header lands), A never reaches a player-type button (`0x1D`) or a
-  name button (`0x1C`), nor any hand below y = -16.4 (the buttons start between -17.4 and -18.3 in
-  both games, and a hand moves at most 1.0 a frame). An unreadable hand gets no A either. A fresh
+  or Ranked before the queue's header lands), A never reaches a player-type button (`0x1D`) or
+  another panel's name button (`0x1C`), nor any hand below y = -16.4 (the buttons start between
+  -17.4 and -18.3 in both games, and a hand moves at most 1.0 a frame). An unreadable hand gets no A
+  either. The hand's own name button and its list take A (`ux=21`, [Each player's own
+  controls](#each-players-own-controls)). A fresh
   panel needs no A: a hand moved into the grid joins it. The gate reads the plugged ports from the
   friends bytes the frame hook keeps (`MatchBlock::FRIENDS_SEEN`).
 - **The seats**, on any character select: an empty panel (kind 0) whose port nobody plugged in is
@@ -1293,7 +1338,10 @@ the match's stage).
 **Project+** (`Orca/UX/RankedPPlus.*`): outside the stage select, `RSS_EXDATA` (`0x8042C4E8`) holds
 the 2024 Proposed preset. On the stage select the hook writes Project+'s own Stage Striking table
 (`0x8042C822`) as the block calls for, and sets `PAGE_INDEX` to `0xFF` so Project+ redraws the struck
-art; Project+'s own check then refuses a struck stage.
+art; Project+'s own check then refuses a struck stage. In every Project+ session the character
+select clears a My Music step (`0x80002810`, Project+'s `MusicSelect.asm`) left from an earlier stage
+select: step 1 hid every tile and turned the timer's pick into My Music, a softlock. The log says
+`cleared a leftover My Music step` when it does.
 
 ### Casual stage pick
 
@@ -1338,8 +1386,8 @@ Not yet: the two cursors over a real two-Orca room and between a Mac and a PC; a
 On a later game's character select the hands come back on the bottom panels, each on its own
 player-type button, where A turns the player into a CPU. So while a header locks, the gate passes A
 only when the hand is in the character grid or on its own token (`OnlineRules.h`). Without a
-header, With Friends and a friend's drop-in keep A off the player-type and name buttons ([No CPUs
-online](#no-cpus-online)).
+header, With Friends and a friend's drop-in keep A off the player-type buttons and other panels'
+name buttons ([No CPUs online](#no-cpus-online)).
 
 - Player area i is the select task's (scene `+0x400`) `+0x44 + 4i`. `+0x1A8` is its hand: `+0x80`
   what it points at (2 or 7 the grid, 3 its own token, 6 and 8 the token moving, 4 a leave button,
@@ -1497,7 +1545,7 @@ only when the box moves inside the window.
 | `focus` / `blur` | Give the game the input, or give it back to the page. |
 | `pause` / `resume` | Answers `state paused` / `state running`. In a session it pauses only while the player's game is alone, and ends by itself when drop-in needs the game; otherwise `unsupported pause`. |
 | `volume V` | 0 to 1, this run only. |
-| `perf off\|fps\|detailed` | The overlay's frame meter (frames shown in the last second and the longest; yellow under 59 fps or past 20 ms, red under 50 fps or past two frames). |
+| `perf off\|fps\|detailed` | The overlay's frame meter (frames shown in the last second and the longest; yellow under 59 fps or past 20 ms, red under 50 fps or past two frames). A frame the game itself holds in emulated time (Project+ loading between scenes) counts as the video frames it held, so the meter, `fps` and the `hi` hitch count in `orca stats` show only this machine falling behind; `hil` counts the frames a load alone made slow (`hi` + `hil` is the older builds' `hi`). |
 | `save N` / `load N` / `reset` | Refused in a session. |
 | `prepare-join` | The host invited a friend: capture a keyframe at the next boundary. |
 | `join <code>` / `leave` | Into or out of a friend's game. |
@@ -1505,6 +1553,7 @@ only when the box moves inside the window.
 | `direct on\|off` | The player's switch for direct links. |
 | `delay auto` / `delay N` | Adaptive input delay, or a fixed 1-6 frames. |
 | `chat <name> <text>` | A line from the page's chat, shown while Orca fills the screen. Fields are `encodeURIComponent` of UTF-8 (name at most 24 code points, text 140). Never logged. |
+| `controls <hex>` | The player's own controls ([Each player's own controls](#each-players-own-controls)); the tag gets them at the next character select. A bad profile answers `unsupported controls`. |
 | `orb <x> <y> <size> <lit> <away> <badge>` / `orb blink` / `orb off` | YouGame's overlay button, drawn where the page's own stands under Orca's window. |
 | `notice <kind> <name> <text> [<key> <verb>]` | One of the YouGame overlay's lines (join, leave, invite, ...). Never logged. |
 | `quit` | Stop at once and exit. |
@@ -1533,6 +1582,7 @@ never pauses Orca: the page sends `blur`, the player's pad goes neutral, and the
 | `error <sentence>` | Something failed. Each `orca error` also gets an `error` twin. |
 | `orca state <state>` / `orca error <code> <sentence>` | Session status (`Orca/Status.h`). Forward every line that starts with `orca `. |
 | `orca menu ...`, `orca result ...`, `orca queue ...` | See [Online menu](#online-menu) and [Matchmaking](#matchmaking-and-results). |
+| `orca controls <hex>` | The player's own controls: changed in the game, or loaded from Orca's file at boot. The page keeps them. |
 | `exit <code>` | Always last: 0 normal, 1 a reported error, 2 bad arguments. |
 
 ### Focus

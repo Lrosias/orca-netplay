@@ -18,8 +18,9 @@
 //   orca queue ready <casual|ranked> <char> <costume> | unready | skip | timeout me|them
 //   orca shaders <compiled> <total>   while the boot compiles shaders
 // Error codes: boot, cancelled, disc_missing, disc_unreadable, disc_revision, profile, settings,
-// room_mismatch, room_full, kicked, network, peer_left, desync, internal. Only the first error is
-// printed, since it explains the exit. Outside a session nothing is printed.
+// room_mismatch, room_full, kicked, network, peer_left, desync, signed_out (the keyframe store
+// refused a signed-out player's game; the host says "friend-left signed_out"), internal. Only the
+// first error is printed, since it explains the exit. Outside a session nothing is printed.
 namespace Orca::Status
 {
 void State(std::string_view state);

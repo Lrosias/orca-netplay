@@ -17,6 +17,7 @@
 #include "Core/Orca/UX/MatchBlock.h"
 #include "Core/Orca/UX/NameTags.h"
 #include "Core/Orca/UX/OnlineMenu.h"
+#include "Core/Orca/UX/OnlineRules.h"
 #include "Core/Orca/UX/RankedSteps.h"
 #include "Core/Orca/UX/Results.h"
 #include "Core/Orca/UX/StageCursors.h"
@@ -566,6 +567,25 @@ std::vector<int> PageZero(const GuestMemory& m)
   return page;
 }
 
+int ClearStaleMusicSelect(GuestMemory& m)
+{
+  // My Music's round trip goes from the stage select to My Music and straight back, never through
+  // the character select, so a step seen here is left over.
+  if (ReadSceneName(m) != "scSelctCharacter")
+    return 0;
+  int changed = 0;
+  for (const u32 offset : MUSIC_SELECT_WORDS)
+  {
+    const u32 at = MUSIC_SELECT + offset;
+    if (m.Valid(at) && m.Valid(at + 3) && m.Read32(at) != 0)
+    {
+      m.Write32(at, 0);
+      changed += 4;
+    }
+  }
+  return changed;
+}
+
 int Apply(GuestMemory& m, int frame, bool two_players)
 {
   const std::optional<MatchBlock::State> read = MatchBlock::Read(m);
@@ -903,6 +923,16 @@ void Frame(const Core::CPUThreadGuard& guard, int frame, bool resimulating,
   }
   const std::optional<MatchBlock::State> before =
       resimulating ? std::nullopt : MatchBlock::Read(memory);
+  // Every Project+ session, not only the flows: a With Friends stage select blanks the same way.
+  if (Rules::ProfileRuleset() == Rules::Ruleset::PPlus)
+  {
+    const bool seen = memory.Valid(MUSIC_SELECT + 0x0B);
+    const u32 step = seen ? memory.Read32(MUSIC_SELECT) : 0;
+    const u32 song = seen ? memory.Read32(MUSIC_SELECT + 0x08) : 0;
+    if (ClearStaleMusicSelect(memory) && !resimulating)
+      NOTICE_LOG_FMT(ROLLBACK, "Project+: frame {}: cleared a leftover My Music step {} song {:x}",
+                     frame, step, song);
+  }
   Apply(memory, frame, p1 && p2);
   if (!resimulating)
   {

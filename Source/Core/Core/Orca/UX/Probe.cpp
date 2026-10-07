@@ -21,10 +21,12 @@
 #include "Common/Logging/Log.h"
 #include "Core/Core.h"
 #include "Core/Orca/Session/Online.h"
+#include "Core/Orca/UX/NameTags.h"
+#include "Core/Orca/UX/Overlay.h"
+#include "Core/Orca/UX/RankedSet.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
-#include "Core/Orca/UX/Overlay.h"
 
 // Research tool for reverse-engineering Brawl's menus. Never active in a real session.
 // ORCA_UX_PROBE=<file> runs one command per line, at a frame counted from entry into a scene:
@@ -32,6 +34,7 @@
 //   @<scene> <frame> utf16 <addr> <text>           UTF-16BE text with a 0 terminator
 //   @<scene> <frame> dump <addr> <length> <name>   writes <user dir>/probe-<name>.bin
 //   @* 0 watch <addr> <name>                       logs the u32 there whenever it changes
+//   @* 0 fighters - -                              logs both fighters' status kinds on change
 //   @<scene> <frame> stall <ms> 0                  blocks the CPU thread like a session stall
 // @<scene>:<n> runs only on the n-th entry into the scene. <addr> is hex, or [hex]+hex for one
 // pointer hop (e.g. [805a00e0]+28).
@@ -187,6 +190,20 @@ void ProbeFrame(const Core::CPUThreadGuard& guard, int frame)
   const int rel = frame - scene_start;
   for (Command& c : commands)
   {
+    if (c.verb == "fighters")
+    {
+      const GuardMemory memory(guard);
+      const RankedSet::Live live = RankedSet::ReadLiveFight(memory);
+      const u32 value = live.valid ? live.status[0] << 16 | (live.status[1] & 0xFFFF) : 0xDEADDEAD;
+      if (!c.done || value != c.last)
+      {
+        NOTICE_LOG_FMT(ROLLBACK, "Fighters frame {} ({} {}): p1 {:x} p2 {:x}", frame, scene, rel,
+                       value >> 16, value & 0xFFFF);
+        c.last = value;
+        c.done = true;
+      }
+      continue;
+    }
     if (c.verb == "watch")
     {
       const u32 at = Address(guard, c.addr);

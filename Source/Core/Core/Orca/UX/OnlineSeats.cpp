@@ -228,8 +228,18 @@ Rollback::InputGate::Masks GateMasks(const GuestMemory& m)
   for (int port = 0; port < Rollback::InputGate::PORTS; ++port)
   {
     const Rules::CssHand hand = Rules::ReadCssHand(m, port);
-    if (!HandMayPressA(hand))
+    const bool list = Rules::ReadCssNameList(m, port);
+    // The player's own tag and its controls: A on their own name button and in its list.
+    if (Rules::CssNameTakesA(hand, port, list))
+    {
+      masks[port].a_centres_stick = true;
+      if (list)
+        masks[port].buttons |= PAD_TRIGGER_L;
+    }
+    else if (!HandMayPressA(hand))
+    {
       masks[port].buttons |= PAD_BUTTON_A;
+    }
     const u32 area = Area(m, port);
     const Rules::CssToken token = Rules::ReadCssToken(m, port);
     if (((plugged >> port) & 1) && area && token.valid &&

@@ -77,6 +77,9 @@ protected:
   // Ends a solo pause when drop-in needs the game running (a friend arriving, an invite, a join or
   // leave) and tells the app "state running".
   void EndSoloPauseForDropIn();
+  // During a solo pause, every 2 s: watches this game's room as a boundary would
+  // (Rollback::OnlineMatch::WatchRoomWhilePaused), so a room lost while paused opens again.
+  void WatchRoomWhilePaused();
   // Per-platform handlers for the window commands. The rect is relative to the parent; its units
   // depend on the OS (see ORCA.md, "Embedding").
   virtual void EmbedSetRect(const Embed::Rect& rect) {}
@@ -109,6 +112,8 @@ private:
   std::optional<std::string> m_requested_title;
   std::string m_shown_title;
   std::chrono::steady_clock::time_point m_next_title_check{};
+  std::chrono::steady_clock::time_point m_next_room_watch{};
+  bool m_room_watch_lost = false;
 
   std::mutex m_ready_lock;
   std::optional<std::string> m_ready_line;

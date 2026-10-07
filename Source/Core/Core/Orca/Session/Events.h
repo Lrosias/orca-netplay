@@ -120,9 +120,19 @@ using StallCallback = std::function<void(int stalled_ms)>;
 void SetStallCallback(StallCallback callback);
 
 // Every frame boundary, on the CPU thread: whether the frame that just ended was shown (a normal
-// first run, not a re-run or catch-up). Drives the frame meter. Must not touch emulation.
-using BoundaryCallback = std::function<void(bool shown)>;
+// first run, not a re-run or catch-up), and how long the game itself held it past one video frame
+// (GameHeldMs), in ms and in video frames (GameHeldFrames). Drives the frame meter. Must not touch
+// emulation.
+using BoundaryCallback = std::function<void(bool shown, double game_held_ms, int game_held_frames)>;
 void SetBoundaryCallback(BoundaryCallback callback);
+
+// How much longer than one video frame (`frame_ms`) the game took over a frame in emulated time:
+// a load, the same on every machine and on a Wii. 0 unless it took 1.5 frames or more, and never
+// more than this machine took past one frame (`wall_ms`), so a jump in emulated time adds nothing.
+double GameHeldMs(double emulated_ms, double wall_ms, double frame_ms);
+// Those milliseconds as whole video frames. `carry` keeps the fraction for the next hold, so a run
+// of loads adds up to the frames they held.
+int GameHeldFrames(double game_held_ms, double frame_ms, double& carry);
 
 // Version of what the in-game UX writes to emulated memory; part of the lobby compatibility key.
 // Set before boot.
@@ -135,5 +145,5 @@ void NotifyPlugIn(int frame, const std::vector<PortInfo>& ports);
 void NotifyFrame(const Core::CPUThreadGuard& guard, int frame, bool resimulating,
                  const std::vector<PortInfo>& ports, bool alone);
 void NotifyStall(int stalled_ms);
-void NotifyBoundary(bool shown);
+void NotifyBoundary(bool shown, double game_held_ms, int game_held_frames);
 }  // namespace Orca::Events

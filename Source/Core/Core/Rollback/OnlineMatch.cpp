@@ -40,12 +40,14 @@
 #include "Core/Orca/Session/Online.h"
 #include "Core/Orca/Session/PadCodec.h"
 #include "Core/Orca/Status.h"
+#include "Core/Orca/UX/NameTags.h"
 #include "Core/Orca/UX/OnlineMenu.h"
 #include "Core/Orca/UX/OnlineRules.h"
 #include "Core/Orca/UX/Queue.h"
 #include "Core/Orca/UX/RankedSet.h"
 #include "Core/Orca/UX/Results.h"
 #include "Core/Orca/UX/SetEnd.h"
+#include "Core/Rollback/Rollback.h"
 #include "Core/Rollback/SessionPort.h"
 #include "Core/System.h"
 #include "Core/WiiRoot.h"
@@ -79,6 +81,8 @@ struct KeyframeJob
   // The header generation wanted at capture (UX/OnlineRules.h WantedGeneration).
   u64 generation = 0;
   std::string error;
+  // The store refused it for good (Orca::Net::LastRefusal); empty if another try could work.
+  std::string refusal;
   ~KeyframeJob()
   {
     if (thread.joinable())
@@ -110,6 +114,8 @@ struct Download
   std::atomic<bool> cancel{false};
   bool ok = false;
   std::string error;
+  // The store refused the download for good (Orca::Net::LastRefusal).
+  std::string refusal;
   Orca::Net::KeyframeInfo info;
   int frame = -1;
   MachineImage image;
@@ -207,6 +213,8 @@ struct Match
   // For the "orca stats" line: values at the last line, deepest rollback and stall time since.
   Clock::time_point stats_time{};
   int stats_frame = -1;
+  // Video frames the game itself held shown frames for since then (LastFrameHeldFrames).
+  int stats_held = 0;
   Orca::Net::Stats stats_last{};
   int stats_rbmax = 0;
   double stats_stall_ms = 0;
@@ -499,6 +507,8 @@ void StartKeyframe(Core::System& system, Match& match, int frame)
       raw->info.id = fmt::format("kf-{}-{}", raw->frame, raw->info.hash.substr(0, 8));
       const auto put_start = Clock::now();
       raw->ok = store->Put(raw->info, blob, &raw->error);
+      if (!raw->ok)
+        raw->refusal = Orca::Net::LastRefusal();
       raw->put_ms = MsSince(put_start);
     }
     raw->done = true;
@@ -1070,7 +1080,24 @@ void HostEvents(Core::System& system, Match& match)
     std::unique_ptr<KeyframeJob> job = std::move(match.job);
     if (job->thread.joinable())
       job->thread.join();
-    if (!job->ok)
+    if (!job->ok && !job->refusal.empty())
+    {
+      // Refused for good (say, a signed-out ticket): another keyframe gets the same answer, so
+      // whoever waits hears it now instead of after its join times out.
+      const std::string why = job->refusal == "signed_out" ? "signed_out" : "refused";
+      ERROR_LOG_FMT(ROLLBACK, "Drop-in: keyframe of frame {} refused ({}): {}; {} waiting told",
+                    job->frame, job->refusal, job->error, match.waiting.size());
+      for (const auto& [seat, arrival] : match.waiting)
+        Orca::Online::DropPeer(seat, why);
+      if (!match.waiting.empty())
+      {
+        match.waiting.clear();
+        Orca::Status::State("friend-left " + why);
+        match.friend_left_told = true;
+      }
+      match.keyframe_wanted = false;
+    }
+    else if (!job->ok)
     {
       ERROR_LOG_FMT(ROLLBACK, "Drop-in: keyframe of frame {} failed: {}", job->frame, job->error);
       // Whoever waits for it gets another try.
@@ -1279,6 +1306,7 @@ void StartDownload(Match& match, const Orca::Net::KeyframeInfo& info)
     if (!blob)
     {
       raw->error = error;
+      raw->refusal = Orca::Net::LastRefusal();
       raw->done = true;
       return;
     }
@@ -1464,9 +1492,18 @@ Load LoadKeyframe(Core::System& system, Match& match, int* frame_out)
     download->thread.join();
   if (!download->ok)
   {
-    ERROR_LOG_FMT(ROLLBACK, "Drop-in: keyframe {}: {}", download->info.id, download->error);
-    match.join_error_code = "network";
-    match.join_error = "Couldn't load your friend's game";
+    ERROR_LOG_FMT(ROLLBACK, "Drop-in: keyframe {}: {}{}", download->info.id, download->error,
+                  download->refusal.empty() ? "" : " (refused: " + download->refusal + ")");
+    if (download->refusal == "signed_out")
+    {
+      match.join_error_code = "signed_out";
+      match.join_error = "Sign in to YouGame to join your friend's game";
+    }
+    else
+    {
+      match.join_error_code = "network";
+      match.join_error = "Couldn't load your friend's game";
+    }
     return Load::Failed;
   }
 
@@ -2235,13 +2272,22 @@ void RefreshOwnValues(Match& match, int frame)
 // Controllers plugged in at `frame` (the session's plan, or solo just this player).
 std::vector<Orca::Events::PortInfo> PortsAt(Match& match, int frame)
 {
-  // A host names its own port only while solo: in a session a friend may already have run this
-  // frame. A joiner takes all values from its host.
-  if (!match.joining && !match.session && !match.port_names.count(match.local_seat) &&
-      Orca::Online::Seat() == match.local_seat)
+  // A host names its own port, with its own controls, only while solo: in a session a friend may
+  // already have run this frame. A joiner takes all values from its host. Solo frames are never
+  // re-run, and a friend who joins later gets these entries with the keyframe.
+  if (!match.joining && !match.session && Orca::Online::Seat() == match.local_seat)
   {
-    if (std::string own = Orca::Online::SeatName(match.local_seat); !own.empty())
-      AddName(match, {match.local_seat, frame, std::move(own), {}});
+    const Orca::Net::KeyframeInfo::Name* now = EntryAt(match, match.local_seat, frame);
+    std::string own = Orca::Online::SeatName(match.local_seat);
+    if (own.empty() && now)
+      own = now->name;
+    std::vector<u8> controls = Orca::Events::OwnControls();
+    if (now ? now->name != own || now->controls != controls : !own.empty() || !controls.empty())
+    {
+      std::vector<u8> queue = now ? now->queue : std::vector<u8>{};
+      AddName(match,
+              {match.local_seat, frame, std::move(own), std::move(controls), std::move(queue)});
+    }
   }
   const auto port = [&](int seat) {
     Orca::Events::PortInfo info{seat, "", seat != match.local_seat, {}};
@@ -2304,6 +2350,7 @@ void PublishStats(Match& match)
   {
     match.stats_time = now;
     match.stats_frame = match.running;
+    match.stats_held = 0;
     match.stats_last = stats;
     match.stats_input = Orca::Events::GetInputAge();
   }
@@ -2333,9 +2380,13 @@ void PublishStats(Match& match)
   num("st", stats.stalls - last.stalls);
   num("stms", std::round(match.stats_stall_ms));
   num("ds", s_desyncs);
-  num("fps", std::round((match.running - match.stats_frame) / seconds * 10) / 10);
+  // Frames the game itself held (a load) count as shown, so this falls only when this machine does.
+  num("fps",
+      std::round((match.running - match.stats_frame + match.stats_held) / seconds * 10) / 10);
   num("hi", stats.hitches);
   num("phi", stats.peer_hitches);
+  // Slow frames a game load explained; "hi" plus this is what earlier builds counted as "hi".
+  num("hil", stats.load_hitches);
   num("tx", link.transport);
   num("lrtt", link.link_rtt_ms);
   // Input age (ControllerSource.h): "pa" is the mean age in ms of the newest adapter report at
@@ -2354,6 +2405,7 @@ void PublishStats(Match& match)
   Orca::Status::Stats(picojson::value(o).serialize());
   match.stats_time = now;
   match.stats_frame = match.running;
+  match.stats_held = 0;
   match.stats_last = stats;
   match.stats_input = input;
   match.stats_rbmax = 0;
@@ -2651,6 +2703,7 @@ std::optional<int> Boundary(Core::System& system,
   }
   if (match.finished)
     return std::nullopt;
+  match.stats_held += LastFrameHeldFrames();
 
   std::optional<int> rewound_to;
   if (!match.started)
@@ -2669,6 +2722,8 @@ std::optional<int> Boundary(Core::System& system,
     match.store = MakeStore();
     if (const std::string leave = Orca::GetEnv("ORCA_TEST_LEAVE_AT"); !leave.empty())
       match.leave_at = std::atoi(leave.c_str());
+    // This player's own controls, before a launch join's hello carries them.
+    Orca::UX::LoadOwnControls();
     Orca::Online::Start();
     // The role (host plays, joiner waits) is known once the room has its ticket.
     std::optional<bool> joining;
@@ -2826,10 +2881,19 @@ std::optional<int> Boundary(Core::System& system,
   if (const auto round_trip_ms = NewRoundTrip(&match.round_trip_sequence))
     match.session->OnRoundTrip(*round_trip_ms);
   match.session->SetFixedDelay(ChosenDelay());
-  // A frame over two frame periods was a local hitch (disc read, shader compile).
+  // A frame over two frame periods was a local hitch (disc read, shader compile). Time the game
+  // itself held it (a load, the same on every machine) is not this machine's: a frame slow only by
+  // that is counted apart, so a gate can still compare the raw count with an older build's.
   const auto now = Clock::now();
+  const auto held = std::chrono::duration_cast<Clock::duration>(
+      std::chrono::duration<double, std::milli>(LastFrameHeldMs()));
   if (match.last_return && now - *match.last_return > HITCH_TIME && !match.port->CatchingUp())
-    match.session->OnLocalHitch();
+  {
+    if (now - *match.last_return - held > HITCH_TIME)
+      match.session->OnLocalHitch();
+    else
+      match.session->OnLoadHitch();
+  }
 
   // Handle a departed host only outside a re-run, or half-replayed frames would remain.
   if (match.joining)
@@ -3267,19 +3331,20 @@ void LogStats(const char* when)
   NOTICE_LOG_FMT(
       ROLLBACK,
       "Online match {}: frame {}, {} rollbacks, {} re-run frames, deepest {}, {} stalls ({} "
-      "counted), {} waits, {} hitches here, {} there, frame advantage {:.2f}, input delay {}{} "
+      "counted), {} waits, {} hitches here ({} more in game loads), {} there, frame advantage "
+      "{:.2f}, input delay {}{} "
       "(+{} -{} reverted {}), {} counted stalls a frame more would have spared, {} checksums "
       "matched, confirmed frame {}, round trip {} ms (median {} ms here, {} ms there), link {}, "
       "{} snapshots (every {}, {:.2f} ms each){}{}",
       when, match.session->CurrentFrame(), stats.rollbacks, stats.resimulated_frames,
       stats.deepest_rollback, stats.stalls, stats.counted_stalls, stats.waits, stats.hitches,
-      stats.peer_hitches, stats.frame_advantage, stats.delay,
+      stats.load_hitches, stats.peer_hitches, stats.frame_advantage, stats.delay,
       stats.delay_fixed ? " (chosen)" : "", stats.delay_raises, stats.delay_lowers,
       stats.delay_reverts, stats.spared_stalls, stats.checksums_matched, stats.confirmed_frame,
       Orca::Online::RoundTripMs(), stats.rtt_median, stats.peer_rtt_median,
-      Orca::Online::Direct().line, stats.saves,
-      stats.snapshot_every, match.port ? match.port->SaveMs() : 0.0,
-      match.session->Error().empty() ? "" : "; ", match.session->Error());
+      Orca::Online::Direct().line, stats.saves, stats.snapshot_every,
+      match.port ? match.port->SaveMs() : 0.0, match.session->Error().empty() ? "" : "; ",
+      match.session->Error());
 }
 
 bool Active()
@@ -3430,6 +3495,15 @@ void EndPause()
 bool Pausing()
 {
   return s_pausing;
+}
+
+void WatchRoomWhilePaused()
+{
+  Match& match = TheMatch();
+  // A pause only goes ahead solo (SoloPauseAllowed), so no session or join is under way.
+  if (!s_pausing || !match.started || match.finished || match.joining || match.session)
+    return;
+  KeepRoomOpen(match);
 }
 
 std::chrono::nanoseconds TakePausedTime()

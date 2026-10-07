@@ -455,6 +455,9 @@ std::string KeyframeHash(const std::vector<u8>& blob)
 
 namespace
 {
+// LastRefusal, per thread: the job and the download threads each read their own.
+thread_local std::string t_last_refusal;
+
 // A folder shared by two Orcas on one machine (tests): the host writes <id>.okf, the joiner reads
 // it.
 class LocalKeyframeStore final : public KeyframeStore
@@ -518,9 +521,9 @@ private:
 };
 
 // YouGame's keyframe endpoint: PUT, GET and DELETE on <store_url>/<id> with "Authorization: Ticket
-// <room ticket>". A 401 with code "ticket" retries with a new ticket; network errors, 429 and 5xx
-// retry with backoff; other refusals are final. A 409 "exists" on PUT means an earlier attempt
-// landed but its reply was lost.
+// <room ticket>". A 401 with code "ticket", or a 403 "signed_out" (the player may have signed in
+// since), retries with a new ticket; network errors, 429 and 5xx retry with backoff; other refusals
+// are final. A 409 "exists" on PUT means an earlier attempt landed but its reply was lost.
 class HttpKeyframeStore final : public KeyframeStore
 {
 public:
@@ -618,6 +621,7 @@ private:
   bool WithRetries(std::string* error,
                    const std::function<void(const std::string&, const std::string&, Result*)>& op)
   {
+    t_last_refusal.clear();
     bool fresh = false;
     for (int attempt = 0; attempt < ATTEMPTS; ++attempt)
     {
@@ -649,8 +653,11 @@ private:
       *error = result.status ? fmt::format("HTTP {}{}{}", result.status,
                                            result.error.empty() ? "" : ": ", result.error) :
                                result.error;
-      // Expired or unknown ticket: retry once with a new one.
-      if (result.status == 401 && result.code == "ticket" && !fresh)
+      // Expired or unknown ticket, or one minted before the player signed in: retry once with a
+      // new one.
+      if (((result.status == 401 && result.code == "ticket") ||
+           (result.status == 403 && result.code == "signed_out")) &&
+          !fresh)
       {
         fresh = true;
         continue;
@@ -661,7 +668,12 @@ private:
       const bool retry = !result.final && (result.status == 0 || result.status == 429 ||
                                            result.status >= 500);
       if (!retry)
+      {
+        // Only YouGame's own refusals carry a code; a bare 4xx (an edge page) may pass next time.
+        if (result.status >= 400)
+          t_last_refusal = result.code;
         return false;
+      }
       WARN_LOG_FMT(NETPLAY, "Orca keyframe: {}; trying again", *error);
     }
     return false;
@@ -821,5 +833,10 @@ std::unique_ptr<KeyframeStore> MakeKeyframeStore(TicketSource tickets)
   if (!dir.empty())
     return std::make_unique<LocalKeyframeStore>(dir);
   return MakeHttpKeyframeStore(std::move(tickets));
+}
+
+std::string LastRefusal()
+{
+  return t_last_refusal;
 }
 }  // namespace Orca::Net

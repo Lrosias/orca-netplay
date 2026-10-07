@@ -3,7 +3,9 @@
 
 #include "Core/Orca/Session/Events.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <mutex>
 #include <utility>
 
@@ -174,7 +176,7 @@ void NotifyStall(int stalled_ms)
     callback(stalled_ms);
 }
 
-void NotifyBoundary(bool shown)
+void NotifyBoundary(bool shown, double game_held_ms, int game_held_frames)
 {
   BoundaryCallback callback;
   {
@@ -182,6 +184,23 @@ void NotifyBoundary(bool shown)
     callback = s_boundary;
   }
   if (callback)
-    callback(shown);
+    callback(shown, game_held_ms, game_held_frames);
+}
+
+double GameHeldMs(double emulated_ms, double wall_ms, double frame_ms)
+{
+  if (!(frame_ms > 0) || !(emulated_ms >= 1.5 * frame_ms) || !(wall_ms > frame_ms))
+    return 0;
+  return std::min(emulated_ms, wall_ms) - frame_ms;
+}
+
+int GameHeldFrames(double game_held_ms, double frame_ms, double& carry)
+{
+  if (!(frame_ms > 0) || !(game_held_ms > 0))
+    return 0;
+  const double frames = game_held_ms / frame_ms + carry;
+  const int whole = std::max(0, static_cast<int>(std::lround(frames)));
+  carry = frames - whole;
+  return whole;
 }
 }  // namespace Orca::Events

@@ -25,7 +25,7 @@
 #                        {"buttons": <wire mask>, "axes": [x, y, cx, cy]} (authed); each holds
 #                        until the next
 # Wire mask: A 1, B 2, X 4, Y 8, Left 16, Right 32, Down 64, Up 128, Start 256, Z 512, R 1024, L 2048.
-import json, os, sys, threading, time, urllib.request, random, string, uuid
+import json, os, socket, sys, threading, time, urllib.request, random, string, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOM = os.environ.get("FAKE_ROOM"); TOKEN = os.environ.get("FAKE_TOKEN", "t0ken")
@@ -34,6 +34,9 @@ SLUG = os.environ.get("FAKE_SLUG", "orca-test"); LOG = os.environ.get("FAKE_LOG"
 # tickets, as the app gets them. FAKE_NO_LEAVE=1: the page never sends Leave.
 COOKIE = os.environ.get("FAKE_COOKIE", ""); TICKET_SLUG = os.environ.get("FAKE_TICKET_SLUG", "")
 SITE = os.environ.get("FAKE_SITE", "https://yougame.co"); NO_LEAVE = os.environ.get("FAKE_NO_LEAVE") == "1"
+# FAKE_TICKET_DROP_FIRST=1: the first mpTicket gets no reply (the connection just closes), as when
+# the page's ticket never comes back.
+DROP_FIRST = os.environ.get("FAKE_TICKET_DROP_FIRST") == "1"
 # FAKE_LEAVE_AFTER: seconds from the room reading ready to the page's Leave (default 2).
 LEAVE_AFTER = float(os.environ.get("FAKE_LEAVE_AFTER", "2"))
 PAD_HZ = float(os.environ.get("FAKE_PAD_HZ", "125")); PAD_NOISE = os.environ.get("FAKE_PAD_NOISE") == "1"
@@ -110,6 +113,14 @@ class H(BaseHTTPRequestHandler):
             return self.reply(200, {"ok": True, "result": None})
         if t == "hello": return self.reply(200, {"ok": True, "result": {"room": ROOM}})
         if t == "mpTicket":
+            with lock:
+                drop = DROP_FIRST and not state.get("dropped")
+                state["dropped"] = True
+            if drop:
+                log({"ticket_dropped": msg["room"]})
+                self.close_connection = True
+                self.connection.shutdown(socket.SHUT_RDWR)
+                return
             pid = "orcabr-" + "".join(random.choice(string.ascii_lowercase) for _ in range(12))
             headers = {"content-type": "application/json", "user-agent": "Mozilla/5.0 (Macintosh) OrcaTest"}
             if COOKIE:

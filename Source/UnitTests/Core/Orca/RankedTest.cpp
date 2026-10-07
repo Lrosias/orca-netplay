@@ -359,6 +359,44 @@ TEST(OrcaRankedPPlus, PresetOutsideTheStageSelectOnly)
   EXPECT_EQ(m.Read8(RankedPPlus::RSS_EXDATA), 0x77);
 }
 
+// A My Music step left from an earlier stage select hid the next one's tiles (the ranked strike
+// screen showed only Random) and sent the timer's pick to My Music.
+TEST(OrcaRankedPPlus, CharacterSelectClearsALeftoverMyMusicStep)
+{
+  const auto leftover = [](FakeMemory& m) {
+    m.Fill(RankedPPlus::MUSIC_SELECT, 0x30, 0);
+    m.Write32(RankedPPlus::MUSIC_SELECT, 1);            // step 1: going to My Music
+    m.Write32(RankedPPlus::MUSIC_SELECT + 0x08, 0x2A);  // song
+    m.Write32(RankedPPlus::MUSIC_SELECT + 0x14, 0x01000000);
+    m.Write32(RankedPPlus::MUSIC_SELECT + 0x2C, 7);
+    m.Write32(RankedPPlus::MUSIC_SELECT + 0x04, 0x55);  // not My Music's
+    m.Write32(RankedPPlus::MUSIC_SELECT + 0x1C, 0x66);  // not My Music's
+  };
+  // Ranked, casual, and a session with no flow (With Friends, solo).
+  for (const int mode : {int{MatchBlock::MODE_RANKED}, int{MatchBlock::MODE_CASUAL}, -1})
+  {
+    SCOPED_TRACE(mode);
+    FakeMemory m = Game("scSelctCharacter");
+    leftover(m);
+    if (mode >= 0)
+    {
+      MatchBlock::Write(
+          m, MatchBlock::State::Fresh(static_cast<u8>(mode), Ranked::RULESET_PPLUS_2024, 0));
+    }
+    EXPECT_EQ(RankedPPlus::ClearStaleMusicSelect(m), 16);
+    for (const u32 offset : RankedPPlus::MUSIC_SELECT_WORDS)
+      EXPECT_EQ(m.Read32(RankedPPlus::MUSIC_SELECT + offset), 0u) << "word +" << offset;
+    EXPECT_EQ(m.Read32(RankedPPlus::MUSIC_SELECT + 0x04), 0x55u);
+    EXPECT_EQ(m.Read32(RankedPPlus::MUSIC_SELECT + 0x1C), 0x66u);
+    EXPECT_EQ(RankedPPlus::ClearStaleMusicSelect(m), 0);
+  }
+  // Never on the stage select, where My Music's own steps run.
+  FakeMemory sss = RankedSss(0);
+  leftover(sss);
+  EXPECT_EQ(RankedPPlus::ClearStaleMusicSelect(sss), 0);
+  EXPECT_EQ(sss.Read32(RankedPPlus::MUSIC_SELECT), 1u);
+}
+
 TEST(OrcaRankedPPlus, GameOneStrikesInTurnsThenTheCoinPicks)
 {
   FakeMemory m = RankedSss(1);  // port 2 strikes first

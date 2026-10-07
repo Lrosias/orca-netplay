@@ -163,6 +163,21 @@ bool MaySkip(const View& v, const State& s)
          !(s.flags & (FLAG_TIMED_OUT | FLAG_GO));
 }
 
+std::string_view UnreadyReason(const View& v, const State& before, const State& after)
+{
+  if (!(before.ready & 1) || (after.ready & 1))
+    return "dropped on an earlier frame";
+  if (after.flags & FLAG_BACK_A)
+    return "A on Back cancelled the search";
+  if ((v.raw[0] & ~v.raw_prev[0]) & BUTTON_B)
+    return "B";
+  if (!v.ports[0].placed)
+    return "the token was picked up";
+  if (!v.queue2 || !v.solo || !v.css)
+    return "left the character select";
+  return "unknown";
+}
+
 State Advance(const View& v, const State& state, int frame)
 {
   State s = state;
@@ -205,7 +220,8 @@ State Advance(const View& v, const State& state, int frame)
       newly[0] = static_cast<u16>(newly[0] & ~BUTTON_START);
     s = State{};
     s.ready = ready & 1;
-    follow(0, true);
+    // Never ready with the name list open: a room's select couldn't close it.
+    follow(0, !v.ports[0].name_list);
     if (swallowing || ((ready & 1) && !(s.ready & 1) && (newly[0] & BUTTON_B)))
       s.flags |= FLAG_SWALLOW_B;
     if (swallowing_start)
@@ -611,6 +627,7 @@ View ReadView(const GuestMemory& m, const std::vector<Events::PortInfo>& ports)
     p.costume = static_cast<int>(m.Read32(area + AREA_COSTUME));
     p.placed = p.human && p.character != NO_CHARACTER && m.Read8(area + AREA_IN_HAND) == 0 &&
                m.Read8(area + AREA_FLYING) == 0;
+    p.name_list = Rules::ReadCssNameList(m, static_cast<int>(i));
     const Rules::CssHand hand = Rules::ReadCssHand(m, static_cast<int>(i));
     if (hand.valid)
     {
@@ -994,6 +1011,7 @@ void Frame(const Core::CPUThreadGuard& guard, int frame, bool resimulating,
     return;
   GuardMemory m(guard);
   // After a room that should not keep this player ready, clear ready at a solo frame.
+  std::string cleared;
   if (alone && !resimulating && s_clear_ready.exchange(false))
   {
     const Rules::Header h = Rules::ReadHeader(m);
@@ -1010,6 +1028,7 @@ void Frame(const Core::CPUThreadGuard& guard, int frame, bool resimulating,
           why = s_clear_ready_why;
         }
         NOTICE_LOG_FMT(ROLLBACK, "Queue: not ready after the room ({})", why);
+        cleared = "cleared after the room: " + why;
       }
     }
   }
@@ -1142,7 +1161,8 @@ void Frame(const Core::CPUThreadGuard& guard, int frame, bool resimulating,
     else if (!ready && l.printed_ready)
     {
       l.printed_ready = false;
-      NOTICE_LOG_FMT(ROLLBACK, "Queue: frame {}: orca queue unready", frame);
+      NOTICE_LOG_FMT(ROLLBACK, "Queue: frame {}: orca queue unready ({})", frame,
+                     cleared.empty() ? UnreadyReason(v, before, after) : cleared);
       Orca::Status::Line("orca queue unready");
     }
   }

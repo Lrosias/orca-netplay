@@ -10,7 +10,8 @@
 #                                            409 {"code": "exists"} for an id already there
 #   GET    /api/orca/keyframes/<room>/<id>   404 {"code": "gone"} when absent
 #   DELETE /api/orca/keyframes/<room>/<id>
-# Any other ticket gets 401 {"code": "ticket"}. Room "flaky" answers 503 to every other request.
+# Ticket "guest" gets 403 {"code": "signed_out"}, "edge" a 403 page with no code (the edge's), any
+# other 401 {"code": "ticket"}. Room "flaky" answers 503 to every other request.
 import json
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,6 +42,12 @@ class Handler(BaseHTTPRequestHandler):
             if flaky["n"] % 2 == 1:
                 self.reply(503, b'{"error":"busy"}')
                 return False
+        if self.headers.get("Authorization") == "Ticket guest":
+            self.reply(403, b'{"error":"Sign in to share a game.","code":"signed_out"}')
+            return False
+        if self.headers.get("Authorization") == "Ticket edge":
+            self.reply(403, b"<html>Access denied</html>", "text/html")
+            return False
         if self.headers.get("Authorization") != "Ticket good":
             self.reply(401, b'{"error":"Bad or expired ticket","code":"ticket"}')
             return False

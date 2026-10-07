@@ -21,17 +21,20 @@
 
 #include "Common/FPURoundMode.h"
 #include "Common/Logging/Log.h"
+#include "Core/CoreTiming.h"
+#include "Core/HW/GCPad.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/SI/SI.h"
+#include "Core/HW/SystemTimers.h"
+#include "Core/HW/VideoInterface.h"
 #include "Core/IOS/FS/HostBackend/FS.h"
 #include "Core/IOS/IOS.h"
-#include "Core/HW/GCPad.h"
 #include "Core/Orca/JitWarm.h"
 #include "Core/Orca/Profile.h"
-#include "Core/Orca/Status.h"
 #include "Core/Orca/Session/Events.h"
 #include "Core/Orca/Session/Online.h"
 #include "Core/Orca/Session/PadCodec.h"
+#include "Core/Orca/Status.h"
 #include "Core/Orca/UX/OrbCombo.h"
 #include "Core/PowerPC/JitCommon/JitBase.h"
 #include "Core/PowerPC/JitInterface.h"
@@ -42,10 +45,10 @@
 #include "Core/Rollback/InputGate.h"
 #include "Core/Rollback/OnlineMatch.h"
 #include "Core/Rollback/SessionPort.h"
-#include "InputCommon/ControlReference/ControlReference.h"
-#include "InputCommon/ControllerInterface/ControllerInterface.h"
 #include "Core/State.h"
 #include "Core/System.h"
+#include "InputCommon/ControlReference/ControlReference.h"
+#include "InputCommon/ControllerInterface/ControllerInterface.h"
 #include "VideoCommon/VideoState.h"
 
 namespace Rollback
@@ -56,6 +59,33 @@ std::atomic<bool> s_in_snapshot{false};
 std::atomic<bool> s_resimulating{false};
 // Whether the frame now running is rendered, for the overlay's frame meter. CPU thread only.
 bool s_frame_shown = true;
+// Emulated ticks and host time when the frame now running began (after any load at its boundary),
+// ticks 0 if unknown; how long the game held the shown frame that just ended (Events::GameHeldMs),
+// and the fraction of a frame held over to the next hold. CPU thread only.
+u64 s_frame_start_ticks = 0;
+std::chrono::steady_clock::time_point s_frame_start_wall{};
+double s_frame_held_ms = 0;
+int s_frame_held_frames = 0;
+double s_frame_held_carry = 0;
+
+// The emulated length of the frame that just ended, past one video frame, if it was shown.
+void TimeEndedFrame(Core::System& system)
+{
+  s_frame_held_ms = 0;
+  s_frame_held_frames = 0;
+  const u64 ticks = system.GetCoreTiming().GetTicks();
+  if (!s_frame_shown || s_frame_start_ticks == 0 || ticks <= s_frame_start_ticks)
+    return;
+  const double rate = system.GetVideoInterface().GetTargetRefreshRate();
+  const double frame_ms = 1000 / (rate > 0 ? rate : 59.94);
+  const double emulated_ms = static_cast<double>(ticks - s_frame_start_ticks) * 1000 /
+                             system.GetSystemTimers().GetTicksPerSecond();
+  const double wall_ms = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - s_frame_start_wall)
+                             .count();
+  s_frame_held_ms = Orca::Events::GameHeldMs(emulated_ms, wall_ms, frame_ms);
+  s_frame_held_frames = Orca::Events::GameHeldFrames(s_frame_held_ms, frame_ms, s_frame_held_carry);
+}
 
 constexpr std::size_t RESTORE_PAGE = 4096;
 constexpr u32 MEM1_VIRTUAL = 0x80000000u;
@@ -531,6 +561,16 @@ u64 HostFloatControlForTests()
   return HostFloatControl();
 }
 
+double LastFrameHeldMs()
+{
+  return s_frame_held_ms;
+}
+
+int LastFrameHeldFrames()
+{
+  return s_frame_held_frames;
+}
+
 void OnFrameBoundary(const Core::CPUThreadGuard& guard)
 {
   HostFloatScope host_float(guard.GetSystem().GetPPCState());
@@ -540,6 +580,8 @@ void OnFrameBoundary(const Core::CPUThreadGuard& guard)
       profile && !Orca::FrameHookLive(guard, *profile))
   {
     InputGate::Clear();
+    s_frame_start_ticks = 0;
+    s_frame_held_carry = 0;
     return;
   }
   Orca::Status::GameStarted();
@@ -555,7 +597,8 @@ void OnFrameBoundary(const Core::CPUThreadGuard& guard)
     NOTICE_LOG_FMT(ROLLBACK, "JIT cleared once: the loader's codes have landed");
   }
   // Report the frame that just ended to the overlay's frame meter. Host time only.
-  Orca::Events::NotifyBoundary(s_frame_shown);
+  TimeEndedFrame(guard.GetSystem());
+  Orca::Events::NotifyBoundary(s_frame_shown, s_frame_held_ms, s_frame_held_frames);
   // Inside a JIT block pc and npc are stale, and a snapshot would record and later resume at a
   // wrong address. Pin both to the hook address so every snapshot resumes here; the rest of the
   // block runs normally and updates them on exit.
@@ -616,5 +659,7 @@ void OnFrameBoundary(const Core::CPUThreadGuard& guard)
   // Skip host rendering for re-run frames. The emulated GPU still runs, so RAM and timing match.
   VideoCommon_SetSkipRender(IsResimulating() || Orca::TestSkipRender());
   s_frame_shown = !IsResimulating();
+  s_frame_start_ticks = guard.GetSystem().GetCoreTiming().GetTicks();
+  s_frame_start_wall = std::chrono::steady_clock::now();
 }
 }  // namespace Rollback

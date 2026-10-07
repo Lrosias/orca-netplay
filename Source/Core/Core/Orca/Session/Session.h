@@ -262,6 +262,8 @@ struct Stats
   // Slow frames this machine reported (OnLocalHitch), and the most any other player reported.
   int hitches = 0;
   int peer_hitches = 0;
+  // Slow frames a game load explained (OnLoadHitch), not in `hitches`.
+  int load_hitches = 0;
   // Stalls that count toward the others' delay (no hitch nearby on either machine, not caused by
   // the other side's own stall, not while catching up or settling), as reported (Packet::stalls),
   // and how many a frame more of the others' delay would have spared (Packet::spared).
@@ -299,6 +301,9 @@ public:
   // outside the session's own stalls and waits). Only the emulator can tell, since the session has
   // no wall clock; peers hear of it and exclude the stalls it caused from the delay.
   void OnLocalHitch();
+  // A frame that was slow only because the game itself held it (a load, the same on every machine).
+  // Counted apart and not reported to peers; stalls around it still don't count.
+  void OnLoadHitch();
 
   // ---- Drop-in ---- The confirmed history: every seat's pads for frames [base, base + size). The
   // host starts with the log of its solo frames since its keyframe and sends a joiner what it

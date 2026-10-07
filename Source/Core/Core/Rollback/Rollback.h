@@ -133,4 +133,8 @@ std::optional<GCPadStatus> RawInputOverride(int port);
 void OnFrameBoundary(const Core::CPUThreadGuard& guard);
 // This thread's FPCR (ARM64) or MXCSR (x86-64); for tests.
 u64 HostFloatControlForTests();
+// At a boundary, on the CPU thread: how long the game itself held the shown frame that just ended
+// past one video frame (Events::GameHeldMs; 0 for a re-run), in ms and in video frames.
+double LastFrameHeldMs();
+int LastFrameHeldFrames();
 }  // namespace Rollback

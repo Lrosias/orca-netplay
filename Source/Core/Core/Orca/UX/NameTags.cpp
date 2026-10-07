@@ -4,12 +4,20 @@
 #include "Core/Orca/UX/NameTags.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <optional>
 #include <utility>
 
+#include <fmt/format.h>
+
+#include "Common/CommonPaths.h"
+#include "Common/FileUtil.h"
+#include "Common/Logging/Log.h"
+#include "Common/StringUtil.h"
 #include "Core/Core.h"
 #include "Core/Orca/Profile.h"
+#include "Core/Orca/Status.h"
 #include "Core/PowerPC/MMU.h"
 
 namespace Orca::UX
@@ -25,9 +33,11 @@ constexpr u32 TAG_RUMBLE = 0x0C;
 constexpr u32 TAG_CONTROLS = 0x14;
 constexpr u32 CONTROLS_TEMPLATE = 0x80406938;
 constexpr u32 CONTROLS_TEMPLATE_SIZE = CONTROLS_LAYOUT_SIZE;
-// Flag byte offsets in the layout: GameCube tap jump, Nunchuk tap jump (0x40) and shake smash
-// (0x80), Classic tap jump. Every other byte is an action.
+// Flag byte offsets in the layout and the bits the game sets there: GameCube tap jump (0x80) and
+// set up (0x70), Nunchuk shake smash (0x80), tap jump (0x40) and not set up (0x03), Classic tap
+// jump (0x80). Every other byte is an action.
 constexpr u32 FLAGS_GAMECUBE = 11, FLAGS_NUNCHUK = 0x1F, FLAGS_CLASSIC = 0x2C;
+constexpr u8 BITS_GAMECUBE = 0xF0, BITS_NUNCHUK = 0xC3, BITS_CLASSIC = 0x80;
 // The highest action the menus can set. 0xE is "none".
 constexpr u8 MAX_ACTION = 0x0E;
 constexpr u32 SCENE_SELCHAR_TASK = 0x400;
@@ -146,19 +156,28 @@ std::u16string Variant(std::u16string name, int port)
   return name;
 }
 
-// Clamps a profile's layout byte to what the game's menus could set, else the default.
-u8 LayoutByte(u32 i, u8 value, u8 default_value)
+// The bits a flag byte may hold; 0 for an action byte.
+u8 FlagBits(u32 i)
 {
   switch (i)
   {
   case FLAGS_GAMECUBE:
-  case FLAGS_CLASSIC:
-    return value & 0x80;
+    return BITS_GAMECUBE;
   case FLAGS_NUNCHUK:
-    return value & 0xC0;
+    return BITS_NUNCHUK;
+  case FLAGS_CLASSIC:
+    return BITS_CLASSIC;
   default:
-    return value <= MAX_ACTION ? value : default_value;
+    return 0;
   }
+}
+
+// Clamps a profile's layout byte to what the game's menus could set, else the default.
+u8 LayoutByte(u32 i, u8 value, u8 default_value)
+{
+  if (const u8 bits = FlagBits(i))
+    return value & bits;
+  return value <= MAX_ACTION ? value : default_value;
 }
 
 // Writes rumble and layout into the tag, only bytes that differ. The caller checked that the
@@ -330,6 +349,56 @@ bool BrawlRev2()
 }
 }  // namespace
 
+std::string ControlsHex(const std::vector<u8>& profile)
+{
+  std::string hex;
+  hex.reserve(profile.size() * 2);
+  for (const u8 b : profile)
+    hex += fmt::format("{:02x}", b);
+  return hex;
+}
+
+bool ControlsValid(const std::vector<u8>& profile)
+{
+  if (profile.size() != CONTROLS_PROFILE_SIZE || profile[0] > 1)
+    return false;
+  for (u32 i = 0; i < CONTROLS_LAYOUT_SIZE; ++i)
+  {
+    const u8 v = profile[1 + i];
+    const u8 bits = FlagBits(i);
+    if (bits ? (v & ~bits) != 0 : v > MAX_ACTION)
+      return false;
+  }
+  return true;
+}
+
+std::optional<std::vector<u8>> ParseControlsHex(std::string_view hex)
+{
+  if (hex.size() != CONTROLS_PROFILE_SIZE * 2)
+    return std::nullopt;
+  const auto digit = [](char c) -> int {
+    if (c >= '0' && c <= '9')
+      return c - '0';
+    if (c >= 'a' && c <= 'f')
+      return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+      return c - 'A' + 10;
+    return -1;
+  };
+  std::vector<u8> profile;
+  profile.reserve(CONTROLS_PROFILE_SIZE);
+  for (size_t i = 0; i < hex.size(); i += 2)
+  {
+    const int hi = digit(hex[i]), lo = digit(hex[i + 1]);
+    if (hi < 0 || lo < 0)
+      return std::nullopt;
+    profile.push_back(static_cast<u8>(hi << 4 | lo));
+  }
+  if (!ControlsValid(profile))
+    return std::nullopt;
+  return profile;
+}
+
 void WriteNameTags(const Core::CPUThreadGuard& guard, const std::vector<Events::PortInfo>& ports)
 {
   if (ports.empty() || !BrawlRev2())
@@ -372,6 +441,126 @@ std::vector<u8> ReadOwnControls(const GuestMemory& m, int port, std::string_view
   return profile;
 }
 
+std::optional<std::vector<u8>> OwnControlsWatch::Next(const std::vector<u8>& read,
+                                                      const std::vector<u8>& own, bool is_default)
+{
+  // Nothing readable (the menus before any tag exists) never clears a profile.
+  if (read.empty())
+    return std::nullopt;
+  if (std::exchange(m_rebase, false))
+  {
+    m_last = read;
+    return std::nullopt;
+  }
+  if (read == m_last)
+    return std::nullopt;
+  m_last = read;
+  // Orca's own write showing up in the tag, or a player with no profile on the defaults.
+  if (read == own || (own.empty() && is_default))
+    return std::nullopt;
+  return read;
+}
+
+namespace
+{
+std::atomic<bool> s_rebase_own{false};
+std::atomic<bool> s_own_loaded{false};
+// The app's controls came before the game's profile was known: kept once it is.
+std::atomic<bool> s_keep_pending{false};
+
+// Where this game's controls are kept between runs: the user folder's Config, one file per game.
+std::string OwnControlsPath()
+{
+  const Orca::Profile* profile = Orca::ActiveProfile();
+  if (!profile || profile->game_id.empty())
+    return {};
+  return File::GetUserPath(D_CONFIG_IDX) + "OrcaControls-" + profile->game_id + ".txt";
+}
+
+void KeepOwnControls(const std::vector<u8>& profile)
+{
+  const std::string path = OwnControlsPath();
+  if (path.empty() || !File::WriteStringToFile(path, ControlsHex(profile) + "\n"))
+    WARN_LOG_FMT(ROLLBACK, "Name tags: couldn't keep this player's controls");
+}
+
+// The game's defaults with rumble on, as a tag Orca makes holds them.
+bool IsDefaultProfile(const GuestMemory& m, const std::vector<u8>& profile)
+{
+  if (profile.size() != CONTROLS_PROFILE_SIZE || profile[0] != 1 || !TemplateReadable(m))
+    return false;
+  for (u32 i = 0; i < CONTROLS_LAYOUT_SIZE; ++i)
+  {
+    if (profile[1 + i] != m.Read8(CONTROLS_TEMPLATE + i))
+      return false;
+  }
+  return true;
+}
+
+// Only bits and actions the menus set, so a kept profile always parses back.
+std::vector<u8> Sanitized(std::vector<u8> profile)
+{
+  profile[0] = profile[0] != 0 ? 1 : 0;
+  for (u32 i = 0; i < CONTROLS_LAYOUT_SIZE; ++i)
+    profile[1 + i] = LayoutByte(i, profile[1 + i], 0x0E);
+  return profile;
+}
+}  // namespace
+
+void LoadOwnControls()
+{
+  if (s_own_loaded.exchange(true))
+  {
+    if (s_keep_pending.exchange(false) && Orca::ActiveProfile())
+      KeepOwnControls(Events::OwnControls());
+    return;
+  }
+  std::optional<std::vector<u8>> profile;
+  const char* from = "";
+  bool kept = false;
+  if (const char* env = std::getenv("ORCA_CONTROLS"); env && *env)
+  {
+    profile = ParseControlsHex(StripWhitespace(env));
+    from = "the app";
+    if (!profile)
+      WARN_LOG_FMT(ROLLBACK, "Name tags: ORCA_CONTROLS isn't a controls profile; ignored");
+  }
+  if (!profile)
+  {
+    std::string text;
+    if (const std::string path = OwnControlsPath();
+        !path.empty() && File::Exists(path) && File::ReadFileToString(path, text))
+    {
+      profile = ParseControlsHex(StripWhitespace(text));
+      from = "an earlier run";
+      kept = true;
+    }
+  }
+  if (!profile)
+    return;
+  NOTICE_LOG_FMT(ROLLBACK, "Name tags: this player's own controls from {}", from);
+  // Kept ones, not the app's: the page takes them as the player's.
+  if (kept)
+    Orca::Status::Line("orca controls " + ControlsHex(*profile));
+  Events::SetOwnControls(std::move(*profile));
+}
+
+bool SetOwnControlsFromApp(std::string_view hex)
+{
+  std::optional<std::vector<u8>> profile = ParseControlsHex(hex);
+  if (!profile)
+    return false;
+  s_own_loaded = true;
+  // The tag worn now still holds the old controls; the next character select writes these.
+  s_rebase_own = true;
+  if (Orca::ActiveProfile())
+    KeepOwnControls(*profile);
+  else
+    s_keep_pending = true;
+  Events::SetOwnControls(std::move(*profile));
+  return true;
+}
+
 void ReadOwnControlsFrame(const Core::CPUThreadGuard& guard,
                           const std::vector<Events::PortInfo>& ports)
 {
@@ -383,22 +572,29 @@ void ReadOwnControlsFrame(const Core::CPUThreadGuard& guard,
   if (own == ports.end())
     return;
   static std::u16string s_last_worn;
-  static std::vector<u8> s_published;
+  static OwnControlsWatch s_watch;
   // After a resync (keyframe load or back to solo), a tag with the remembered name may belong to
-  // someone else's save, so forget it.
+  // someone else's save, so forget it, and take what is worn now as no change.
   static u64 s_resyncs = 0;
   if (const u64 resyncs = Events::Resyncs(); resyncs != s_resyncs)
   {
     s_resyncs = resyncs;
     s_last_worn.clear();
+    s_watch.Rebase();
   }
+  if (s_rebase_own.exchange(false))
+    s_watch.Rebase();
   GuardMemory memory(guard);
-  std::vector<u8> profile = ReadOwnControls(memory, own->port, own->name, &s_last_worn);
-  if (profile != s_published)
-  {
-    s_published = profile;
-    Events::SetOwnControls(std::move(profile));
-  }
+  const std::vector<u8> read = ReadOwnControls(memory, own->port, own->name, &s_last_worn);
+  const std::vector<u8> current = Events::OwnControls();
+  std::optional<std::vector<u8>> changed =
+      s_watch.Next(read.empty() ? read : Sanitized(read), current, IsDefaultProfile(memory, read));
+  if (!changed)
+    return;
+  NOTICE_LOG_FMT(ROLLBACK, "Name tags: this player changed their controls in the game");
+  Orca::Status::Line("orca controls " + ControlsHex(*changed));
+  KeepOwnControls(*changed);
+  Events::SetOwnControls(std::move(*changed));
 }
 
 }  // namespace Orca::UX

@@ -117,7 +117,10 @@ public:
   // Every frame boundary, on the CPU thread. `shown` is true for a rendered first run, not a
   // rollback re-run or catch-up. Re-runs lengthen the measured frame time but never count as
   // frames. The first shown boundary only arms the meter, since the one before may include a wait.
-  void OnFrame(double now_ms, bool shown);
+  // `game_held_ms` (Events::GameHeldMs) is time the game itself held a shown frame, such as a load,
+  // and `game_held_frames` those video frames (Events::GameHeldFrames): the meter counts them as
+  // shown, so it shows only this machine falling behind.
+  void OnFrame(double now_ms, bool shown, double game_held_ms = 0, int game_held_frames = 0);
   // The core paused or resumed (host thread). The meter's clock stands still while paused.
   void Pause(double now_ms);
   void Resume(double now_ms);
@@ -143,7 +146,7 @@ private:
   LinkView m_link;
   std::deque<std::pair<double, int>> m_stall_history;  // (time, total stalls)
   // Shown frames (boundary, frame time ms) over the last PERF_WINDOW_MS + PERF_HOLD_MS, on the
-  // RunningMs clock.
+  // RunningMs clock. A frame the game itself held is that many frames here (OnFrame).
   std::deque<std::pair<double, double>> m_frames;
   double m_first_frame = -1;  // meter start; no readout for the first second
   double m_last_frame = -1;   // last shown boundary, -1 if not armed
@@ -170,7 +173,7 @@ constexpr double DIM_EASE_S = 0.2;
 void SetStats(Stats stats);
 void SetPerf(Perf perf);
 // The game's frame boundary, for the frame meter.
-void FrameBoundary(bool shown);
+void FrameBoundary(bool shown, double game_held_ms, int game_held_frames);
 // A short toast under the circle. Any thread.
 void ShowToast(std::string text);
 // A line of the app's chat. Never logged. Any thread.

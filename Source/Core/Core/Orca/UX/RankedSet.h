@@ -45,6 +45,7 @@ struct Live
   std::array<u8, 2> stocks{0, 0};
   std::array<u16, 2> percent{0, 0};
   std::array<bool, 2> on_ledge{false, false};
+  std::array<u32, 2> status{0, 0};  // each fighter's status kind
   bool operator==(const Live&) const = default;
 };
 

@@ -33,9 +33,11 @@ class CPUThreadGuard;
 //   It keeps its CPU plate until ApplySeats hides it or a player joins it. A human's panel on an
 //   unplugged port is left to the game, which empties it 17 frames after the controller goes;
 //   emptying it first would leave the token's highlight on the grid.
-// - GateMasks, without a header: A never reaches a player-type or name button, or any place within
-//   one frame's travel of them. A panel a CPU had is joined by Orca pressing A for its port while
-//   that port's hand rests on the panel's player-type button (PressesJoin).
+// - GateMasks, without a header: A never reaches a player-type button, another panel's name
+//   button, or any place within one frame's travel of them. The player's own name button and its
+//   list take A as on the queue's own select (Rules::CssNameTakesA). A panel a CPU had is joined by
+//   Orca pressing A for its port while that port's hand rests on the panel's player-type button
+//   (PressesJoin).
 // - ApplySeats, on the character select: an empty panel whose port nobody plugged in is hidden.
 //   Hiding only stops drawing; the panel's logic and buttons stay. A panel that should show gets
 //   Orca's hide bits cleared on any character select.
@@ -77,7 +79,7 @@ constexpr u32 MODEL_FLAGS_HIDDEN = 0x00000060;  // DISABLE_DRAW_OPA | DISABLE_DR
 // most 1.0 a frame (0.83 in Brawl), so from -16.4 up no single frame takes the hand onto one with A
 // down. Below -16.4, A loses only the bottom edge of the panel's costume picture.
 constexpr float TYPE_BUTTONS_A_FLOOR = -16.4f;
-constexpr u32 CSS_BUTTON_NAME = 0x1C;
+constexpr u32 CSS_BUTTON_NAME = Rules::CSS_BUTTON_NAME;
 
 // ---- Pure decisions ----
 // Whether a select is online: a header that locks, an online pick, or two ports or more plugged in.
@@ -98,8 +100,9 @@ constexpr u32 PanelKindFor(u32 kind)
 // select while it searches).
 bool SeatHidden(bool online, const Rules::Header& header, int port, u32 kind, bool plugged,
                 bool searching);
-// Whether A may reach the game from this hand on an online select without a header. An unreadable
-// hand may not, as with Rules::CssHandMayPressA.
+// Whether A may reach the game from this hand on an online select without a header, apart from the
+// player's own name button (Rules::CssNameTakesA). An unreadable hand may not, as with
+// Rules::CssHandMayPressA.
 bool HandMayPressA(const Rules::CssHand& hand);
 // Whether Orca presses A for plugged-in port `port` (0-3) on an online select without a header:
 // its panel is empty (`kind` 0) with its token neither in the hand nor flying (a panel a CPU had;

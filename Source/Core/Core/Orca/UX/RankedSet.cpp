@@ -384,6 +384,7 @@ Live ReadLiveFight(const GuestMemory& m)
     {
       const u32 kind = m.Read32(status + STATUS_KIND);
       live.on_ledge[port] = kind >= STATUS_CLIFF_FIRST && kind <= STATUS_CLIFF_LAST;
+      live.status[port] = kind;
     }
     seen[port] = true;
   }

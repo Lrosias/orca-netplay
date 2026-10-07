@@ -140,12 +140,25 @@ std::string CompatibilityKey()
       GetSeedSaveHash(), TestOverridesActive(), Config::Get(Config::MAIN_WII_SD_CARD),
       Config::Get(Config::MAIN_ALLOW_SD_WRITES));
   // The disc image's hash, when the app computed it: a modified disc with the right ID and revision
-  // would otherwise desync instead of being refused.
+  // would otherwise desync instead of being refused. For a dump AliasRevision plays as another
+  // (Brawl Rev 1), the app passes the hash of the dump it plays as, or its players meet no one.
   parts += "|disc=" + Env("ORCA_DISC_SHA1");
   // Version of what the in-game UX writes to emulated memory (name tags, mode locks).
   parts += fmt::format("|ux={}", Events::UXCompatVersion());
   // The room allows 1-64 characters of [a-zA-Z0-9._:-].
-  return fmt::format("orca1:{:016x}", XXH3_64bits(parts.data(), parts.size()));
+  const std::string key = fmt::format("orca1:{:016x}", XXH3_64bits(parts.data(), parts.size()));
+  // What went into it, when that changes: a player alone in a queue shows which input split them.
+  {
+    static std::mutex logged_mutex;
+    static std::string logged;
+    std::lock_guard lock(logged_mutex);
+    if (parts != logged)
+    {
+      logged = parts;
+      NOTICE_LOG_FMT(NETPLAY, "Orca: compatibility {} from {}", key, parts);
+    }
+  }
+  return key;
 }
 
 namespace

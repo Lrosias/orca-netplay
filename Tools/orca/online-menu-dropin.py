@@ -3,7 +3,9 @@
 # (ORCA.md "Online menu", "Drop-in"), over a real YouGame dev room, headless and muted.
 #
 #   Tools/orca/online-menu-dropin.py <dolphin-emu-nogui> <disc> [--pplus <launcher.dol>] [--invite]
-#                                    [--hold]
+#                                    [--hold] [--disc2 <disc>]
+#
+# --disc2: the friend boots this disc instead (Brawl Rev 1 against a Rev 2 host, or the reverse).
 #
 # 1. Host boots to the main menu and opens PLAY ONLINE: the ONLINE page (With Friends / With
 #    Anyone), and stays there.
@@ -41,9 +43,11 @@ import threading
 import time
 
 if len(sys.argv) < 3:
-    sys.exit("usage: online-menu-dropin.py <nogui> <disc> [--pplus <dol>] [--invite]")
+    sys.exit("usage: online-menu-dropin.py <nogui> <disc> [--pplus <dol>] [--invite] "
+             "[--disc2 <disc>]")
 BIN, DISC = sys.argv[1], sys.argv[2]
 PPLUS = sys.argv[sys.argv.index("--pplus") + 1] if "--pplus" in sys.argv else None
+DISC2 = sys.argv[sys.argv.index("--disc2") + 1] if "--disc2" in sys.argv else DISC
 INVITE = "--invite" in sys.argv
 HOLD = "--hold" in sys.argv
 # --hold: the host's frame its hold ends at (it reaches the menu at about 1,430 in Brawl, and the
@@ -85,7 +89,7 @@ def write(name, lines):
 
 
 class Orca:
-    def __init__(self, name, env_extra, input_path):
+    def __init__(self, name, env_extra, input_path, disc=DISC):
         self.name = name
         self.lines = queue.Queue()
         self.menu = []
@@ -109,9 +113,9 @@ class Orca:
                 "-C", "Dolphin.DSP.Backend=No Audio Output",
                 "-C", "Logger.Logs.ROLLBACK=True", "-C", "Logger.Options.Verbosity=2"]
         if PPLUS:
-            args += ["-C", f"Dolphin.Core.DefaultISO={DISC}", "-e", PPLUS]
+            args += ["-C", f"Dolphin.Core.DefaultISO={disc}", "-e", PPLUS]
         else:
-            args += ["-e", DISC]
+            args += ["-e", disc]
         self.log_path = os.path.join(WORK, f"{name}.log")
         self.err = open(self.log_path, "w")
         self.proc = subprocess.Popen(args, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -263,7 +267,7 @@ if INVITE:
 
 host = start_host(ROOM, PICK_AT, env_extra={"ORCA_TEST_HOLD": f"0-{HOLD_UNTIL}"} if HOLD else None)
 
-friend = Orca("Friend", {}, write("friend.txt", ["# no presses: port 2 stays still"]))
+friend = Orca("Friend", {}, write("friend.txt", ["# no presses: port 2 stays still"]), DISC2)
 orcas.append(friend)
 friend.send(f"join {ROOM}")
 friend.expect("orca caps", 30)

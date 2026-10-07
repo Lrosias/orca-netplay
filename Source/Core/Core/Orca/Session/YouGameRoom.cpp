@@ -56,6 +56,10 @@ constexpr auto SERVER_SILENCE_LIMIT = std::chrono::seconds(8);
 // A joiner whose room has no host (a stale invite, a host that left or restarted) gives up this
 // long after its welcome; a present host says hello within about a second.
 constexpr auto HOST_WAIT = std::chrono::seconds(8);
+// The room's ticket: the page mints it, and a busy site took 12-60 s. A request that gets no reply
+// is sent once more.
+constexpr auto TICKET_TIMEOUT = std::chrono::seconds(30);
+constexpr int TICKET_TRIES = 2;
 // Matchmade rooms: a game's report waits this long for the room's match to start; the host's begin
 // gets this many tries (one per roster change after a refusal) and is resent if unanswered this
 // long.
@@ -1038,17 +1042,28 @@ struct YouGameRoom::Impl
     }
 
     // Leave() must not wait out a slow request: the progress callback aborts it.
-    Common::HttpRequest http(std::chrono::seconds(10),
-                             [this](s64, s64, s64, s64) { return !stop.load(); });
+    Common::HttpRequest http(TICKET_TIMEOUT, [this](s64, s64, s64, s64) { return !stop.load(); });
     const auto post = [&](const std::string& target, const picojson::object& body,
                           const Common::HttpRequest::Headers& headers,
                           picojson::object* result) -> bool {
-      const auto response = http.Post(target, picojson::value(body).serialize(), headers,
-                                      Common::HttpRequest::AllowedReturnCodes::All);
+      Common::HttpRequest::Response response;
+      for (int attempt = 1; attempt <= TICKET_TRIES && !stop; ++attempt)
+      {
+        const auto start = Clock::now();
+        response = http.Post(target, picojson::value(body).serialize(), headers,
+                             Common::HttpRequest::AllowedReturnCodes::All);
+        if (response)
+          break;
+        WARN_LOG_FMT(
+            NETPLAY, "Orca room: no reply from {} in {} ms (HTTP {}, try {} of {})", target,
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count(),
+            http.GetLastResponseCode(), attempt, TICKET_TRIES);
+        const auto until = Clock::now() + std::chrono::seconds(1);
+        while (attempt < TICKET_TRIES && !stop && Clock::now() < until)
+          std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
       if (!response)
       {
-        WARN_LOG_FMT(NETPLAY, "Orca room: no reply from {} (HTTP {})", target,
-                     http.GetLastResponseCode());
         End(stop ? "You left the room" : "YouGame did not respond", stop ? "" : "network");
         return false;
       }
@@ -2936,6 +2951,10 @@ struct YouGameRoom::Impl
         End("Your games went out of sync, so you left your friend's game", "desync");
       else if (reason == "stalled")
         End("The connection with your friend stalled, so you left the game", "peer_left");
+      else if (reason == "signed_out")
+        End("Your friend needs to sign in to YouGame to share their game", "signed_out");
+      else if (reason == "refused")
+        End("YouGame couldn't pass your friend's game to you", "network");
       else
         End("Your friend's game disconnected you", "network");
       return;

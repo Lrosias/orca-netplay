@@ -576,6 +576,51 @@ TEST(OrcaOnlineSeats, TheGateKeepsAOffTheButtonsOnlyWhereItShould)
   EXPECT_TRUE(GateMasks(sss)[0].Empty());
 }
 
+TEST(OrcaOnlineSeats, ThePlayersOwnNameButtonAndItsListTakeA)
+{
+  using Rules::CssHand;
+  const auto on_name = [](int panel, u32 button = CSS_BUTTON_NAME) {
+    return CssHand{true, Rules::CSS_HAND_BUTTON, button, -19.0f, -21.5f, panel};
+  };
+  // The own panel's name button, or an open list (the hand then reads button 0); nothing else.
+  EXPECT_TRUE(Rules::CssNameTakesA(on_name(0), 0, false));
+  EXPECT_TRUE(Rules::CssNameTakesA(on_name(1), 1, false));
+  EXPECT_FALSE(Rules::CssNameTakesA(on_name(1), 0, false));
+  EXPECT_FALSE(Rules::CssNameTakesA(on_name(-1), 0, false));
+  EXPECT_FALSE(Rules::CssNameTakesA(on_name(0, Rules::CSS_BUTTON_PLAYER_TYPE), 0, false));
+  EXPECT_FALSE(Rules::CssNameTakesA(CssHand{}, 0, false));
+  EXPECT_TRUE(Rules::CssNameTakesA(on_name(0, 0), 0, true));
+
+  // With Friends: A on port 1's own name button reaches the game, the stick still while A is down.
+  FakeMemory m = Game("scSelctCharacter", 25);
+  SetHand(m, 0, Rules::CSS_HAND_BUTTON, -21.5f, CSS_BUTTON_NAME, 0);
+  Rollback::InputGate::Masks masks = GateMasks(m);
+  EXPECT_EQ(masks[0].buttons, 0);
+  EXPECT_TRUE(masks[0].a_centres_stick);
+  // Another panel's name button: no A.
+  SetHand(m, 0, Rules::CSS_HAND_BUTTON, -21.5f, CSS_BUTTON_NAME, 1);
+  EXPECT_EQ(GateMasks(m)[0].buttons, PAD_BUTTON_A);
+  EXPECT_FALSE(GateMasks(m)[0].a_centres_stick);
+  // The list open: A picks, the stick scrolls (still while A is down), L is kept from the game.
+  SetHand(m, 0, Rules::CSS_HAND_BUTTON, -21.5f, 0, 0);
+  m.Put32(AREA + 0x200, 1);
+  masks = GateMasks(m);
+  EXPECT_EQ(masks[0].buttons, PAD_TRIGGER_L);
+  EXPECT_TRUE(masks[0].a_centres_stick);
+  EXPECT_FALSE(masks[0].main_stick);
+  // Another port's list says nothing about port 1's.
+  EXPECT_EQ(GateMasks(m)[1].buttons, 0);
+  // Closed again, the player-type button beside it never takes A.
+  m.Put32(AREA + 0x200, 0);
+  SetHand(m, 0, Rules::CSS_HAND_BUTTON, -21.5f, Rules::CSS_BUTTON_PLAYER_TYPE, 0);
+  EXPECT_EQ(GateMasks(m)[0].buttons, PAD_BUTTON_A);
+  // Local play keeps the game's own A everywhere.
+  FakeMemory local = Game("scSelctCharacter");
+  SetHand(local, 0, Rules::CSS_HAND_BUTTON, -21.5f, 0, 0);
+  local.Put32(AREA + 0x200, 1);
+  EXPECT_TRUE(GateMasks(local)[0].Empty());
+}
+
 TEST(OrcaOnlineSeats, APanelACpuLeftIsJoinedWithTheGamesOwnA)
 {
   using Rules::CssHand;

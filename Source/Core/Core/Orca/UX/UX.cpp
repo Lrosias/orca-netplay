@@ -142,9 +142,9 @@ void Init()
     // Local display only. The overlay matches the session's game.
     Kit::SetLook(Rules::ProfileRuleset() == Rules::Ruleset::PPlus ? Kit::Look::ProjectPlus :
                                                                     Kit::Look::Brawl);
-    // Read only. Captures this player's own controls while playing alone, so the session can carry
-    // them into a game it joins or hosts.
-    if (alone)
+    // Read only, first runs only (it keeps and prints changes). Captures this player's own controls
+    // while playing alone, so the session can carry them into a game it joins or hosts.
+    if (alone && !resimulating)
       ReadOwnControlsFrame(guard, ports);
     // Test only, ORCA_UX_TEST_LATE_NAME=<frame>. Simulates a friend's name arriving late: first
     // runs before that frame see it empty and re-runs see it, to show the desync the session's
@@ -203,7 +203,9 @@ void Init()
   });
   // While the game waits for a friend, re-present the last frame with "Waiting for <name>...".
   Orca::Events::SetStallCallback([](int stalled_ms) { RepresentDuringStall(stalled_ms); });
-  Orca::Events::SetBoundaryCallback([](bool shown) { FrameBoundary(shown); });
+  Orca::Events::SetBoundaryCallback([](bool shown, double game_held_ms, int game_held_frames) {
+    FrameBoundary(shown, game_held_ms, game_held_frames);
+  });
   // For joined/left toasts only. Never a source for memory writes; those use the frame callback.
   Orca::Events::SetPlugInCallback([](int frame, const std::vector<Orca::Events::PortInfo>& ports) {
     const double now = std::chrono::duration<double, std::milli>(

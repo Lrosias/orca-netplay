@@ -595,6 +595,55 @@ TEST(OrcaOnlineRules, AOnBackBacksOutOfTheQueuesOwnCharacterSelectOnly)
   EXPECT_FALSE(CssHandOnBack(CSS_HAND_BUTTON, CSS_BUTTON_BACK));
 }
 
+TEST(OrcaOnlineRules, TheQueuesOwnSelectLetsThePlayerPickTheirTagWhileNotSearching)
+{
+  constexpr u16 A = PAD_BUTTON_A;
+  FakeMemory m = Game("scSelctCharacter");
+  m.Write16(Queue::RAW, 0);
+  m.Write16(Queue::RAW + 2, 0);
+  // Port 1's hand on its own name button (panel 0).
+  SetHand(m, 0, CSS_HAND_BUTTON, -21.5f, CSS_BUTTON_NAME, -19.0f);
+  m.Write32(CSS_HAND + 0xB0, 0);
+  for (const Mode mode : {Mode::Casual, Mode::Ranked})
+  {
+    WriteHeader(m, mode, Ruleset::Brawl, 0, 0, MB::FLAG_SOLO | MB::FLAG_QUEUE2);
+    Rollback::InputGate::Masks masks = GateMasks(m);
+    EXPECT_FALSE(masks[0].buttons & A);
+    EXPECT_TRUE(masks[0].a_centres_stick);
+    // The list open: its picks take A, L stays from the game.
+    SetHand(m, 0, CSS_HAND_BUTTON, -21.5f, 0, -19.0f);
+    m.Write32(CSS_AREA + 0x200, 2);
+    masks = GateMasks(m);
+    EXPECT_FALSE(masks[0].buttons & A);
+    EXPECT_TRUE(masks[0].buttons & PAD_TRIGGER_L);
+    EXPECT_TRUE(masks[0].a_centres_stick);
+    EXPECT_TRUE(ReadCssNameList(m, 0));
+    EXPECT_FALSE(ReadCssNameList(m, 1));
+    m.Write32(CSS_AREA + 0x200, 0);
+    SetHand(m, 0, CSS_HAND_BUTTON, -21.5f, CSS_BUTTON_NAME, -19.0f);
+  }
+  // While searching: no A there (a room's select couldn't close a list).
+  Queue::State ready;
+  ready.ready = 1;
+  Queue::WriteState(m, ready);
+  EXPECT_TRUE(GateMasks(m)[0].buttons & A);
+  Queue::WriteState(m, Queue::State{});
+  EXPECT_FALSE(GateMasks(m)[0].buttons & A);
+  // The player-type button beside it never takes A.
+  SetHand(m, 0, CSS_HAND_BUTTON, -21.5f, CSS_BUTTON_PLAYER_TYPE, -24.0f);
+  EXPECT_TRUE(GateMasks(m)[0].buttons & A);
+  // A queue room's select: A stays in the grid, own name button and list or not.
+  SetHand(m, 0, CSS_HAND_BUTTON, -21.5f, CSS_BUTTON_NAME, -19.0f);
+  for (const Mode mode : {Mode::Casual, Mode::Ranked})
+  {
+    WriteHeader(m, mode, Ruleset::Brawl, 0, 0, MB::FLAG_QUEUE2);
+    EXPECT_TRUE(GateMasks(m)[0].buttons & A);
+    m.Write32(CSS_AREA + 0x200, 1);
+    EXPECT_TRUE(GateMasks(m)[0].buttons & A);
+    m.Write32(CSS_AREA + 0x200, 0);
+  }
+}
+
 TEST(OrcaOnlineRules, BReachesTheCharacterSelectOnlyToTakeTheTokenUp)
 {
   constexpr u16 B = PAD_BUTTON_B;

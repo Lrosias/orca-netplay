@@ -797,6 +797,12 @@ void Session::OnLocalHitch()
   m_last_hitch_frame = m_frame;
 }
 
+void Session::OnLoadHitch()
+{
+  ++m_stats.load_hitches;
+  m_last_hitch_frame = m_frame;
+}
+
 void Session::SetFixedDelay(std::optional<int> frames)
 {
   if (frames)

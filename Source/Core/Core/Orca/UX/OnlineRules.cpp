@@ -755,13 +755,26 @@ Rollback::InputGate::Masks GateMasks(const GuestMemory& m)
       if (!h.Solo() && !CssBMayUnpick(m, port))
         masks[port].buttons |= PAD_BUTTON_B;
       // A only in the grid. On the queue's own character select, port 1 may also press BACK
-      // (CssBackTakesA), with the stick centred while A is down.
+      // (CssBackTakesA) and, while not searching, its own name button and list (CssNameTakesA),
+      // each with the stick centred while A is down.
       const CssHand hand = ReadCssHand(m, port);
-      if (h.Solo() && port == 0 && m.Valid(Queue::RAW + 1) &&
+      const bool own_select = h.Solo() && port == 0;
+      const bool list = own_select && ReadCssNameList(m, port);
+      if (own_select && m.Valid(Queue::RAW + 1) &&
           CssBackTakesA(hand, RawHeld(m, port, PAD_BUTTON_A)))
+      {
         masks[port].a_centres_stick = true;
+      }
+      else if (own_select && !(Queue::ReadState(m).ready & 1) && CssNameTakesA(hand, port, list))
+      {
+        masks[port].a_centres_stick = true;
+        if (list)
+          masks[port].buttons |= PAD_TRIGGER_L;
+      }
       else if (!CssHandMayPressA(hand, a_bottom))
+      {
         masks[port].buttons |= PAD_BUTTON_A;
+      }
     }
     return masks;
   }
@@ -851,6 +864,12 @@ bool CssHandMayPressA(const CssHand& hand, float bottom)
   default:
     return false;
   }
+}
+
+bool ReadCssNameList(const GuestMemory& m, int port)
+{
+  const u32 area = ReadCssArea(m, port);
+  return area && Pointer(m, area + CSS_AREA_NAME_LIST) && m.Read32(area + CSS_AREA_NAME_LIST) != 0;
 }
 
 CssToken ReadCssToken(const GuestMemory& m, int port)

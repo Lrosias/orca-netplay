@@ -246,6 +246,9 @@ void EndPause();
 // True between a successful BeginPause and EndPause: the core is paused by the player, not by boot
 // stepping, an HLE reload or a panic.
 bool Pausing();
+// During the player's pause, on the CPU thread (Core::RunOnCPUThread): what a boundary does for
+// this game's room, so a room lost while paused is reported and opened again.
+void WatchRoomWhilePaused();
 // Host time spent paused since the last call. The stats line leaves it out, so its fps counts
 // running time only.
 std::chrono::nanoseconds TakePausedTime();

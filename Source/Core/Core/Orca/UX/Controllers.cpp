@@ -247,8 +247,10 @@ enum StandardButton
   DPAD_RIGHT = 15,
 };
 
-// A trigger clicks (the GC's digital L/R) at the end of its travel, as the real one does.
-constexpr float TRIGGER_CLICK = 0.9f;
+// A trigger's digital L/R (shield, air dodge) from half its travel, as in Dolphin. A GameCube
+// trigger clicks only at the end, but most pads' triggers are shorter, softer and never pulled all
+// the way.
+constexpr float TRIGGER_CLICK = 0.5f;
 }  // namespace
 
 std::optional<Snapshot> ParseSnapshotEvent(std::string_view json)

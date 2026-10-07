@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -53,6 +54,13 @@ constexpr u32 CUSTOM_PAGE = 2;
 // Hovered item values: 0 nothing, 1-0x34 a stage, then these.
 constexpr u32 PAGE_ITEM = 0x35;    // page button
 constexpr u32 RANDOM_ITEM = 0x36;  // Random
+// Project+'s My Music from the stage select (Source/Community/MusicSelect.asm): a step word, then
+// the song, stage, page, mode and hidden alts it carries there and back. Step 1 hides the stage
+// select's tiles and turns its pick into My Music; 4 backs it out; 7 picks a stage by itself.
+constexpr u32 MUSIC_SELECT = 0x80002810;
+// The words its own cleanup clears, as offsets from MUSIC_SELECT.
+constexpr std::array<u32, 10> MUSIC_SELECT_WORDS{0x00, 0x08, 0x0C, 0x10, 0x14,
+                                                 0x18, 0x20, 0x24, 0x28, 0x2C};
 
 // The 2024 Proposed preset, Project+ v3.2's pf/stage/switch/Switch03.rss.
 extern const u8 kSwitch03[RSS_EXDATA_SIZE];
@@ -61,6 +69,11 @@ extern const u8 kSwitch03[RSS_EXDATA_SIZE];
 int LegalIndexOfKind(int kind);
 // The ruleset's stage at each position of page 0 in memory, -1 for none.
 std::vector<int> PageZero(const GuestMemory& memory);
+
+// On the character select, clears a My Music step left from an earlier stage select: step 1 hides
+// the next stage select's tiles and turns its pick into My Music. Every Project+ session runs it.
+// Pure and idempotent; returns bytes changed.
+int ClearStaleMusicSelect(GuestMemory& memory);
 
 // Runs the flow for one frame. Pure and idempotent; returns how many bytes changed.
 int Apply(GuestMemory& memory, int frame, bool two_players);

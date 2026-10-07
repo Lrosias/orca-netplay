@@ -101,6 +101,7 @@ constexpr u32 CSS_HAND_TAKING = 6;     // token moving into the hand
 constexpr u32 CSS_HAND_GRID_HOLDING = 7;  // over the grid, token in hand (A places it)
 constexpr u32 CSS_HAND_PLACING = 8;       // token moving down
 constexpr u32 CSS_BUTTON_PLAYER_TYPE = 0x1D;
+constexpr u32 CSS_BUTTON_NAME = 0x1C;
 constexpr u32 CSS_BUTTON_BACK = 0x02;  // with CSS_HAND_EXIT (Rules is 0x04)
 // A passes only strictly between these y bounds. Brawl's bottom row reaches down to -4.07 and the
 // player's panel (a button) starts near -5.8, so -4.2 stays one frame's travel inside the grid
@@ -145,6 +146,23 @@ constexpr bool CssBackTakesA(const CssHand& hand, bool a_held)
 {
   return hand.valid && CssHandOnBack(hand.target, hand.button) && !a_held;
 }
+
+// ---- A on the player's own name button: their tag and its controls ----
+// A on a panel's name button opens its list of tags. While it is open, the player area's +0x200
+// is nonzero (1 shown, 2 and 3 scrolling) and the hand reads target 1 with button 0 where the name
+// button is (both games, probed under the harness). A pick sets the area's tag (+0x1C8).
+// The name button sits beside the player-type button, so A reaches it only from the hand's own
+// panel with the stick centred while A is down: the hand can't slide onto the player-type button
+// with the press. L is kept from an open list: Project+'s hold-L on a new name leaves the select
+// for its controls scene. Pure.
+constexpr u32 CSS_AREA_NAME_LIST = 0x200;
+constexpr bool CssNameTakesA(const CssHand& hand, int port, bool list_open)
+{
+  return list_open || (hand.valid && hand.target == CSS_HAND_BUTTON &&
+                       hand.button == CSS_BUTTON_NAME && hand.panel == port);
+}
+// Whether port `port`'s (0-3) name list is open; false anywhere but the character select.
+bool ReadCssNameList(const GuestMemory& memory, int port);
 
 // ---- B on the character select: only to pick the token back up ----
 // B on a placed token undoes the pick, but B held with the token in hand backs out to the menus.

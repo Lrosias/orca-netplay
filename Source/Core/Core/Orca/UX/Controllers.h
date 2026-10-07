@@ -66,7 +66,7 @@ GCPadStatus NeutralPad();
 GCPadStatus MapAdapterPort(const AdapterPort& port);
 
 // Maps a standard gamepad: A = south, B = west, X = east, Y = north, Z = either bumper,
-// L/R = triggers (digital press past 90%).
+// L/R = triggers (digital press from half their travel).
 GCPadStatus MapStandardPad(const StandardPad& pad);
 
 enum class PadSource

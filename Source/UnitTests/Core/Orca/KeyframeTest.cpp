@@ -121,7 +121,7 @@ TEST(OrcaKeyframe, EncryptionRoundTripsAndRefusesTampering)
 
 // The HTTP store against Tools/orca/fake_keyframes.py (set ORCA_TEST_KEYFRAME_SERVER to its URL):
 // put, get with progress, delete, retries past 503s. A stale ticket is replaced once, a second
-// refusal is final, and a repeated PUT of the same id counts as done.
+// refusal is final (LastRefusal names it), and a repeated PUT of the same id counts as done.
 TEST(OrcaKeyframe, HttpStoreAgainstAFakeServer)
 {
   const char* server = std::getenv("ORCA_TEST_KEYFRAME_SERVER");
@@ -155,6 +155,7 @@ TEST(OrcaKeyframe, HttpStoreAgainstAFakeServer)
     std::string error;
     ASSERT_TRUE(store->Put(info, blob, &error)) << error;
     EXPECT_EQ(minted, 1);
+    EXPECT_EQ(LastRefusal(), "") << "503s and a stale ticket aren't refusals";
     auto good = store_for(room, "good", "good");
     ASSERT_TRUE(good->Put(info, blob, &error)) << "409 exists is done: " << error;
     int calls = 0;
@@ -179,6 +180,7 @@ TEST(OrcaKeyframe, HttpStoreAgainstAFakeServer)
     EXPECT_FALSE(again->Get(info, [](u64, u64) { return true; }, &error));
     EXPECT_NE(error.find("404"), std::string::npos) << error;
     EXPECT_NE(error.find("gone"), std::string::npos) << "the store's sentence: " << error;
+    EXPECT_EQ(LastRefusal(), "gone");
   }
   // A GET with a stale ticket gets a new one too, and the refusal's body never counts as progress.
   {
@@ -209,6 +211,27 @@ TEST(OrcaKeyframe, HttpStoreAgainstAFakeServer)
     std::string error;
     EXPECT_FALSE(store->Put({3, "kf-3-" + hash.substr(0, 8), blob.size(), hash, ""}, blob, &error));
     EXPECT_EQ(error, "cancelled");
+    EXPECT_EQ(LastRefusal(), "");
+  }
+  // A ticket minted while signed out: one new ticket (the player may have signed in since), then
+  // the refusal is final.
+  {
+    const std::vector<u8> blob(2000, 4);
+    const std::string hash = KeyframeHash(blob);
+    const KeyframeInfo info{9, "kf-9-" + hash.substr(0, 8), blob.size(), hash, ""};
+    std::string error;
+    minted = 0;
+    ASSERT_TRUE(store_for("room3", "guest", "good")->Put(info, blob, &error)) << error;
+    EXPECT_EQ(minted, 1);
+    minted = 0;
+    EXPECT_FALSE(store_for("room4", "guest", "guest")->Put(info, blob, &error));
+    EXPECT_EQ(minted, 1);
+    EXPECT_NE(error.find("403"), std::string::npos) << error;
+    EXPECT_EQ(LastRefusal(), "signed_out");
+    // A 4xx without YouGame's code (an edge page) fails this try but isn't a refusal.
+    EXPECT_FALSE(store_for("room4", "edge", "edge")->Put(info, blob, &error));
+    EXPECT_NE(error.find("403"), std::string::npos) << error;
+    EXPECT_EQ(LastRefusal(), "");
   }
   // A ticket the store refuses even when new: final.
   auto refused = store_for("room1", "bad", "bad");
@@ -217,6 +240,7 @@ TEST(OrcaKeyframe, HttpStoreAgainstAFakeServer)
   const std::string hash = KeyframeHash(blob);
   EXPECT_FALSE(refused->Put({1, "kf-1-" + hash.substr(0, 8), blob.size(), hash, ""}, blob, &error));
   EXPECT_NE(error.find("401"), std::string::npos) << error;
+  EXPECT_EQ(LastRefusal(), "ticket");
 }
 
 // NAND files the joiner's own boot writes travel as hashes: the joiner fills them in from its NAND

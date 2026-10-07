@@ -187,7 +187,7 @@ double OverlayModel::RunningMs(double now_ms) const
   return (m_paused ? m_paused_at : now_ms) - m_paused_ms;
 }
 
-void OverlayModel::OnFrame(double now_ms, bool shown)
+void OverlayModel::OnFrame(double now_ms, bool shown, double game_held_ms, int game_held_frames)
 {
   std::lock_guard lk(m_lock);
   if (!shown)
@@ -210,7 +210,14 @@ void OverlayModel::OnFrame(double now_ms, bool shown)
   }
   else
   {
-    m_frames.emplace_back(now, now - m_last_frame);
+    // A frame the game itself held (a load) reads as the video frames it held, spread over it, and
+    // only time past the hold is this machine's.
+    constexpr double frame_ms = 1000 / 59.94;
+    const double ms = now - m_last_frame;
+    const int held = std::max(0, game_held_frames);
+    for (int k = 1; k <= held; ++k)
+      m_frames.emplace_back(m_last_frame + ms * k / (held + 1), std::min(ms, frame_ms));
+    m_frames.emplace_back(now, std::max(ms - game_held_ms, std::min(ms, frame_ms)));
   }
   m_last_frame = now;
   while (!m_frames.empty() && m_frames.front().first <= now - PERF_WINDOW_MS - PERF_HOLD_MS)
@@ -1298,9 +1305,9 @@ void SetPerf(Perf perf)
   s_perf = perf;
 }
 
-void FrameBoundary(bool shown)
+void FrameBoundary(bool shown, double game_held_ms, int game_held_frames)
 {
-  s_overlay.OnFrame(NowMs(), shown);
+  s_overlay.OnFrame(NowMs(), shown, game_held_ms, game_held_frames);
 }
 
 void ShowToast(std::string text)

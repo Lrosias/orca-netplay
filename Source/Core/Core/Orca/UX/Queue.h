@@ -6,6 +6,7 @@
 #include <array>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "Common/CommonTypes.h"
@@ -116,6 +117,7 @@ struct CssPort
   int character = NO_CHARACTER;  // under the hand while holding the token, else the token's
   bool placed = false;           // the token is down on a character
   int costume = 0;
+  bool name_list = false;  // its name list is open (Rules::ReadCssNameList)
   // The hand (OnlineRules.h CssHand).
   u32 hand_target = 0;
   u32 hand_button = 0;
@@ -181,6 +183,9 @@ bool MaySkip(const View& view, const State& state);
 
 // The state after this frame. Pure and idempotent: feeding the result back in changes nothing.
 State Advance(const View& view, const State& state, int frame);
+
+// Why the own select's ready (port 1) dropped from `before` to `after`, for the log.
+std::string_view UnreadyReason(const View& view, const State& before, const State& after);
 
 // The gate's masks and presses for the frame about to run. Pure.
 Rollback::InputGate::Masks Gate(const View& view, const State& state);

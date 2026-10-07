@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -23,10 +24,10 @@ class CPUThreadGuard;
 //   - Save tags: g_GameGlobal (0x805A00E0) +0x28 -> records (0x90172D40), tag i at
 //     +0xE0 + i * 0x124. Name first, up to 5 UTF-16BE characters and a 0. Empty name = unused.
 //   - Tag controls: +0x0C rumble (1 on), +0x14 layout, 0x2D bytes, defaults at 0x80406938.
-//     GameCube 12 bytes (L, R, Z, D-pad up, side, down, A, B, C-stick, Y, X, then tap jump in bit
-//     0x80), Wii Remote 8, with Nunchuk 12 (last: tap jump 0x40, shake smash 0x80), Classic 13
-//     (last: tap jump 0x80). Other bytes are actions (0 attack, 1 special, 2 jump, 3 shield,
-//     4 grab, 5 smash, 9 taunt, 0xA-0xC taunts, 0xE none).
+//     GameCube 12 bytes (L, R, Z, D-pad up, side, down, A, B, C-stick, Y, X, then flags: tap jump
+//     0x80, set up 0x70), Wii Remote 8, with Nunchuk 12 (last: shake smash 0x80, tap jump 0x40,
+//     not set up 0x03), Classic 13 (last: tap jump 0x80). Other bytes are actions (0 attack,
+//     1 special, 2 jump, 3 shield, 4 grab, 5 smash, 9 taunt, 0xA-0xC taunts, 0xE none).
 //   - On scMelee's first frame the game copies each port's tag layout into the per-port table
 //     (0x805B7480, pointed to by 0x805A00C8), which the match reads. So whatever a port's tag holds
 //     when the match starts is what that port plays with.
@@ -94,9 +95,15 @@ constexpr u32 CONTROLS_LAYOUT_SIZE = 0x2D;
 constexpr u32 CONTROLS_PROFILE_SIZE = 1 + CONTROLS_LAYOUT_SIZE;
 
 // One frame's writes for these ports. Returns how many ports got a tag. Profile bytes are clamped
-// to values the game's own menus could set (rumble 0 or 1, tap-jump and shake-smash bits only,
-// actions up to 0xE), else the game's default, since profiles come from other machines.
+// to values the game's own menus could set (rumble 0 or 1, the flag bytes' own bits only, actions
+// up to 0xE), else the game's default, since profiles come from other machines.
 int ApplyNameTags(GuestMemory& memory, const std::vector<Events::PortInfo>& ports);
+
+// A profile as text (lowercase hex, 92 characters) and back. Parsing refuses any other size, and
+// any byte the game's menus couldn't set.
+std::string ControlsHex(const std::vector<u8>& profile);
+std::optional<std::vector<u8>> ParseControlsHex(std::string_view hex);
+bool ControlsValid(const std::vector<u8>& profile);
 
 // Runs from Events' frame callback on every frame (first runs and re-runs), before the session
 // saves a snapshot or keyframe, so those include what it wrote.
@@ -108,8 +115,35 @@ void WriteNameTags(const Core::CPUThreadGuard& guard, const std::vector<Events::
 std::vector<u8> ReadOwnControls(const GuestMemory& memory, int port, std::string_view own_name,
                                 std::u16string* last_worn);
 
+// Which reads of the player's own tag are the player's own changes. A read that only shows what
+// Orca put in the tag, or a save that isn't this player's (after a resync, or before the app's
+// controls reached the tag), is no change.
+class OwnControlsWatch
+{
+public:
+  // The read becomes the reference without counting as a change: after a resync, and after the app
+  // sets the controls (the worn tag still holds the old ones until the next character select).
+  void Rebase() { m_rebase = true; }
+  // This frame's read; returns the controls to publish when the player changed them. `own` is the
+  // current profile, `is_default` whether the read is the game's defaults with rumble on.
+  std::optional<std::vector<u8>> Next(const std::vector<u8>& read, const std::vector<u8>& own,
+                                      bool is_default);
+
+private:
+  std::vector<u8> m_last;
+  bool m_rebase = false;
+};
+
 // Frame hook: on first runs while playing alone, publishes this player's controls to the session
-// (Events::SetOwnControls). Brawl rev 2 and Project+ only.
+// (Events::SetOwnControls) when they change them in the game. Each change prints
+// "orca controls <hex>" for the app and is kept in the user folder. Brawl rev 2 and Project+ only.
 void ReadOwnControlsFrame(const Core::CPUThreadGuard& guard,
                           const std::vector<Events::PortInfo>& ports);
+
+// The controls this player starts with, at boot: ORCA_CONTROLS=<hex> from the app, else the ones
+// kept from an earlier run of this game (printed as "orca controls <hex>" for the page). Unset or
+// invalid leaves none (the game's defaults).
+void LoadOwnControls();
+// "controls <hex>" from the app: the player changed them on the page. Returns false if invalid.
+bool SetOwnControlsFromApp(std::string_view hex);
 }  // namespace Orca::UX

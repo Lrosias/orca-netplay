@@ -193,6 +193,20 @@ TEST(OrcaQueue, OnItsOwnCharacterSelectStartReadiesAndBUnreadies)
   EXPECT_EQ(s.timer_start, 0u);
 }
 
+TEST(OrcaQueue, NeverReadyWithTheNameListOpen)
+{
+  View listing = Solo();
+  listing.ports[0].name_list = true;
+  State s = Step(Press(listing, START), State{}, 100);
+  EXPECT_EQ(s.ready, 0);
+  // Closed, Start readies as before.
+  s = Step(Press(Solo(), START), s, 101);
+  EXPECT_EQ(s.ready, 1);
+  // A list open while ready (it can't be opened then) un-readies.
+  s = Step(listing, s, 102);
+  EXPECT_EQ(s.ready, 0);
+}
+
 TEST(OrcaQueue, TheBThatStopsTheSearchIsSwallowedUntilLetGo)
 {
   State s = Step(Press(Solo(), START), State{}, 400);
@@ -349,6 +363,29 @@ TEST(OrcaQueue, AOnBackWhileSearchingUnreadiesThenBacksOut)
   r = Step(Press(room, A), r, 806);
   EXPECT_FALSE(r.flags & FLAG_BACK_A);
   EXPECT_FALSE(Gate(room, r)[0].a_centres_stick);
+}
+
+// The log says why the own select's ready dropped.
+TEST(OrcaQueue, TheLogSaysWhyReadyDropped)
+{
+  const State ready = Step(Press(Solo(), START), State{}, 100);
+  ASSERT_EQ(ready.ready, 1);
+  const auto why = [&](const View& v) {
+    const State after = Advance(v, ready, 101);
+    EXPECT_EQ(after.ready & 1, 0);
+    return std::string(UnreadyReason(v, ready, after));
+  };
+  EXPECT_EQ(why(Press(Solo(), B)), "B");
+  View up = Solo();
+  up.ports[0].placed = false;
+  EXPECT_EQ(why(up), "the token was picked up");
+  View back = Solo();
+  back.ports[0].hand_target = Rules::CSS_HAND_EXIT;
+  back.ports[0].hand_button = Rules::CSS_BUTTON_BACK;
+  EXPECT_EQ(why(Press(back, A)), "A on Back cancelled the search");
+  // Still ready, or already not ready before this frame.
+  EXPECT_EQ(UnreadyReason(Solo(), ready, ready), "dropped on an earlier frame");
+  EXPECT_EQ(UnreadyReason(Solo(), State{}, State{}), "dropped on an earlier frame");
 }
 
 TEST(OrcaQueue, BothReadyGoOnAndPort1PressesStart)
