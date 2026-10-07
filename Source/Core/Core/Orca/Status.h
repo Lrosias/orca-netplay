@@ -53,8 +53,11 @@ void Report(std::string_view code, std::string_view sentence);
 //   chat     app may send "chat <name> <text>", shown as a toast (never logged)
 //   yougame  app may send "orb ..." and "notice ..." for the YouGame button over the game; a press
 //            on it prints "orca orb" (Windows)
+//   music    app may send "music on|off", the player's Music switch (Orca/Music.h)
 //   results  "orca result" lines, only for a profile with a verified result reader
 inline constexpr const char* CAPS = "join leave stats pause delay perf direct host chat yougame";
+// "music": offered where Orca can tell the game's music apart (Orca/Music.h Supported).
+inline constexpr const char* MUSIC_CAP = "music";
 inline constexpr const char* RESULTS_CAP = "results";
 // "locks": a queue room's game enforces the online rules (UX/OnlineRules.h). Offered only for a
 // profile with a ruleset; informational, so Orca doesn't wait for the app's answer.
@@ -67,11 +70,11 @@ inline constexpr const char* QUEUE2_CAP = "queue2";
 // later "caps" line when that changes. A host with friends in its game leaves them for a With
 // Anyone pick only with that pick's cap; without it the pick prints in place, unarmed ("orca menu
 // online <queue> kept"), and arms once the friends are gone (Rollback/OnlineMatch.h
-// DecideLobbyPick, DecideKeptPick). Offered with "locks". A ruleset profile then offers 15 caps;
-// the app accepts at most 16.
+// DecideLobbyPick, DecideKeptPick). Offered with "locks". A ruleset profile then offers 16 caps,
+// the most an app before the Music switch's release accepts (that release takes 24).
 inline constexpr const char* PICK_CAPS = "pick-casual pick-ranked";
-// This build's caps for the running profile: CAPS, plus "results", "locks", "queue2" and the pick
-// caps where supported.
+// This build's caps for the running profile: CAPS, plus "music", "results", "locks", "queue2" and
+// the pick caps where supported.
 std::string OfferedCaps();
 void PrintCaps();
 void SetAppCaps(std::string_view list);

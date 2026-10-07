@@ -34,6 +34,7 @@ and why. Paths are relative to `Source/Core/Core/` unless they start with `Sourc
 - [Direct links](#direct-links)
 - [Input delay](#input-delay)
 - [Input latency](#input-latency)
+- [Music switch](#music-switch)
 - [Match start](#match-start)
 - [Code the JIT doesn't see](#code-the-jit-doesnt-see)
 - [Game patches](#game-patches)
@@ -94,6 +95,7 @@ game) is seat 0, controller port 1; a friend's seat is its room slot.
 | `ORCA_DIRECT` | `0`: no direct links, the relay only. Default on. |
 | `ORCA_THREAD_QOS` | `0`: no raised thread priority; `1`: also for a scripted harness run. |
 | `ORCA_JITWARM` | `0`: no JIT warm-up ([Match start](#match-start)). |
+| `ORCA_MUSIC` | `off`: start with the music off ([Music switch](#music-switch)), for harness runs. |
 | `ORCA_SHADER_WAIT_S` | Set by the app: how long boot may wait for shaders (60-900 s). |
 | `ORCA_CONTROLS` | Set by the app: the player's own controls, 92 hex ([Each player's own controls](#each-players-own-controls)). |
 
@@ -144,6 +146,19 @@ meet in the same rooms. The TMD and ticket still differ in hashes, signatures an
 game never reads them: a Rev 1 and a Rev 2 run of the default inputs (Brawl and Project+) give the
 same hashlog. Other revisions and modified Rev 1 copies are refused, and so is a launcher's disc that
 doesn't read as Rev 2 at boot (`Orca::SessionDiscReady`, e.g. after a read error).
+
+`Orca --verify <disc> [-u <user>]` checks a disc image and exits, without booting, a window, a
+session or the app's bridge (`Orca/DiscVerify.h`). It runs Dolphin's integrity check (the Wii hash
+tree; no Redump lookup, no whole-disc hashes) and prints `orca verify progress <done> <total>` in
+bytes at most once a second and one `orca verify problem <low|medium|high> <text>` per problem, with
+Dolphin's severity. A Medium or High problem counts as damage unless it is only in Brawl's
+Masterpiece partitions, which Orca and Project+ never read (some WBFS tools wipe them); each one
+that counts is followed by `orca verify damage <text>`. Last comes `orca verify ok` (exit 0) or
+`orca verify damaged <n>`, n damage lines (exit 2). A file that isn't a disc image prints `orca
+verify unreadable <path>` (exit 1). The signature checks use a temporary NAND, never the player's.
+A GameCube disc has no hash tree, so only its structure is checked. A good scrubbed Brawl Rev 2
+`.wbfs` reports 9 Low problems: no update partition, no stored image size, and errors in unused
+blocks (8088 in DATA, 1 in each Masterpiece partition).
 
 Sessions start from an empty NAND (save hash 0); the game makes its save in-session on both
 machines. A session with no `Config/GCPadNew.ini` gets `Sys/Orca/Input/GCPadNew.ini`: port 1 on the
@@ -717,6 +732,51 @@ and timestamps from the sampling boundary to the present call and to CoreAnimati
 `presentedTime`. Presentation must be measured in a `-p macos` window (headless Metal presents
 nothing), with a warm shader cache.
 
+## Music switch
+
+`music on|off` on stdin (cap `music`), or `ORCA_MUSIC=off` for a harness run: the player's own
+Music switch. Off leaves the game's music out of what this machine plays and changes nothing the
+game sees, so two players with different switches stay in sync. It is not in the compatibility key.
+Offered for Brawl (any revision) and Project+; without the cap the line answers `unsupported music`.
+
+`Orca/Music.*`, `HW/DSPHLE/UCodes/AXWii.cpp`, `HW/DSP.cpp`:
+
+- **Music is the stream voices.** Brawl and Project+ play their music (BRSTM) on AX voices of type
+  stream (`AXPBWii::is_stream` 1): a looping stereo pair over a ring buffer in MEM2, one voice on
+  main left, one on main right, no AUX sends. Sound effects are normal voices (type 0), looping ones
+  too. Seen on every voice of the default Brawl and Project+ runs (menus, character and stage
+  select, a match).
+- **RAM gets the same mix.** AX HLE mixes every voice as before and writes the frame (96 samples,
+  3 ms) to RAM as before. With the switch off it also keeps what the stream voices added to the
+  main bus (a voice's share is additive, `MixAdd`), gives that the compressor's gain too, and mixes
+  the frame again without it: same volume ramp, same clamp.
+- **Only the speakers get the second mix.** The AI DMA reads the frame from RAM for the host mixer.
+  While RAM still holds the bytes the mixer wrote there (Brawl: `0x804E84C0` and `0x804E8640`,
+  read by the DMA as `0x004E84C0`), it plays the quiet copy instead; anything else (a rollback
+  load, a game write) plays RAM. The last 32 frames are kept.
+- **Not RAM.** The game's own volume or options would change memory every peer hashes, and a
+  session starts from an empty NAND where a joiner plays on the host's save.
+
+**Checked** (2026-10-06, Mac):
+
+- Hashlogs of the default inputs (Brawl to 10800, Project+ to 9000) with the music on, with it off,
+  and of 0.3.27: equal on every frame.
+- Sync tests (`YG_SYNCTEST=7`) with it off: 0 RAM mismatches (Brawl 73451 re-run frames, Project+
+  60851).
+- What Orca played (`Dolphin.DSP.DumpAudio`, the same run on and off, sample-aligned): where only
+  music plays (character select after the match) RMS 2000-4000 drops to 0.7, the floor of a silent
+  second; in the matches the effects stay (off/on RMS median 0.77 Brawl, 0.84 Project+); with no
+  music playing the two dumps are identical. 99.99% of AI blocks went out quiet.
+- Two Orcas, one with the music off (`queue-e2e.mjs --q2 --queue casual --music-off ada
+  --dump-audio`): Brawl passed with 102 checksums matched on each side, Project+ with 103, no
+  desync; the music-off side's dump was silent for 71 of 157 s (Brawl) against 25 for the other.
+- Again on the 0.3.29 candidate: hashlogs on = off (Brawl Rev 2 frames 0-10807, Project+ 0-9003),
+  Rev 1 off = Rev 2 on (0-10819); a sync test off, 0 RAM mismatches; two Orcas, Project+, one off:
+  104 checksums each. A voice probe of the Brawl run with it off: the results screen's music is the
+  stream pair too (the announcer and the crowd are normal voices), and no stream voice of the run
+  sends to an AUX bus. Cost: instructions retired by the whole run to frame 9000 (a snapshot every
+  frame from 5900) are the same on and off, within the 0.1% between runs.
+
 ## Match start
 
 The first seconds of a match (the countdown and just after) used to drop frames: two things compiled
@@ -1095,7 +1155,7 @@ before the players part.
 
 | stdout | |
 |---|---|
-| `orca caps ... host results locks queue2 pick-casual pick-ranked` | `results` where the result reader is verified; `locks`, `queue2` and the pick caps where the profile has a ruleset (Brawl rev 2 and Project+). The app answers a pick cap only for a queue it can search now. 15 caps at most: the app passes 16, and more needs a desktop release first (`OrcaOnlineMenuLobby.EveryCapFitsTheAppsCapsLine`). |
+| `orca caps ... host results locks queue2 pick-casual pick-ranked` | `results` where the result reader is verified; `locks`, `queue2` and the pick caps where the profile has a ruleset (Brawl rev 2 and Project+). The app answers a pick cap only for a queue it can search now. With `music` that is 16 caps, the most an app before the Music switch's release passes (that release takes 24); more needs it as the minimum app (`OrcaOnlineMenuLobby.EveryCapFitsTheAppsCapsLine`). |
 | `orca result <json>` | The room's verdict, when it arrives. At most 300 bytes. |
 | `orca state friend-left match-over` / `host-left match-over` | A ranked room closed after its set. |
 
@@ -1546,6 +1606,7 @@ only when the box moves inside the window.
 | `pause` / `resume` | Answers `state paused` / `state running`. In a session it pauses only while the player's game is alone, and ends by itself when drop-in needs the game; otherwise `unsupported pause`. |
 | `volume V` | 0 to 1, this run only. |
 | `perf off\|fps\|detailed` | The overlay's frame meter (frames shown in the last second and the longest; yellow under 59 fps or past 20 ms, red under 50 fps or past two frames). A frame the game itself holds in emulated time (Project+ loading between scenes) counts as the video frames it held, so the meter, `fps` and the `hi` hitch count in `orca stats` show only this machine falling behind; `hil` counts the frames a load alone made slow (`hi` + `hil` is the older builds' `hi`). |
+| `music on\|off` | The player's Music switch ([Music switch](#music-switch)), cap `music`. |
 | `save N` / `load N` / `reset` | Refused in a session. |
 | `prepare-join` | The host invited a friend: capture a keyframe at the next boundary. |
 | `join <code>` / `leave` | Into or out of a friend's game. |

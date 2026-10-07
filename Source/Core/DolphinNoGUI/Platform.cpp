@@ -20,6 +20,7 @@
 #include "Core/IOS/IOS.h"
 #include "Core/IOS/STM/STM.h"
 #include "Core/Orca/Branding.h"
+#include "Core/Orca/Music.h"
 #include "Core/Orca/Profile.h"
 #include "Core/Orca/Session/Online.h"
 #include "Core/Orca/Status.h"
@@ -349,6 +350,17 @@ void Platform::ProcessEmbedCommands()
         Config::SetCurrent(Config::MAIN_AUDIO_VOLUME, static_cast<int>(std::lround(volume * 100)));
         AudioCommon::UpdateSoundStream(system);
       }
+    }
+    else if (cmd == "music")
+    {
+      // "music on|off": the player's Music switch. Only what this machine plays changes
+      // (Orca/Music.h), so it never reaches the game, a friend or the checksums.
+      std::string value, more;
+      in >> value;
+      if ((value == "on" || value == "off") && !(in >> more) && Orca::Status::Cap("music"))
+        Orca::Music::SetOn(value == "on");
+      else
+        Embed::Out("unsupported music");
     }
     else if (cmd == "save" || cmd == "load")
     {

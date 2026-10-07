@@ -12,6 +12,7 @@
 
 #include <fmt/format.h>
 
+#include "Core/Orca/Music.h"
 #include "Core/Orca/Profile.h"
 #include "Core/Orca/UX/OnlineRules.h"
 #include "Core/Orca/UX/Results.h"
@@ -112,6 +113,8 @@ void Report(std::string_view code, std::string_view sentence)
 std::string OfferedCaps()
 {
   std::string caps = CAPS;
+  if (Music::Supported())
+    caps += fmt::format(" {}", MUSIC_CAP);
   if (UX::ResultsVerified())
     caps += fmt::format(" {}", RESULTS_CAP);
   if (UX::Rules::ProfileRuleset() != UX::Rules::Ruleset::None)

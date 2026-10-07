@@ -31,13 +31,14 @@
 #include "Common/StringUtil.h"
 #include "Core/Boot/Boot.h"
 #include "Core/BootManager.h"
+#include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
 #include "Core/DolphinAnalytics.h"
 #include "Core/HW/VideoInterface.h"
 #include "Core/Host.h"
 #include "Core/Orca/Branding.h"
-#include "Core/Config/MainSettings.h"
 #include "Core/Orca/Disc.h"
+#include "Core/Orca/DiscVerify.h"
 #include "Core/Orca/Launch.h"
 #include "Core/Orca/Profile.h"
 #include "Core/Orca/Status.h"
@@ -56,6 +57,8 @@
 static std::unique_ptr<Platform> s_platform;
 // True in embed mode (Embed.h): drawn inside the YouGame app's window, controlled over stdin.
 static bool s_embedded = false;
+// The disc of a --verify run (DiscVerify.h), which checks it and exits without booting.
+static std::string s_verify_disc;
 
 static void signal_handler(int)
 {
@@ -76,8 +79,8 @@ static void signal_handler(int)
 static bool MsgAlertHandler(const char* caption, const char* text, bool yes_no,
                             Common::MsgType style)
 {
-  // When embedded, log the alert instead of popping a message box over the app.
-  if (s_embedded)
+  // When embedded or verifying, log the alert instead of popping a message box.
+  if (s_embedded || !s_verify_disc.empty())
   {
     fmt::print(stderr, "{}\n", Orca::BrandText(text));
     return false;
@@ -358,6 +361,19 @@ static int Run(const int argc, char* argv[], const Embed::Options& embed)
     user_directory = std::string(home) + "/Library/Application Support/Orca";
 #endif
 
+  if (!s_verify_disc.empty())
+  {
+    UICommon::SetUserDirectory(user_directory);
+    // The verifier's IOS checks signatures in a NAND of its own, so the player's is never written.
+    const std::string nand = File::CreateTempDir();
+    if (!nand.empty())
+      File::SetUserPath(D_WIIROOT_IDX, nand);
+    const int code = Orca::DiscVerify::Run(s_verify_disc, stdout);
+    if (!nand.empty())
+      File::DeleteDirRecursively(nand);
+    return code;
+  }
+
   std::unique_ptr<BootParameters> boot;
   bool game_specified = false;
   // When orca-launch.ini boots a loader, the disc that loader boots from the drive.
@@ -595,7 +611,7 @@ static int Run(const int argc, char* argv[], const Embed::Options& embed)
 
 int main(const int raw_argc, char* raw_argv[])
 {
-  // Remove --embed, --parent and --rect before the regular parser sees the arguments.
+  // Remove --embed, --parent, --rect and --verify before the regular parser sees the arguments.
   std::vector<char*> arg_list(raw_argv, raw_argv + raw_argc);
   std::string embed_error;
   const std::optional<Embed::Options> embed = Embed::TakeArguments(&arg_list, &embed_error);
@@ -606,6 +622,15 @@ int main(const int raw_argc, char* raw_argv[])
     Embed::Out("exit 2");
     return 2;
   }
+  std::string verify_error;
+  const std::optional<std::string> verify =
+      Orca::DiscVerify::TakeArgument(&arg_list, &verify_error);
+  if (!verify || (!verify->empty() && embed->enabled))
+  {
+    fmt::print(stderr, "{}\n", verify ? "--verify can't be used with --embed" : verify_error);
+    return 1;
+  }
+  s_verify_disc = *verify;
   s_embedded = embed->enabled;
   if (s_embedded)
   {

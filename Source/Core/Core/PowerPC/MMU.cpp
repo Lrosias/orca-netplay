@@ -50,6 +50,7 @@
 #include "Core/HW/MMIO.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/ProcessorInterface.h"
+#include "Core/Orca/PanicDiag.h"
 #include "Core/Orca/Profile.h"
 #include "Core/PowerPC/GDBStub.h"
 #include "Core/PowerPC/JitInterface.h"
@@ -1228,6 +1229,8 @@ void MMU::GenerateDSIException(u32 effective_address, bool write)
   // DSI exceptions are only supported in MMU mode.
   if (!m_system.IsMMUMode())
   {
+    // Orca: the first one also dumps the state behind it to stderr (Orca/PanicDiag.h).
+    Orca::PanicDiag::DumpOnce(m_system, effective_address, write);
     if (write)
     {
       PanicAlertFmtT(
