@@ -18,10 +18,12 @@
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
 #include "Core/Host.h"
+#include "Core/Orca/JitWarm.h"
 #include "Core/PowerPC/JitCommon/JitBase.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PPCSymbolDB.h"
 #include "Core/PowerPC/PowerPC.h"
+#include "Core/Rollback/Diag.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -79,6 +81,8 @@ void JitBaseBlockCache::Clear()
 #if defined(_DEBUG) || defined(DEBUGFAST)
   Core::DisplayMessage("Clearing code cache.", 3000);
 #endif
+  if (Rollback::Diag::g_jit_code_log)
+    Rollback::Diag::JitCodeCleared("blocks");
   m_jit.js.fifoWriteAddresses.clear();
   m_jit.js.pairedQuantizeAddresses.clear();
   m_jit.js.noSpeculativeConstantsAddresses.clear();
@@ -160,6 +164,14 @@ void JitBaseBlockCache::FinalizeBlock(JitBlock& block, bool block_link,
   block.physical_addresses = code_block.m_physical_addresses;
 
   block.originalSize = code_block.m_num_instructions;
+  if (Rollback::Diag::g_jit_code_log)
+  {
+    std::vector<std::pair<u32, u32>> words;
+    words.reserve(block.originalSize);
+    for (u32 i = 0; i < block.originalSize; ++i)
+      words.emplace_back(code_buffer[i].address, code_buffer[i].inst.hex);
+    Rollback::Diag::JitCodeCompiled(block.effectiveAddress, words);
+  }
   if (m_jit.IsDebuggingEnabled())
   {
     // TODO C++23: Can do this all in one statement with `std::vector::assign_range`.
@@ -202,6 +214,9 @@ void JitBaseBlockCache::FinalizeBlock(JitBlock& block, bool block_link,
     Common::JitRegister::Register(block.normalEntry, block.near_end - block.normalEntry,
                                   "JIT_PPC_{:08x}", block.physicalAddress);
   }
+
+  // Orca: a match's first compiles are remembered, to compile them while the next one loads.
+  Orca::JitWarm::OnBlockFinalized(block);
 }
 
 JitBlock* JitBaseBlockCache::GetBlockFromStartAddress(u32 addr, CPUEmuFeatureFlags feature_flags)
@@ -305,6 +320,8 @@ void JitBaseBlockCache::InvalidateICache(u32 initial_address, u32 initial_length
 void JitBaseBlockCache::InvalidateICacheInternal(u32 physical_address, u32 address, u32 length,
                                                  bool forced)
 {
+  if (Rollback::Diag::g_jit_code_log)
+    Rollback::Diag::JitCodeInvalidated(address, length, forced);
   // Optimization for the case of invalidating a single cache line, which is used by the dcb*
   // instructions. If the valid_block bit for that cacheline is not set, we can safely skip
   // the remaining invalidation logic.

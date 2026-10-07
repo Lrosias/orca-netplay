@@ -6,10 +6,13 @@
 #include "Core/Config/MainSettings.h"
 #include "Core/ConfigManager.h"
 #include "Core/Core.h"
+#include "Core/Orca/UX/YgOrb.h"
 #include "Core/System.h"
 
 #include <windows.h>
+#include <windowsx.h>
 #include <climits>
+#include <cstdio>
 #include <dwmapi.h>
 
 #include "VideoCommon/Present.h"
@@ -28,17 +31,27 @@ public:
 
   WindowSystemInfo GetWindowSystemInfo() const override;
 
+protected:
+  void EmbedSetRect(const Embed::Rect& rect) override;
+  void EmbedSetVisible(bool visible) override;
+  void EmbedSetFocus(bool focus) override;
+
 private:
-  static constexpr TCHAR WINDOW_CLASS_NAME[] = _T("DolphinNoGUI");
+  static constexpr TCHAR WINDOW_CLASS_NAME[] = _T("Orca");
 
   static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
-  static bool RegisterRenderWindowClass();
+  static bool RegisterRenderWindowClass(bool embedded);
   bool CreateRenderWindow();
   void UpdateWindowPosition();
   void ProcessEvents();
+  void UpdateEmbedFocus();
 
   HWND m_hwnd{};
+  // Embed mode: the app's "show" / "hide". A rect while hidden must not show the window again.
+  bool m_embed_visible = true;
+  // The app's "focus" / "blur": whether the game gets input. On by default, as on macOS.
+  bool m_embed_focus = true;
 
   int m_window_x = Config::Get(Config::MAIN_RENDER_WINDOW_XPOS);
   int m_window_y = Config::Get(Config::MAIN_RENDER_WINDOW_YPOS);
@@ -52,7 +65,7 @@ PlatformWin32::~PlatformWin32()
     DestroyWindow(m_hwnd);
 }
 
-bool PlatformWin32::RegisterRenderWindowClass()
+bool PlatformWin32::RegisterRenderWindowClass(bool embedded)
 {
   WNDCLASSEX wc = {};
   wc.cbSize = sizeof(WNDCLASSEX);
@@ -61,16 +74,21 @@ bool PlatformWin32::RegisterRenderWindowClass()
   wc.cbClsExtra = 0;
   wc.cbWndExtra = 0;
   wc.hInstance = GetModuleHandle(nullptr);
-  wc.hIcon = LoadIcon(nullptr, IDI_ICON1);
+  wc.hIcon = LoadIcon(wc.hInstance, IDI_ICON1);
   wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-  wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+  // When embedded, show black until the first frame instead of a white box.
+  wc.hbrBackground = embedded ? static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)) :
+                                reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
   wc.lpszMenuName = nullptr;
   wc.lpszClassName = WINDOW_CLASS_NAME;
-  wc.hIconSm = LoadIcon(nullptr, IDI_ICON1);
+  wc.hIconSm = LoadIcon(wc.hInstance, IDI_ICON1);
 
   if (!RegisterClassEx(&wc))
   {
-    MessageBox(nullptr, _T("Window registration failed."), _T("Error"), MB_ICONERROR | MB_OK);
+    if (embedded)
+      fprintf(stderr, "Orca: window registration failed (%lu)\n", GetLastError());
+    else
+      MessageBox(nullptr, _T("Window registration failed."), _T("Error"), MB_ICONERROR | MB_OK);
     return false;
   }
 
@@ -79,7 +97,29 @@ bool PlatformWin32::RegisterRenderWindowClass()
 
 bool PlatformWin32::CreateRenderWindow()
 {
-  m_hwnd = CreateWindowEx(WS_EX_CLIENTEDGE, WINDOW_CLASS_NAME, _T("Dolphin"), WS_OVERLAPPEDWINDOW,
+  if (IsEmbedded())
+  {
+    // A child window of the app's window, placed at the player box in the parent's client pixels,
+    // so it moves and clips with the app.
+    const HWND parent = reinterpret_cast<HWND>(static_cast<uintptr_t>(m_embed.parent));
+    const Embed::Rect& r = m_embed.rect;
+    // No WM_PARENTNOTIFY: each one is a synchronous call into the app's UI thread.
+    m_hwnd = CreateWindowEx(WS_EX_NOPARENTNOTIFY, WINDOW_CLASS_NAME, _T("Orca"),
+                            WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN, r.x, r.y, r.w, r.h,
+                            parent, nullptr, GetModuleHandle(nullptr), this);
+    if (!m_hwnd)
+    {
+      fprintf(stderr, "Orca: CreateWindowEx under the app's window failed (%lu)\n", GetLastError());
+      return false;
+    }
+    m_embed_visible = !m_embed.too_small;  // Hidden until a big enough rect (Embed.h).
+    if (m_embed_visible)
+      ShowWindow(m_hwnd, SW_SHOWNA);
+    UpdateEmbedFocus();
+    return true;
+  }
+
+  m_hwnd = CreateWindowEx(WS_EX_CLIENTEDGE, WINDOW_CLASS_NAME, _T("Orca"), WS_OVERLAPPEDWINDOW,
                           m_window_x < 0 ? CW_USEDEFAULT : m_window_x,
                           m_window_y < 0 ? CW_USEDEFAULT : m_window_y, m_window_width,
                           m_window_height, nullptr, nullptr, GetModuleHandle(nullptr), this);
@@ -96,8 +136,15 @@ bool PlatformWin32::CreateRenderWindow()
 
 bool PlatformWin32::Init()
 {
-  if (!RegisterRenderWindowClass() || !CreateRenderWindow())
+  // The app (Electron) sends rects in physical pixels, so be per-monitor DPI aware too, or Windows
+  // would scale the child window and its swap chain.
+  if (IsEmbedded())
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+  if (!RegisterRenderWindowClass(IsEmbedded()) || !CreateRenderWindow())
     return false;
+  if (IsEmbedded())
+    return true;
 
   // TODO: Enter fullscreen if enabled.
   if (Config::Get(Config::MAIN_FULLSCREEN))
@@ -125,6 +172,8 @@ void PlatformWin32::MainLoop()
     Core::HostDispatchJobs(Core::System::GetInstance());
     ProcessEvents();
     UpdateWindowPosition();
+    if (IsEmbedded())
+      UpdateEmbedFocus();
 
     // TODO: Is this sleep appropriate?
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -142,7 +191,7 @@ WindowSystemInfo PlatformWin32::GetWindowSystemInfo() const
 
 void PlatformWin32::UpdateWindowPosition()
 {
-  if (m_window_fullscreen)
+  if (m_window_fullscreen || IsEmbedded())
     return;
 
   RECT rc = {};
@@ -153,6 +202,33 @@ void PlatformWin32::UpdateWindowPosition()
   m_window_y = rc.top;
   m_window_width = rc.right - rc.left;
   m_window_height = rc.bottom - rc.top;
+}
+
+void PlatformWin32::EmbedSetRect(const Embed::Rect& r)
+{
+  SetWindowPos(m_hwnd, HWND_TOP, r.x, r.y, r.w, r.h,
+               SWP_NOACTIVATE | (m_embed_visible ? SWP_SHOWWINDOW : SWP_NOREDRAW));
+}
+
+void PlatformWin32::EmbedSetVisible(bool visible)
+{
+  m_embed_visible = visible;
+  ShowWindow(m_hwnd, visible ? SW_SHOWNA : SW_HIDE);
+  UpdateEmbedFocus();
+}
+
+void PlatformWin32::EmbedSetFocus(bool focus)
+{
+  m_embed_focus = focus;
+  UpdateEmbedFocus();
+}
+
+// When embedded, the app keeps keyboard focus and this window never takes it. Input counts while
+// the app's window is in the foreground, the game is shown, and the app's last word was "focus".
+void PlatformWin32::UpdateEmbedFocus()
+{
+  const HWND root = GetAncestor(m_hwnd, GA_ROOT);
+  m_window_focus = m_embed_visible && m_embed_focus && root && GetForegroundWindow() == root;
 }
 
 void PlatformWin32::ProcessEvents()
@@ -198,12 +274,71 @@ LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wPa
   break;
 
   case WM_KEYDOWN:
-    if (wParam == VK_ESCAPE)
+    if (platform->IsEmbedded())
+    {
+      // Ignore auto-repeat, so a held F11 doesn't toggle full screen over and over.
+      if (lParam & (1 << 30))
+        break;
+      // Forward the keys the page cares about, since it can't see them here. Shift+Tab opens the
+      // YouGame overlay, the same as clicking the YouGame button.
+      if (wParam == VK_ESCAPE)
+        Embed::Out("key escape");
+      else if (wParam == VK_F11)
+        Embed::Out("key fullscreen");
+      else if (wParam == VK_TAB && (GetKeyState(VK_SHIFT) & 0x8000) &&
+               !(GetKeyState(VK_CONTROL) & 0x8000) && !(GetKeyState(VK_MENU) & 0x8000))
+        Embed::Out("orca orb");
+    }
+    else if (wParam == VK_ESCAPE)
+    {
       platform->RequestShutdown();
+    }
+    break;
+
+  // When embedded, Alt and F10 are game keys, so don't let them open the app's window menu.
+  // Alt+F4 still closes the app.
+  case WM_SYSKEYDOWN:
+  case WM_SYSKEYUP:
+  case WM_SYSCHAR:
+    if (platform && platform->IsEmbedded() && wParam != VK_F4)
+      return 0;
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+
+  // When embedded, the app's window was destroyed along with ours, so stop.
+  case WM_DESTROY:
+    if (platform && platform->IsEmbedded())
+      platform->Stop();
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+
+  // When embedded, clicks on the game land here, not in the app's page. Report them; the app
+  // decides whether to give the game focus. A left click on the YouGame button Orca draws
+  // (UX/YgOrb.h) is reported as "orca orb". No CS_DBLCLKS, so a double click arrives as two
+  // presses.
+  case WM_LBUTTONDOWN:
+  case WM_RBUTTONDOWN:
+  case WM_MBUTTONDOWN:
+    if (platform && platform->IsEmbedded())
+    {
+      const bool orb = msg == WM_LBUTTONDOWN &&
+                       Orca::UX::YgOrb::Current().Hit(static_cast<float>(GET_X_LPARAM(lParam)),
+                                                      static_cast<float>(GET_Y_LPARAM(lParam)));
+      Embed::Out(orb ? "orca orb" : "orca click");
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+
+  // When embedded, the keyboard stays with the app: hand any focus straight back to its window.
+  case WM_SETFOCUS:
+    if (platform && platform->IsEmbedded())
+    {
+      if (const HWND root = GetAncestor(hwnd, GA_ROOT); root && root != hwnd)
+        SetFocus(root);
+    }
     break;
 
   case WM_CLOSE:
-    platform->RequestShutdown();
+    // When embedded, only the app ends the game ("quit" or a closed stdin).
+    if (!platform->IsEmbedded())
+      platform->RequestShutdown();
     break;
 
   default:

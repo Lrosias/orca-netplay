@@ -307,10 +307,15 @@ public:
     x = ptr;
   }
 
+  // Rollback harness diagnostics: when set, DoMarker records (name, write position) in write mode.
+  static inline std::vector<std::pair<std::string, const u8*>>* s_marker_log = nullptr;
+
   void DoMarker(const std::string& prevName, u32 arbitraryNumber = 0x42)
   {
     u32 cookie = arbitraryNumber;
     Do(cookie);
+    if (s_marker_log && IsWriteMode())
+      s_marker_log->emplace_back(prevName, *m_ptr_current);
 
     if (IsReadMode() && cookie != arbitraryNumber)
     {
