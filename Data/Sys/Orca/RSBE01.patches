@@ -5,7 +5,7 @@
 # Sections: the boot straight to the main menu; the main menu's Play Online, the game's own ONLINE
 # page with no connection (ORCA.md "Online menu": with Orca's texture pack and its rewrite of the
 # menu's text, UX/MenuText.h, nothing on it says Nintendo); everything unlocked; items off by
-# default.
+# default; Options > Sound's balance held in the middle.
 #
 # Found with Orca's harness (ORCA_UX_PROBE watches, RAM dumps and Dolphin's disassembler); the
 # unlock words and the input-lag fix are from the community "Global Brawl Netplay Settings" Gecko
@@ -337,6 +337,20 @@ end
 8002AE38 80030480 8003007C    # lwz   r0, 0x480(r3) -> 0x7C(r3)
 8002AE3C 9005003C 9005003C    # stw   r0, 0x3C(r5) (guard only)
 
+# Project+'s "Move v-sync call for Brawl/PM" [hannesmann, Dan Salvato, Achilles], the same two words
+# (Source/Extras/Netplay.asm on Project+'s SD card). Brawl's frame function (0x80023AE4) waits for a
+# retrace before it draws: the beq at 0x80023B88 goes back to VIWaitForRetrace (0x801E892C) while no
+# XFB slot is free. Moved, it never waits there and waits once at the end instead, so each frame is
+# drawn and copied right after the game's logic, about 13 ms sooner (ORCA.md "Input latency"). Both
+# groups are in the main DOL, so they land together at the first boundary and stay.
+80023B84 2C000000 2C000000    # cmpwi r0, 0 (guard)
+80023B88 4182FF7C 60000000    # beq   0x80023B04 -> nop
+80023B8C 881F0074 881F0074    # lbz   r0, 0x74(r31) (guard)
+
+80024020 7C0803A6 7C0803A6    # mtlr  r0 (guard)
+80024024 38210020 38210020    # addi  r1, r1, 0x20 (guard)
+80024028 4E800020 481C4904    # blr -> b 0x801E892C (VIWaitForRetrace, a tail call)
+
 # --- Everything unlocked --------------------------------------------------------------------------
 
 # The prize-unlock check (0x8004F978) reads any bit outside its 102-prize table as set for bits
@@ -441,3 +455,35 @@ end
 9017BE54 00000000 4F524341    # menu data +4 (unused): 'ORCA', the group has landed
 9017BE58 FFFFFFFF FFFFFFFF    # item switch: every item on (guard only, left as is)
 9017BE5C FFFFFFFF FFFFFFFF    # (guard only)
+
+# --- Options > Sound: the balance stays in the middle ---------------------------------------------
+
+# Options > Sound has one slider, the balance between music and sound effects: gmGlobalRecord menu
+# data +0x18 (0x9017BE68), a byte from 0 to 100. GameGlobal::init (0x8004C7E0) sets 50, where both
+# play in full, before the first frame, and a session has no save to change it. The page
+# (sora_menu_main; its input handler at 0x8117B2CC, the value it edits at +0x66C) moves the value
+# one step a frame while a direction is held and hands each step straight to the sound manager
+# (0x80076F30 on [0x805A01D0]): toward 100, the end labelled MUSIC, the music fades out; toward 0,
+# the effects. Leaving the page stores the value in the record. All of that is game memory, so in a
+# room it was the host's: a joiner plays on a copy of the host's machine, and a host who had pushed
+# the slider to an end silenced the friend's music or effects (two Orcas, 2026-10-07). The player's
+# own Music switch (ORCA.md "Music switch") changes only what their machine plays.
+#
+# Instead both of the slider's limits are 50, so it never moves, in every session: an Orca that
+# plays alone is still the host a friend can drop into, and a balance set alone would reach the
+# friend with the keyframe. The value never changes, so the sound manager is never called and
+# leaving the page stores what was there. Menu code only, run while the page is open: nothing per
+# frame, nothing in a match. Left's limit is `cmplwi r0, 100; bge` (stop at or over it); right's
+# was `cmpwi r0, 0; beq`, now `ble`, so a value under the limit only ever comes up to it (never
+# below 0 into the u16's top). The words checked in RAM on the Sound page, Brawl and Project+,
+# 2026-10-07. The game's only other calls to 0x80076F30 are its init, its reset to the defaults and
+# a save's load (0x8004C7F0, 0x8004E294, 0x8004ECB8), and Project+'s codeset makes none.
+# To clamp instead of lock (10 to 90, so some balance stays but no end mutes anyone): 2800005A for
+# left's limit and 2C00000A for right's, in both files (the Project+ lines are these + 0x1480).
+8117B43C A003066C A003066C    # lhz    r0, 0x66C(r3) (the slider's value; guard)
+8117B440 28000064 28000032    # cmplwi r0, 100 -> 50: left stops at 50
+8117B444 408000B4 408000B4    # bge    0x8117B4F8 (to the right check; guard)
+
+8117B500 A003066C A003066C    # lhz    r0, 0x66C(r3) (guard)
+8117B504 2C000000 2C000032    # cmpwi  r0, 0 -> 50: right stops at 50
+8117B508 418200B0 408100B0    # beq -> ble 0x8117B5B8 (the handler's end)

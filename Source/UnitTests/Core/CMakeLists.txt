@@ -51,6 +51,7 @@ add_dolphin_test(OrcaSetEndTest Orca/SetEndTest.cpp)
 target_link_libraries(OrcaSetEndTest PRIVATE imgui)
 add_dolphin_test(OrcaNativeTextTest Orca/NativeTextTest.cpp)
 add_dolphin_test(OrcaLayoutTest Orca/LayoutTest.cpp)
+add_dolphin_test(OrcaPresentPacingTest Orca/PresentPacingTest.cpp)
 
 add_dolphin_test(SkylandersTest IOS/USB/SkylandersTest.cpp)
 

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <stdexcept>
 
 #include <chrono>
 #include <mutex>
@@ -33,15 +34,13 @@ namespace Orca::Net
 {
 namespace
 {
-// OKF2: NAND entries are files (0), folders (1) or references (2: a hash, no data).
-constexpr char MAGIC[4] = {'O', 'K', 'F', '2'};
-// Long-distance matching over a 128 MB window: RAM and the NAND's /tmp share data far apart.
-constexpr int WINDOW_LOG = 27;
+// ORP1 contains controller inputs and typed UI events; legacy machine images are rejected.
+constexpr char MAGIC[4] = {'O', 'R', 'P', '1'};
+constexpr int WINDOW_LOG = 26;
 constexpr int LEVEL = 3;
 // Sanity limit per section (MEM2 is 64 MB; a Wii NAND is at most 512 MB).
 constexpr u64 MAX_SECTION = 512ull << 20;
-constexpr u64 MAX_RAW = 1ull << 30;
-constexpr u32 MAX_NAND_ENTRIES = 65536;
+constexpr u64 MAX_RAW = 64ull << 20;
 // The site accepts at most 128 MB.
 constexpr u64 MAX_KEYFRAME_BYTES = 128ull << 20;
 
@@ -52,6 +51,10 @@ public:
   void U64(u64 v) { Bytes(&v, sizeof(v)); }
   void Bytes(const void* data, size_t size)
   {
+    if (size > MAX_RAW - out.size())
+      throw std::length_error("Replay too large");
+    if (size == 0)
+      return;
     const auto* p = static_cast<const u8*>(data);
     out.insert(out.end(), p, p + size);
   }
@@ -77,10 +80,10 @@ public:
   }
   bool U32(u32* v) { return Bytes(v, sizeof(*v)); }
   bool U64(u64* v) { return Bytes(v, sizeof(*v)); }
-  bool Blob(std::vector<u8>* out)
+  bool Blob(std::vector<u8>* out, u64 limit = MAX_SECTION)
   {
     u64 size;
-    if (!U64(&size) || size > MAX_SECTION || size > m_data.size() - m_pos)
+    if (!U64(&size) || size > limit || size > m_data.size() - m_pos)
       return false;
     out->assign(m_data.begin() + m_pos, m_data.begin() + m_pos + size);
     m_pos += size;
@@ -208,105 +211,204 @@ bool ReplaceNandTree(const std::string& root, const std::vector<NandEntry>& entr
   return true;
 }
 
-std::vector<u8> PackKeyframe(int frame, const Rollback::MachineImage& image,
-                             const std::vector<NandEntry>& nand)
+namespace
 {
-  Writer w;
-  w.Bytes(MAGIC, sizeof(MAGIC));
-  w.U32(static_cast<u32>(frame));
-  w.Blob(image.state);
-  w.Blob(image.mem1);
-  w.Blob(image.mem2);
-  w.Blob(image.l1_cache);
-  w.U32(static_cast<u32>(nand.size()));
-  for (const NandEntry& entry : nand)
-  {
-    w.U32(static_cast<u32>(entry.path.size()));
-    w.Bytes(entry.path.data(), entry.path.size());
-    if (entry.reference)
-    {
-      w.U32(2);
-      w.U64(entry.hash);
-      continue;
-    }
-    w.U32(entry.directory ? 1 : 0);
-    w.Blob(entry.data);
-  }
-
-  ZSTD_CCtx* cctx = ZSTD_createCCtx();
-  ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, LEVEL);
-  ZSTD_CCtx_setParameter(cctx, ZSTD_c_enableLongDistanceMatching, 1);
-  ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, WINDOW_LOG);
-  // Uses several threads when zstd was built with them; one otherwise.
-  ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, 4);
-  std::vector<u8> out(ZSTD_compressBound(w.out.size()));
-  const size_t size = ZSTD_compress2(cctx, out.data(), out.size(), w.out.data(), w.out.size());
-  ZSTD_freeCCtx(cctx);
-  if (ZSTD_isError(size))
-  {
-    ERROR_LOG_FMT(NETPLAY, "Orca keyframe: compression failed: {}", ZSTD_getErrorName(size));
-    return {};
-  }
-  out.resize(size);
-  return out;
+size_t ReplayMetadataBytes(const ReplayFrame& frame)
+{
+  size_t bytes = sizeof(std::vector<Events::PortInfo>) + 96;
+  for (const auto& port : *frame.ports)
+    bytes += sizeof(Events::PortInfo) + 96 + port.name.size() + port.controls.size() + port.queue.size();
+  return bytes;
 }
 
-bool UnpackKeyframe(const std::vector<u8>& blob, int* frame, Rollback::MachineImage* image,
-                    std::vector<NandEntry>* nand)
+bool ChargeMetadata(const ReplayFrame& frame, const ReplayFrame* previous, size_t* budget)
 {
-  const unsigned long long raw_size = ZSTD_getFrameContentSize(blob.data(), blob.size());
-  if (raw_size == ZSTD_CONTENTSIZE_ERROR || raw_size == ZSTD_CONTENTSIZE_UNKNOWN ||
-      raw_size > MAX_RAW)
-  {
+  if (previous && *previous->ports == *frame.ports)
+    return true;
+  const size_t bytes = ReplayMetadataBytes(frame);
+  if (bytes > *budget)
     return false;
-  }
-  std::vector<u8> raw(raw_size);
-  ZSTD_DCtx* dctx = ZSTD_createDCtx();
-  ZSTD_DCtx_setParameter(dctx, ZSTD_d_windowLogMax, WINDOW_LOG);
-  const size_t size = ZSTD_decompressDCtx(dctx, raw.data(), raw.size(), blob.data(), blob.size());
-  ZSTD_freeDCtx(dctx);
-  if (ZSTD_isError(size) || size != raw.size())
-    return false;
+  *budget -= bytes;
+  return true;
+}
 
-  Reader r(raw);
-  char magic[4];
-  u32 frame_value, count;
-  if (!r.Bytes(magic, sizeof(magic)) || std::memcmp(magic, MAGIC, sizeof(MAGIC)) != 0 ||
-      !r.U32(&frame_value) || frame_value > (1u << 30) || !r.Blob(&image->state) ||
-      !r.Blob(&image->mem1) || !r.Blob(&image->mem2) || !r.Blob(&image->l1_cache) ||
-      !r.U32(&count) || count > MAX_NAND_ENTRIES)
-  {
+bool WriteReplayFrame(Writer& w, const ReplayFrame& frame)
+{
+  if (!frame.ports || frame.ports->size() > MAX_SEATS)
     return false;
+  u32 seen = 0;
+  for (const auto& port : *frame.ports)
+  {
+    if (port.port < 0 || port.port >= MAX_SEATS || (seen & (1u << port.port)) ||
+        port.name.size() > 128 || port.controls.size() > MAX_CONTROLS || port.queue.size() > MAX_QUEUE)
+      return false;
+    seen |= 1u << port.port;
   }
-  nand->clear();
+  if (frame.header && (frame.header->mode > 2 || frame.header->ruleset > 2 ||
+                       frame.header->coin > 1 || (frame.header->flags & ~3u)))
+    return false;
+  w.Bytes(frame.pads.data(), sizeof(frame.pads));
+  w.U32(frame.ports ? static_cast<u32>(frame.ports->size()) : 0);
+  if (frame.ports)
+  {
+    for (const auto& port : *frame.ports)
+    {
+      w.U32(port.port);
+      w.U32(static_cast<u32>(port.name.size()));
+      w.Bytes(port.name.data(), port.name.size());
+      w.Blob(port.controls);
+      w.Blob(port.queue);
+    }
+  }
+  w.U32(frame.header.has_value());
+  if (frame.header)
+  {
+    w.U32(frame.header->mode);
+    w.U32(frame.header->ruleset);
+    w.U32(frame.header->coin);
+    w.U32(frame.header->flags);
+    w.U32(frame.header->room);
+  }
+  w.U32(frame.clear_ready);
+  return true;
+}
+
+bool ReadReplayFrame(Reader& r, ReplayFrame* frame)
+{
+  u32 count;
+  if (!r.Bytes(frame->pads.data(), sizeof(frame->pads)) || !r.U32(&count) || count > MAX_SEATS)
+    return false;
+  auto ports = std::make_shared<std::vector<Events::PortInfo>>();
+  ports->reserve(count);
+  u32 seen = 0;
   for (u32 i = 0; i < count; ++i)
   {
-    u32 path_size, kind;
-    NandEntry entry;
-    if (!r.U32(&path_size) || path_size > 1024)
+    Events::PortInfo port;
+    u32 seat, length;
+    if (!r.U32(&seat) || seat >= MAX_SEATS || (seen & (1u << seat)) || !r.U32(&length) || length > 128)
       return false;
-    entry.path.resize(path_size);
-    if (!r.Bytes(entry.path.data(), path_size) || !r.U32(&kind) || kind > 2 ||
-        !SafeRelative(entry.path))
-    {
+    seen |= 1u << seat;
+    port.port = static_cast<int>(seat);
+    port.remote = true;
+    port.name.resize(length);
+    if (!r.Bytes(port.name.data(), length) || !r.Blob(&port.controls, MAX_CONTROLS) ||
+        !r.Blob(&port.queue, MAX_QUEUE))
       return false;
-    }
-    if (kind == 2)
-    {
-      entry.reference = true;
-      if (!r.U64(&entry.hash))
-        return false;
-    }
-    else if (!r.Blob(&entry.data))
-    {
-      return false;
-    }
-    entry.directory = kind == 1;
-    nand->push_back(std::move(entry));
+    ports->push_back(std::move(port));
   }
-  *frame = static_cast<int>(frame_value);
-  return r.AtEnd();
+  frame->ports = std::move(ports);
+  u32 header, clear;
+  if (!r.U32(&header) || header > 1)
+    return false;
+  if (header)
+  {
+    u32 mode, ruleset, coin, flags, room;
+    if (!r.U32(&mode) || mode > 2 || !r.U32(&ruleset) || ruleset > 2 ||
+        !r.U32(&coin) || coin > 1 || !r.U32(&flags) || (flags & ~3u) || !r.U32(&room))
+      return false;
+    frame->header = ReplayHeader{static_cast<u8>(mode), static_cast<u8>(ruleset),
+                                static_cast<u8>(coin), static_cast<u8>(flags), room};
+  }
+  if (!r.U32(&clear) || clear > 1)
+    return false;
+  frame->clear_ready = clear != 0;
+  return true;
 }
+}  // namespace
+
+std::vector<u8> PackKeyframe(int frame, const ReplayArchive& replay)
+{
+  try
+  {
+    if (frame < 0 || static_cast<size_t>(frame) > MAX_REPLAY_FRAMES ||
+        replay.frames.size() < static_cast<size_t>(frame))
+      return {};
+    Writer w;
+    w.Bytes(MAGIC, sizeof(MAGIC));
+    w.U32(static_cast<u32>(frame));
+    w.U64(replay.origin_hash);
+    w.U64(replay.target_hash);
+    size_t budget = MAX_RAW - (static_cast<size_t>(frame) + 1) * sizeof(ReplayFrame);
+    const ReplayFrame* previous = nullptr;
+    for (int i = 0; i < frame; ++i)
+    {
+      if (!WriteReplayFrame(w, replay.frames[i]))
+        return {};
+      if (!ChargeMetadata(replay.frames[i], previous, &budget))
+        return {};
+      previous = &replay.frames[i];
+  }
+  if (!WriteReplayFrame(w, replay.boundary) || !ChargeMetadata(replay.boundary, previous, &budget))
+    return {};
+  if (w.out.size() > MAX_RAW)
+    return {};
+  std::vector<u8> out(ZSTD_compressBound(w.out.size()));
+  const size_t size = ZSTD_compress(out.data(), out.size(), w.out.data(), w.out.size(), LEVEL);
+  if (ZSTD_isError(size))
+    return {};
+  out.resize(size);
+  return out;
+  }
+  catch (const std::exception&)
+  {
+    return {};
+  }
+}
+
+bool UnpackKeyframe(const std::vector<u8>& blob, int* frame, ReplayArchive* replay)
+{
+  try
+  {
+    const auto raw_size = ZSTD_getFrameContentSize(blob.data(), blob.size());
+    if (raw_size == ZSTD_CONTENTSIZE_ERROR || raw_size == ZSTD_CONTENTSIZE_UNKNOWN ||
+        raw_size > MAX_RAW)
+      return false;
+    std::vector<u8> raw(raw_size);
+    ZSTD_DCtx* dctx = ZSTD_createDCtx();
+    if (!dctx)
+      return false;
+    ZSTD_DCtx_setParameter(dctx, ZSTD_d_windowLogMax, WINDOW_LOG);
+    const size_t size = ZSTD_decompressDCtx(dctx, raw.data(), raw.size(), blob.data(), blob.size());
+    ZSTD_freeDCtx(dctx);
+    if (ZSTD_isError(size) || size != raw.size())
+      return false;
+    Reader r(raw);
+    char magic[4];
+    u32 count;
+    ReplayArchive decoded;
+    if (!r.Bytes(magic, sizeof(magic)) || std::memcmp(magic, MAGIC, sizeof(MAGIC)) != 0 ||
+        !r.U32(&count) || count > MAX_REPLAY_FRAMES || !r.U64(&decoded.origin_hash) ||
+        !r.U64(&decoded.target_hash))
+      return false;
+    if (static_cast<u64>(count + 1) * 44 > raw.size() - 24)
+      return false;
+    decoded.frames.reserve(count);
+    size_t budget = MAX_RAW - (static_cast<size_t>(count) + 1) * sizeof(ReplayFrame);
+    for (u32 i = 0; i < count; ++i)
+    {
+      ReplayFrame next;
+      if (!ReadReplayFrame(r, &next))
+        return false;
+      if (!ChargeMetadata(next, decoded.frames.empty() ? nullptr : &decoded.frames.back(), &budget))
+        return false;
+      if (!decoded.frames.empty() && *decoded.frames.back().ports == *next.ports)
+        next.ports = decoded.frames.back().ports;
+      decoded.frames.push_back(std::move(next));
+    }
+    if (!ReadReplayFrame(r, &decoded.boundary) ||
+        !ChargeMetadata(decoded.boundary, decoded.frames.empty() ? nullptr : &decoded.frames.back(), &budget) ||
+        !r.AtEnd())
+      return false;
+    *frame = static_cast<int>(count);
+    *replay = std::move(decoded);
+    return true;
+  }
+  catch (const std::exception&)
+  {
+    return false;
+  }
+}
+
 
 namespace
 {
@@ -469,6 +571,11 @@ public:
   }
   bool Put(const KeyframeInfo& info, const std::vector<u8>& data, std::string* error) override
   {
+    if (!ValidReplayId(info.id) || data.size() > MAX_KEYFRAME_BYTES || data.size() != info.size)
+    {
+      *error = "invalid replay offer";
+      return false;
+    }
     const std::string path = Path(info.id);
     const std::string temp = path + ".part";
     File::IOFile file(temp, "wb");
@@ -484,6 +591,11 @@ public:
                                      const std::function<bool(u64, u64)>& progress,
                                      std::string* error) override
   {
+    if (!ValidReplayId(info.id) || info.size == 0 || info.size > MAX_KEYFRAME_BYTES)
+    {
+      *error = "invalid replay offer";
+      return std::nullopt;
+    }
     File::IOFile file(Path(info.id), "rb");
     if (!file || file.GetSize() != info.size)
     {
@@ -511,7 +623,7 @@ public:
   }
   void Delete(const std::string& id) override
   {
-    if (Orca::GetEnv("ORCA_TEST_KEEP_KEYFRAMES") != "1")
+    if (ValidReplayId(id) && Orca::GetEnv("ORCA_TEST_KEEP_KEYFRAMES") != "1")
       File::Delete(Path(id));
   }
 
@@ -537,6 +649,11 @@ public:
 
   bool Put(const KeyframeInfo& info, const std::vector<u8>& data, std::string* error) override
   {
+    if (!ValidReplayId(info.id) || data.size() > MAX_KEYFRAME_BYTES || data.size() != info.size)
+    {
+      *error = "invalid replay offer";
+      return false;
+    }
     return WithRetries(error, [&](const std::string& ticket, const std::string& base,
                                   Result* result) {
       *result = Request("PUT", base + "/" + info.id,
@@ -553,7 +670,7 @@ public:
                                      const std::function<bool(u64, u64)>& progress,
                                      std::string* error) override
   {
-    if (info.size == 0 || info.size > MAX_KEYFRAME_BYTES)
+    if (!ValidReplayId(info.id) || info.size == 0 || info.size > MAX_KEYFRAME_BYTES)
     {
       *error = fmt::format("a keyframe of {} bytes", info.size);
       return std::nullopt;
@@ -578,6 +695,8 @@ public:
 
   void Delete(const std::string& id) override
   {
+    if (!ValidReplayId(id))
+      return;
     // Best effort, off the caller's thread (the CPU thread calls this right after a load); the
     // site's cleanup catches anything missed. Copy the ticket now, since the room may be gone when
     // the thread runs.
@@ -708,17 +827,19 @@ private:
 
   static size_t OnWrite(char* data, size_t size, size_t count, void* user)
   {
-    auto* t = static_cast<Transfer*>(user);
-    const size_t n = size * count;
-    // A refusal's body is YouGame's {error, code}, not the keyframe.
-    long status = 0;
-    curl_easy_getinfo(t->curl, CURLINFO_RESPONSE_CODE, &status);
-    if (status < 200 || status >= 300 || !t->download)
+    try
     {
-      if (t->error_body->size() + n > 64 * 1024)
-        return 0;
-      t->error_body->insert(t->error_body->end(), data, data + n);
-      return n;
+      auto* t = static_cast<Transfer*>(user);
+      const size_t n = size * count;
+      // A refusal's body is YouGame's {error, code}, not the keyframe.
+      long status = 0;
+      curl_easy_getinfo(t->curl, CURLINFO_RESPONSE_CODE, &status);
+      if (status < 200 || status >= 300 || !t->download)
+      {
+        if (t->error_body->size() + n > 64 * 1024)
+          return 0;
+        t->error_body->insert(t->error_body->end(), data, data + n);
+        return n;
     }
     if (t->download->size() + n > t->limit)
       return 0;  // abort: larger than any keyframe
@@ -726,6 +847,11 @@ private:
     if (t->progress && !t->progress(t->download->size(), 0))
       return 0;
     return n;
+    }
+    catch (const std::exception&)
+    {
+      return 0;
+    }
   }
 
   Result Request(const char* method, const std::string& url,

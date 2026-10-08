@@ -200,6 +200,20 @@ bool TemplateReadable(const GuestMemory& m)
   return m.Valid(CONTROLS_TEMPLATE) && m.Valid(CONTROLS_TEMPLATE + CONTROLS_TEMPLATE_SIZE - 1);
 }
 
+// Whether the tag holds exactly what the game puts in a tag it makes: rumble on and the default
+// layout. The caller checked that the defaults are readable.
+bool HoldsDefaults(const GuestMemory& m, u32 tag)
+{
+  if (m.Read8(tag + TAG_RUMBLE) != 1)
+    return false;
+  for (u32 i = 0; i < CONTROLS_LAYOUT_SIZE; ++i)
+  {
+    if (m.Read8(tag + TAG_CONTROLS + i) != m.Read8(CONTROLS_TEMPLATE + i))
+      return false;
+  }
+  return true;
+}
+
 // The character select's task, when that scene is running.
 bool CharacterSelectTask(const GuestMemory& m, u32* task)
 {
@@ -313,8 +327,21 @@ int ApplyNameTags(GuestMemory& m, const std::vector<Events::PortInfo>& ports)
     if (name.empty())
       continue;
     const std::optional<u32> area = JoinedArea(m, task, p.port);
-    if (!area || m.Read32(*area + AREA_NAME_ID) != NO_TAG)
+    if (!area)
       continue;
+    if (const u32 worn = m.Read32(*area + AREA_NAME_ID); worn != NO_TAG)
+    {
+      // A tag the player picked keeps its controls, unless it holds exactly what a tag the game
+      // just made holds (a tag they made, or made again after a restart): then it gets the port's
+      // own controls, as the tag Orca gives does. Written once, it no longer holds the defaults.
+      if (carries && worn < static_cast<u32>(TAG_SLOTS) && TemplateReadable(m))
+      {
+        const u32 tag = tags + worn * TAG_SIZE;
+        if (!TagAt(m, tag).empty() && HoldsDefaults(m, tag))
+          WriteControls(m, tag, p.controls);
+      }
+      continue;
+    }
     std::u16string tag = name;
     int slot = FindTag(m, tags, tag);
     if (slot >= 0 && WornByAnotherPort(m, task, p.port, slot))
@@ -399,17 +426,11 @@ std::optional<std::vector<u8>> ParseControlsHex(std::string_view hex)
   return profile;
 }
 
-void WriteNameTags(const Core::CPUThreadGuard& guard, const std::vector<Events::PortInfo>& ports)
-{
-  if (ports.empty() || !BrawlRev2())
-    return;
-  GuardMemory memory(guard);
-  ApplyNameTags(memory, ports);
-}
-
 std::vector<u8> ReadOwnControls(const GuestMemory& m, int port, std::string_view own_name,
-                                std::u16string* last_worn)
+                                std::u16string* last_worn, std::u16string* read_tag)
 {
+  if (read_tag)
+    read_tag->clear();
   u32 tags = 0;
   if (!TagTable(m, &tags))
     return {};
@@ -433,6 +454,8 @@ std::vector<u8> ReadOwnControls(const GuestMemory& m, int port, std::string_view
   if (slot < 0)
     return {};
   const u32 tag = tags + static_cast<u32>(slot) * TAG_SIZE;
+  if (read_tag)
+    *read_tag = TagAt(m, tag);
   std::vector<u8> profile;
   profile.reserve(CONTROLS_PROFILE_SIZE);
   profile.push_back(m.Read8(tag + TAG_RUMBLE));
@@ -442,11 +465,14 @@ std::vector<u8> ReadOwnControls(const GuestMemory& m, int port, std::string_view
 }
 
 std::optional<std::vector<u8>> OwnControlsWatch::Next(const std::vector<u8>& read,
+                                                      std::u16string_view tag,
                                                       const std::vector<u8>& own, bool is_default)
 {
   // Nothing readable (the menus before any tag exists) never clears a profile.
   if (read.empty())
     return std::nullopt;
+  const bool switched = tag != m_tag;
+  m_tag = tag;
   if (std::exchange(m_rebase, false))
   {
     m_last = read;
@@ -457,6 +483,11 @@ std::optional<std::vector<u8>> OwnControlsWatch::Next(const std::vector<u8>& rea
   m_last = read;
   // Orca's own write showing up in the tag, or a player with no profile on the defaults.
   if (read == own || (own.empty() && is_default))
+    return std::nullopt;
+  // A switch to a tag at the game's defaults (one they made, or made again after a restart) is not
+  // their controls changing, so the defaults never replace their own. Editing the tag they wear
+  // back to the defaults still is a change.
+  if (switched && is_default)
     return std::nullopt;
   return read;
 }
@@ -561,34 +592,58 @@ bool SetOwnControlsFromApp(std::string_view hex)
   return true;
 }
 
-void ReadOwnControlsFrame(const Core::CPUThreadGuard& guard,
-                          const std::vector<Events::PortInfo>& ports)
+std::optional<std::vector<u8>> OwnControlsReader::Read(const GuestMemory& m,
+                                                       const std::vector<Events::PortInfo>& ports,
+                                                       const std::vector<u8>& own, u64 resyncs)
+{
+  // PortInfo.remote differs per machine, so it only picks what to read here, never what to write.
+  const auto mine =
+      std::find_if(ports.begin(), ports.end(), [](const Events::PortInfo& p) { return !p.remote; });
+  if (mine == ports.end())
+    return std::nullopt;
+  // After a resync (keyframe load or back to solo), a tag with the remembered name may belong to
+  // someone else's save, so forget it, and take what is worn now as no change.
+  if (resyncs != m_resyncs)
+  {
+    m_resyncs = resyncs;
+    m_last_worn.clear();
+    m_watch.Rebase();
+  }
+  if (std::exchange(m_rebase, false))
+    m_watch.Rebase();
+  std::u16string tag;
+  const std::vector<u8> read = ReadOwnControls(m, mine->port, mine->name, &m_last_worn, &tag);
+  return m_watch.Next(read.empty() ? read : Sanitized(read), tag, own, IsDefaultProfile(m, read));
+}
+
+std::optional<std::vector<u8>> NameTagsFrame(GuestMemory& m,
+                                             const std::vector<Events::PortInfo>& write_ports,
+                                             const std::vector<Events::PortInfo>& ports,
+                                             OwnControlsReader* reader, const std::vector<u8>& own,
+                                             u64 resyncs)
+{
+  ApplyNameTags(m, write_ports);
+  // After the writes: a tag that just got the player's controls reads as those, never as the
+  // game's defaults it held before this frame's writes.
+  if (!reader)
+    return std::nullopt;
+  return reader->Read(m, ports, own, resyncs);
+}
+
+void NameTagsFrameHook(const Core::CPUThreadGuard& guard,
+                       const std::vector<Events::PortInfo>& write_ports,
+                       const std::vector<Events::PortInfo>& ports, bool read_own)
 {
   if (!BrawlRev2())
     return;
-  // PortInfo.remote differs per machine, so it only picks what to read here, never what to write.
-  const auto own =
-      std::find_if(ports.begin(), ports.end(), [](const Events::PortInfo& p) { return !p.remote; });
-  if (own == ports.end())
-    return;
-  static std::u16string s_last_worn;
-  static OwnControlsWatch s_watch;
-  // After a resync (keyframe load or back to solo), a tag with the remembered name may belong to
-  // someone else's save, so forget it, and take what is worn now as no change.
-  static u64 s_resyncs = 0;
-  if (const u64 resyncs = Events::Resyncs(); resyncs != s_resyncs)
-  {
-    s_resyncs = resyncs;
-    s_last_worn.clear();
-    s_watch.Rebase();
-  }
-  if (s_rebase_own.exchange(false))
-    s_watch.Rebase();
+  static OwnControlsReader s_reader;
+  if (read_own && s_rebase_own.exchange(false))
+    s_reader.Rebase();
   GuardMemory memory(guard);
-  const std::vector<u8> read = ReadOwnControls(memory, own->port, own->name, &s_last_worn);
-  const std::vector<u8> current = Events::OwnControls();
   std::optional<std::vector<u8>> changed =
-      s_watch.Next(read.empty() ? read : Sanitized(read), current, IsDefaultProfile(memory, read));
+      read_own ? NameTagsFrame(memory, write_ports, ports, &s_reader, Events::OwnControls(),
+                               Events::Resyncs()) :
+                 NameTagsFrame(memory, write_ports, ports, nullptr, {}, 0);
   if (!changed)
     return;
   NOTICE_LOG_FMT(ROLLBACK, "Name tags: this player changed their controls in the game");

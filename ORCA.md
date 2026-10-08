@@ -371,55 +371,51 @@ change.
 ## Drop-in
 
 The host plays at once. An invited friend joins as if they had plugged a controller into the next
-port of the host's game, and both machines show it. The friend loads the host's latest state and
-syncs from there, so joining never takes longer the longer the host has played.
+port. Since the input-replay protocol, a join rebuilds the host's game from the local boot and its
+controller history. Longer histories take longer to rebuild. No peer supplies Dolphin device state,
+RAM images, NAND files, pointers, or arbitrary memory writes.
 
-`Rollback/OnlineMatch.cpp`, `Orca/Session/Session.*`, `Orca/Session/Keyframe.*`.
+`Rollback/OnlineMatch.cpp`, `Orca/Session/Session.*`, `Orca/Session/Replay.h`,
+`Orca/Session/Keyframe.*`.
 
 ### How it works
 
-1. **Solo.** The host's port 1 is its local pad with no input delay; the other ports report no
-   controller. It logs every frame's pads (32 bytes a frame) and joins its room in the background.
-   There is no rollback and no snapshot.
-2. **Keyframe.** On an invite (`prepare-join`) or when a friend arrives, whichever comes first:
-   - At the next frame boundary the host captures the machine (`SnapshotRing::Capture`, 8-10 ms)
-     and takes the session NAND as a copy-on-write clone (APFS; a plain read elsewhere).
-   - NAND files that the game's boot writes whatever the player does (`BootNandFrame` in the
-     profile; Brawl writes 38.7 MB of packs to `/tmp`) travel as XXH3 hashes only. The joiner runs
-     its own boot to that frame while it downloads, then fills those files in from its own NAND,
-     refusing the keyframe if one differs. This halved the upload. Saves always travel.
-   - A thread packs everything, compresses it (zstd level 3 with long-distance matching), encrypts
-     it with AES-256-GCM under a fresh key, and stores it. The game goes on meanwhile. The key
-     travels only in the room's `kf` message, so the store holds ciphertext.
-   - Never from the host's first 300 frames: Project+'s first frames after its launcher run
-     differently on a machine whose JIT holds other blocks. A keyframe under 30 s old is reused;
-     each serves one joiner, who deletes it after loading.
-3. **Join.** The host starts a rollback session at its next frame J and sends the friend the
-   keyframe's id, frame K, size and hash. The friend boots the same disc and profile, runs its boot
-   to `BootNandFrame` (`orca state joining <percent>`), downloads and checks the keyframe, replaces
-   its session NAND, loads the state (`SnapshotRing::LoadImage`), then runs the host's logged pads
-   for [K, J) and live inputs from J, unthrottled and unrendered, until it has caught up.
-4. **Plug in.** The host picks a frame S (its frame plus the rollback window, twice the maximum delay
-   and the round trip) and announces it in the roster every packet carries. Both machines plug port
-   2 in at exactly S. The host never waits on a joiner before S.
-5. **Leave.** The host picks an unplug frame L the same way; the friend stops once its inputs before
-   L are acknowledged. A friend whose connection drops is unplugged after its last input (rolling
-   back frames that guessed otherwise); one silent for 10 s is dropped. Both sides learn why
-   (`friend-left left|desync|stalled|network`, `bye desync`, `drop`). With nobody else plugged in,
-   the host plays solo again with no input delay.
+1. **Local origin.** Each process captures its own machine and temporary NAND before frame zero's
+   hook. These trusted local snapshots support replay and returning to the player's own game.
+2. **Recording.** The host retains the final controller pads and bounded port metadata for each
+   frame. Rollbacks replace predicted inputs with the winning inputs. Typed rules-header and
+   clear-ready events run through the same trusted UI handlers at their original phase.
+3. **Offer.** A background thread compresses and encrypts a replay through boundary K. The
+   canonical id is `replay-<frame>-<first eight hash digits>`. AES-GCM and the transport checksum
+   detect corruption; the decoder independently validates every peer-supplied field.
+4. **Rebuild.** The friend restores only its own origin and re-executes frames [0, K), unthrottled
+   and unrendered. At K it applies the recorded boundary hook and checks its complete MEM1/MEM2
+   checksum against the host. A mismatch or cancellation returns to its own local game.
+   Historical result and timeout notifications are rebased without reporting old events.
+5. **Catch up and plug in.** The normal rollback session starts at K, catches up from live history,
+   and both machines plug in the friend's controller at the same agreed future frame. Heartbeats
+   keep the pending seat alive while the replay runs.
+6. **Leave.** The existing agreed unplug and solo-return behavior continues. A failed replay does
+   not leave the player's machine on partially reconstructed peer history.
 
-Seats 3 and 4 work the same way, but only two players have been tested. With a third player, the
-packet carrying a catching-up joiner's inputs also limits the inputs the others get, so live players
-would stall during a join; catch-up should come from history only.
+Replays permit at most 216,000 frames (one hour at 60 fps), 64 MiB decompressed data, and a separate
+64 MiB decoded-allocation budget. Port lists have at most four unique seats, names at most 128 bytes,
+controls at most 64 bytes, and queue labels at most 32 bytes. Rebuilding has a three-minute deadline.
+An over-limit history refuses new joins; existing players keep playing. The `orca2:` compatibility
+prefix isolates the replay protocol from old `orca1:` clients and legacy machine-image payloads.
 
-**Typical numbers** (Brawl): keyframes of 26-30 MB; compress 120-170 ms on a thread; over the
-internet a join took 5.7-7.2 s from the friend's first frame to plugged in (upload, download and
-about 1 s of catch-up), and about 1.5 s with a local store. Higher zstd levels don't pay: level 19
-saves 6 MB over level 3 but takes 10 s; what is left is already-compressed game data.
+A host takes one friend at a time: a friend who arrives while another is in the game, rebuilding
+or playing, is dropped with `room_full` (`HostEvents`). A rebuilding friend acknowledges nothing past
+its K, which holds what the host sends everyone (`Session::SendPacket`), so a friend already playing
+would stall for the whole rebuild and both would be dropped (`stalled`). A rebuild that ends because
+the room ended reports the room's own code, and one whose host left reports `peer_left`.
+
+Only two-player joins have been tested. A Brawl loopback join at frame 2,039 rebuilt the same RAM,
+joined live play in about nine seconds, and then matched 24 live checksums on the test machine.
 
 ### Port values: each player's name and controls
 
-A joiner plays on a copy of the host's machine, save included, so its own name tags are not there.
+A joiner reconstructs the host's input history, so its own name tags are not there.
 Each port carries its player's values instead (`Orca/UX/NameTags.h`): the YouGame username as the
 tag's name, the tag's rumble byte and its whole button layout. The frame hook writes them into the
 port's name tag on the character select, and the game copies the layout into its per-port table
@@ -436,8 +432,16 @@ They come from `ORCA_CONTROLS` at boot, else the file Orca kept for this game
 (`<user>/Config/OrcaControls-<game>.txt`), and from the app's `controls <hex>` mid-run. While the
 player is alone, a change they make to the tag they wear (the controls menu, Project+'s name list)
 becomes their own controls: Orca prints `orca controls <hex>` and keeps the file. Orca's own writes,
-a save that isn't theirs (after a resync) and re-runs never count. Controls loaded from the file
-(no `ORCA_CONTROLS`) are printed the same way once at boot, so the page shows what Orca plays.
+a save that isn't theirs (after a resync), a switch to a tag at the game's defaults and re-runs never
+count. Controls loaded from the file (no `ORCA_CONTROLS`) are printed the same way once at boot, so
+the page shows what Orca plays.
+
+- **Tags made in the game** last only until Orca closes: every run boots an empty session NAND, so a
+  player who wants their own tag makes it again. A port with controls that wears a tag holding
+  exactly what the game puts in a new one (rumble on, the default layout) gets its controls written
+  into it on the character select, in the same frame (`ApplyNameTags`), and the read of the
+  player's own controls comes after the writes (`NameTagsFrame`), so a tag made again plays with
+  their controls and never replaces them with the defaults. The tags themselves are not kept.
 
 - **Solo**, the own port's values carry them from the frame they change, so the YouGame tag gets them
   on every character select: Training, the queue's own select, With Friends. A friend who joins
@@ -517,17 +521,20 @@ machines, so no compatibility change. Tests: `OrcaOnlineMenuLobby.*` (the three 
 
 ### Keyframe store
 
-`HttpKeyframeStore` in `Orca/Session/Keyframe.cpp`. Tests use `ORCA_TEST_KEYFRAME_DIR`: the store
-refuses dev tickets.
+`HttpKeyframeStore` in `Orca/Session/Keyframe.cpp`. It holds the host's encrypted replays (the
+store and its route keep the keyframe name). Tests use `ORCA_TEST_KEYFRAME_DIR`: the store refuses
+dev tickets.
 
-- `https://yougame.co/api/orca/keyframes/<room>/<id>`, `id` = `kf-<frame>-<8 hex of XXH3-64>`.
+- `https://yougame.co/api/orca/keyframes/<room>/<id>`, `id` = `replay-<frame>-<8 hex of XXH3-64>`
+  (frame 0 to 216,000, no leading zeros; `ValidReplayId`). Orca sends and accepts no other id.
   Auth: `Authorization: Ticket <ticket>` with the room's ticket (accepted up to 6 h past expiry; on
   401 `ticket` or 403 `signed_out` Orca mints a fresh one once).
-- **PUT** with `Content-Length` (at most 128 MB), `X-Orca-Frame`, `X-Orca-Hash`. 409 `exists` counts
-  as done. 6 PUTs a minute per account.
+- **PUT** with `Content-Length`, `X-Orca-Frame`, `X-Orca-Hash`. A replay is at most 64 MiB
+  before compression, so at most `ZSTD_compressBound(64 MiB)` + 28 = 67,371,036 bytes; Orca's own
+  cap on a download is 128 MB. 409 `exists` counts as done. 6 PUTs a minute per account.
 - **GET** streams with `Content-Length` (for join progress); Orca checks size and hash, then
   decrypts. 404 `gone` means expired.
-- **DELETE** by the joiner after loading, best effort; by the host when replacing or leaving.
+- **DELETE** by the joiner after rebuilding, best effort; by the host when replacing or leaving.
 - Network errors, 429 and 5xx retry 4 times with 0.5/1/2 s backoff; anything else is final. A host
   whose keyframe is refused for good (a refusal with YouGame's code; a bare 4xx from the edge only
   fails that keyframe) makes no more for the friends waiting: it drops them with
@@ -669,35 +676,49 @@ input delay on top (2 frames of 16.68 ms).
 |---|---|---|---|
 | Immediate XFB | `Orca/Profile.cpp` | no | Presents each frame at its XFB copy instead of 18 ms later at the VI field that scans it out. |
 | VSync off | `Orca/Profile.cpp` | no | Forced: VSync only adds 2-19 ms in a composited window and could let the screen pace the game. |
-| Smooth Early Presentation | `Orca/Profile.cpp` | no | Evens presents out for about 2 ms: a 60 Hz screen repeats and drops a third as many frames. |
+| Steady presentation | `Source/Core/VideoCommon/PresentPacing.h` | no | Shows each frame at a steady offset from its VI time that covers the usual rollback re-run, so re-runs don't move the picture. |
 | No re-present on rollback loads | `Source/Core/VideoCommon/Present.cpp` | no | A rollback no longer flashes the snapshot's stale frame. |
 | Slow screens drop frames | `Source/Core/VideoBackends/Metal/MTLGfx.mm` | no | A screen under 59 Hz no longer slows the game to its rate. |
 | Thread priority | `Orca/ThreadPriority.cpp` | no | The CPU, room and controller threads run at interactive priority. |
 | Brawl's input lag fix | `Data/Sys/Orca/RSBE01.patches` | yes (Brawl) | Brawl copies this frame's pads, not last frame's. |
 | SI relatch | `HW/SI/SI.cpp`, `Rollback/Rollback.cpp` | yes | The game reads the pads the frame hook just set, not the previous hook's. |
+| V-sync move | `Data/Sys/Orca/RSBE01.patches`, `PPLUS32.patches` | yes | Both games draw and copy each frame right after its logic instead of after a retrace wait: 13 ms sooner. |
 
-The two that change emulation change the compatibility key, so builds with and without them never
+The three that change emulation change the compatibility key, so builds with and without them never
 meet.
 
 **Result** (median of 82 jumps, 120 Hz screen, solo): Brawl's press-to-glass went from 104 ms to
-53 ms, Project+'s from 87 ms to 53 ms; the image changes at press+2 frames in both.
+53 ms, Project+'s from 87 ms to 53 ms, with the image at press+2 frames in both; the v-sync move
+then took 13 ms more off both (the sampling boundary to the present call: 48.8 to 35.6 ms in Brawl,
+48.8 to 35.2 ms in Project+). Online, with frequent 1-frame rollbacks (on 6-17% of the frames), it
+keeps 6-7 ms of that; with 4-7 frame rollbacks it keeps none, and the picture is as steady as
+before.
 
 ### Presentation (host only)
 
-- **Immediate XFB.** Brawl and Project+ copy their XFB about 15.8 ms into a frame and the VI field
-  starts 18 ms later. It can't desync: re-run frames skip `ImmediateSwap`, the throttle it bypasses
-  only sleeps, and per-frame RAM hashes are identical with it on and off. It also shows the
-  corrected frame after a rollback at once.
-- **Smooth Early Presentation.** Immediate XFB presents unevenly (4-6% of 60 Hz refreshes repeated a
-  frame). Smooth presents at the VI time plus a slowly-following offset: about 2 ms later at the
-  present call, but no later at the glass at the median and earlier at p90, because even presents
-  catch the compositor's earlier slot. A session never makes a stall's time up (pacing resets when a
-  stall ends), so frames after a stall pay the same 2 ms as any other.
+- **Immediate XFB.** The VI field that would scan a copy out starts up to a frame after it. It can't
+  desync: re-run frames skip `ImmediateSwap`, the throttle it bypasses only sleeps, and per-frame
+  RAM hashes are identical with it on and off. It also shows the corrected frame after a rollback at
+  once.
+- **Steady presentation** (`PresentPacer`, under Smooth Early Presentation, forced on). With the
+  v-sync move a frame's copy lands about 2 ms after the frame boundary, 14 ms before the VI field
+  after it. Each frame is due at the throttle's host time for that field, computed at the copy (the
+  estimate taken at the previous field is stale after a re-run, whose fields run unthrottled, or a
+  stall's pacing reset), and is shown at due plus an offset: all but the latest 4 of the last 180
+  arrivals, moving at most 0.5 ms a frame up and 0.2 ms down, never past due. Without rollbacks the
+  offset sits just above the copies. When re-runs come often it grows to cover them, so a re-run
+  doesn't move the picture; a rare one is late on its own frame only. Dolphin's own rule moved half
+  the way to any late frame at once, so with the early copy every re-run dragged the presents after
+  it. Loads and hitches raise the offset the same way: a match's first seconds are presented as
+  before the move, until 3 s after the last slow frame.
+- **Precise waits** (`Common/Timer.cpp`, macOS). A present now waits up to 14 ms, and macOS woke such
+  sleeps 1-3 ms late, which no spin takes back; long waits sleep in 1 ms steps. Precision frame
+  timing is forced on.
 - **No re-present on rollback loads.** Rollback snapshots skip `Presenter::DoState`'s redisplay;
   savestates and keyframes still show their frame.
-- **Rollback and the vertex buffer.** At the frame boundary the GPU is mid-frame (Brawl and Project+
-  are 170-350 draws past their last XFB copy), so the frame shown after a rollback mixes the old
-  timeline's draws and the new one's; that stays. But a batch still buffered in the vertex manager
+- **Rollback and the vertex buffer.** Before the v-sync move, the GPU was mid-frame at the frame
+  boundary (Brawl and Project+ 170-350 draws past their last XFB copy), so the frame shown after a
+  rollback mixed the old timeline's draws and the new one's. But a batch still buffered in the vertex manager
   was flushed after the snapshot's XF and TEV state had been restored, so it was drawn through the
   wrong matrices (one-frame triangle spikes from a character as hits land). Loads now flush it first.
 - **Slow screens** (Metal). On a 50 Hz screen `nextDrawable` held the game at 50 fps, dragging the
@@ -726,6 +747,19 @@ rollbacks had 0-1 underflows; at 40 ms 5-32, at 32 ms 174. Sound trails the pict
   buffer from the pads just set, leaving the status register alone. It is deterministic: a pure
   function of the session's pads, applied after the boundary's snapshot was saved or loaded, so every
   load relatches.
+- **V-sync move** (Project+'s "Move v-sync call for Brawl/PM" by hannesmann, Dan Salvato and
+  Achilles, in its netplay codeset). Brawl's frame function (`0x80023AE4`) waits for a retrace
+  before it draws, looping back to `VIWaitForRetrace` (`0x801E892C`) from the `beq` at `0x80023B88`
+  while no XFB slot is free. The move makes that `beq` a `nop` and its `blr` at `0x80024028` a tail
+  call to `VIWaitForRetrace`, so each frame is drawn and copied right after the game's logic (the
+  copy 2.1 frames after the sampling boundary instead of 2.9) and waits once at the end. Both
+  games write the same two words at the first frame boundary, each in a guarded group of three
+  (`RSBE01.patches`, `PPLUS32.patches`; Project+'s codes then write the same words every frame, see
+  [Code the JIT doesn't see](#code-the-jit-doesnt-see)). Every frame's RAM differs from earlier
+  builds from frame 0 on; the scripts still reach the same scenes, a few frames sooner. A frame
+  that runs over a field now waits for the next retrace, so the game's slow load frames hold whole
+  fields; a 2-field hold (33.37 ms) counts as a slow frame in a game load, where a 1.5-field one
+  didn't.
 
 Measure with a latency-probe build: a scripted press, frame dumps to find the first changed image,
 and timestamps from the sampling boundary to the present call and to CoreAnimation's
@@ -776,6 +810,25 @@ Offered for Brawl (any revision) and Project+; without the cap the line answers 
   stream pair too (the announcer and the crowd are normal voices), and no stream voice of the run
   sends to an AUX bus. Cost: instructions retired by the whole run to frame 9000 (a snapshot every
   frame from 5900) are the same on and off, within the 0.1% between runs.
+
+### The game's Sound slider
+
+Options > Sound's balance between music and effects (gmGlobalRecord, `0x9017BE68`, 0-100) is game
+memory, so in a room it was the host's: a host who had pushed it to the end labelled MUSIC silenced
+the joiner's music, and to the other end their effects. Since Orca 0.3.32 it stays at 50, where
+`GameGlobal::init` puts it, in every session, solo included: both limits of the page's slider
+handler are 50 (`RSBE01.patches` and `PPLUS32.patches`, "Options > Sound"), so the cursor never
+moves and the sound manager is never called. Solo can't keep it: every Orca is the host a friend
+can drop into, and a balance set alone reaches the friend with the keyframe. Music on or off for one
+player is the Music switch. Clamping to 10-90 instead is two words per file, named there.
+
+Checked 2026-10-07, Brawl and Project+: two Orcas in a friends room, the host's slider held toward
+MUSIC before the friend joined. With 0.3.30 the friend's audio after the join was silent (RMS 1-20 a
+second); with the lock it had its music (RMS 2700-6100), every checksum matched. Hashlogs of the
+default inputs equal 0.3.30's without the two groups and differ with them only in the three changed
+words (RAM compared at the character select, in the match, on the results screen and back on the
+character select). `YG_SYNCTEST=7` with the slider held both ways on the Sound page, and over the
+default inputs: 0 RAM mismatches. Test: `OrcaOnlineMenuSound.*`.
 
 ## Match start
 
@@ -874,15 +927,19 @@ whole-cache clear switches to Project+'s: a desync from the next frame. Orca nev
 a session itself, but Dolphin does when its code space fills, rarely, and at different times on a Mac
 and a PC.
 
-**The fix:** `KeepGameCode = <address> <Brawl's word> <Project+'s word>` lines in `PPLUS32.ini`.
-Every instruction fetch at those addresses (both JITs and the interpreters) gets Brawl's word while
-RAM holds Project+'s, so any JIT clear compiles what ran before, and RAM, its hashes and the codes'
-own reads are unchanged. `JitClearFrame = 2` adds one clear at the end of frame 2, so every machine
-compiles from then on whatever a fetch reads, whatever its boot compiled.
+**The fix:** the v-sync move's two words are written by `PPLUS32.patches` at the first frame
+boundary, before the codes first write them, through the memory-patch path, which drops the JIT's
+copies; every machine runs the move from frame 1 and the codes then write the same words ([Input
+latency](#input-latency)). The other five are `KeepGameCode = <address> <Brawl's word> <Project+'s
+word>` lines in `PPLUS32.ini`: every instruction fetch there (both JITs and the interpreters) gets
+Brawl's word while RAM holds Project+'s, so any JIT clear compiles what ran before, and RAM, its
+hashes and the codes' own reads are unchanged. `JitClearFrame = 2` adds one clear at the end of
+frame 2, so every machine compiles from then on whatever a fetch reads, whatever its boot compiled.
 
-Running Project+'s v-sync move for real would cut about 13 ms of latency, but it doubled the 60 Hz
-repeats and drops whenever there were rollbacks (a re-run's time lands on that frame's present and
-Smooth Early Presentation's offset follows it), so Orca keeps what earlier builds ran.
+Through 0.3.30 the v-sync move was kept as Brawl's words too: run for real, its early copy let each
+rollback's re-run land on that frame's present and drag the presents after it (twice the 60 Hz
+repeats and drops with rollbacks). The steady presentation in [Input latency](#input-latency) fixed
+that.
 
 **Checking a codeset** (a Project+ update, another launcher profile): `Tools/orca/jit-history.py
 <nogui> <disc> --pplus <dol>` runs the boot twice (as it comes, and with JIT clears), compares the
@@ -972,7 +1029,7 @@ away.
 | `+0x290`-`+0x297` | A friend's move from the menus |
 
 Any new header (another mode, ruleset, coin or room) starts every track's state fresh. Compatibility:
-anything that changes what the game computes bumps `UX::kCompatVersion` (currently `ux=21`), which is
+anything that changes what the game computes bumps `UX::kCompatVersion` (currently `ux=23`), which is
 in the compatibility key.
 
 ## Input gate

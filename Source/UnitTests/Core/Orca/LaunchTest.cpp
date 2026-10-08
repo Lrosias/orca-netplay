@@ -173,7 +173,8 @@ TEST(OrcaLaunch, KeptGameCode)
 }
 
 // PPLUS32.ini keeps Brawl's own words where Project+'s codes rewrite its code in frame 1 (ORCA.md
-// "Code the JIT doesn't see"), and still clears the JIT once after they land.
+// "Code the JIT doesn't see"), except its v-sync move, which every machine runs after the one JIT
+// clear once they land.
 TEST(OrcaLaunch, ProjectPlusKeepsBrawlsCode)
 {
   const std::string sys =
@@ -183,7 +184,6 @@ TEST(OrcaLaunch, ProjectPlusKeepsBrawlsCode)
       Orca::LoadProfileFrom(sys, "PPLUS32", std::nullopt, &error);
   ASSERT_TRUE(profile) << error;
   const std::vector<Orca::Profile::KeptCode> expected = {
-      {0x80023B88, 0x4182FF7C, 0x60000000}, {0x80024028, 0x4E800020, 0x481C4904},
       {0x8001CD24, 0x38631198, 0x806311A0}, {0x8001CD2C, 0x80630008, 0x38630006},
       {0x800266B8, 0x38672CAC, 0x38672CB2}, {0x8018CFC4, 0x2C000000, 0x28000030},
       {0x8018CFC8, 0x41820034, 0x41800034},

@@ -1461,6 +1461,58 @@ TEST(OrcaUXGamePatches, BrawlInputLagFixIsTheMagusCodeInPlace)
     EXPECT_FALSE(p.address >= 0x8002AD8C && p.address <= 0x8002AE3C) << std::hex << p.address;
 }
 
+TEST(OrcaUXGamePatches, BrawlRunsProjectPlusVSyncMove)
+{
+  // Project+'s "Move v-sync call for Brawl/PM" (`op nop @ $80023b88`, `op b 0x1C4904 @ $80024028`):
+  // the same two words, each in a group of three whose other words only guard, in both games' files
+  // (Project+'s lands them before its own codes first write them, so no JIT keeps Brawl's).
+  for (const char* file : {"RSBE01.patches", "PPLUS32.patches"})
+  {
+    SCOPED_TRACE(file);
+    const auto patches = ShippedPatches(file);
+    const auto index_of = [&](u32 address) {
+      return static_cast<size_t>(
+          std::find_if(patches.begin(), patches.end(),
+                       [&](const GamePatch& p) { return p.address == address; }) -
+          patches.begin());
+    };
+    struct Move
+    {
+      u32 group, address, original, value;
+    };
+    for (const Move& move : {Move{0x80023B84, 0x80023B88, 0x4182FF7C, 0x60000000},   // beq -> nop
+                             Move{0x80024020, 0x80024028, 0x4E800020, 0x481C4904}})  // blr -> b
+    {
+      const size_t at = index_of(move.group);
+      ASSERT_LE(at + 3, patches.size()) << std::hex << move.group;
+      const std::span<const GamePatch> group(patches.data() + at, 3);
+      EXPECT_FALSE(group[0].joins_previous);
+      EXPECT_TRUE(group[1].joins_previous && group[2].joins_previous);
+      if (at + 3 < patches.size())
+        EXPECT_FALSE(patches[at + 3].joins_previous);
+      std::vector<u32> originals;
+      for (const GamePatch& p : group)
+      {
+        ASSERT_TRUE(p.original.has_value());
+        EXPECT_TRUE(p.when.empty());
+        originals.push_back(*p.original);
+        if (p.address == move.address)
+        {
+          EXPECT_EQ(*p.original, move.original);
+          EXPECT_EQ(p.value, move.value);
+        }
+        else
+        {
+          EXPECT_EQ(p.value, *p.original) << std::hex << p.address;
+        }
+      }
+      EXPECT_TRUE(GroupApplies(group, originals));
+    }
+  }
+  // The tail call goes to VIWaitForRetrace, where the beq's loop called it.
+  EXPECT_EQ(0x80024028u + (0x481C4904u & 0x03FFFFFC), 0x801E892Cu);
+}
+
 TEST(OrcaUXGamePatches, TheShippedProjectPlusFileGuardsEveryLine)
 {
   // Project+ owns the code and data around the disc's modules, so its file may only hold groups
@@ -1681,6 +1733,19 @@ std::array<u8, 0x2D> TagLayout(const FakeBrawl& m, int slot)
     layout[i] = m.Read8(FakeBrawl::Tag(slot) + 0x14 + i);
   return layout;
 }
+// A tag as the game makes one (the player made it in the name list): the name, rumble on, the
+// default layout.
+void GameMadeTag(FakeBrawl& m, int slot, const std::u16string& name)
+{
+  m.SetTag(slot, name);
+  m.Write8(FakeBrawl::Tag(slot) + 0x0C, 1);
+  for (u32 i = 0; i < 0x2D; ++i)
+    m.Write8(FakeBrawl::Tag(slot) + 0x14 + i, FakeBrawl::CONTROLS[i]);
+}
+void Wear(FakeBrawl& m, int port, int slot)
+{
+  m.W32(FakeBrawl::Area(port) + 0x1C8, static_cast<u32>(slot));
+}
 }  // namespace
 
 TEST(OrcaUXNameTags, APortsOwnControlsGoIntoTheTagItGets)
@@ -1732,7 +1797,7 @@ TEST(OrcaUXNameTags, ControlsReplaceThoseOfATagAlreadyHoldingTheName)
   EXPECT_EQ(m.NameId(1), 7);
   EXPECT_EQ(TagLayout(m, 7), CustomLayout());
   EXPECT_EQ(m.Read8(FakeBrawl::Tag(7) + 0x0C), 0);
-  // A port already wearing a tag keeps it, controls and all (only a tag being given gets them).
+  // A port already wearing a tag of its own keeps it, controls and all.
   FakeBrawl chosen;
   chosen.SetTag(3, u"MINE");
   chosen.Join(0);
@@ -1740,6 +1805,134 @@ TEST(OrcaUXNameTags, ControlsReplaceThoseOfATagAlreadyHoldingTheName)
   chosen.recording = true;
   EXPECT_EQ(ApplyNameTags(chosen, {{0, "cy", false, Profile(0, CustomLayout())}}), 0);
   EXPECT_TRUE(chosen.written.empty());
+}
+
+TEST(OrcaUXNameTags, ATagThePlayerMakesAgainWearsTheirOwnControls)
+{
+  // Tags made in the game die with Orca, so after a restart the player makes MYTAG again: the game
+  // creates it with its defaults, rumble on, and the port wears it. Its own controls go in it.
+  FakeBrawl m;
+  GameMadeTag(m, 118, u"MYTAG");
+  m.Join(0);
+  Wear(m, 0, 118);
+  const std::vector<Orca::Events::PortInfo> ports{{0, "zeke", false, Profile(0, CustomLayout())}};
+  m.recording = true;
+  // No tag given: the port keeps the one it wears.
+  EXPECT_EQ(ApplyNameTags(m, ports), 0);
+  EXPECT_EQ(m.NameId(0), 118);
+  EXPECT_EQ(TagLayout(m, 118), CustomLayout());
+  EXPECT_EQ(m.Read8(FakeBrawl::Tag(118) + 0x0C), 0);
+  EXPECT_EQ(m.TagName(118), u"MYTAG");
+  EXPECT_EQ(m.TagName(119), u"");  // no YouGame tag made
+  // Only that tag's rumble and layout.
+  for (const u32 a : m.written)
+  {
+    EXPECT_TRUE(a == FakeBrawl::Tag(118) + 0x0C ||
+                (a >= FakeBrawl::Tag(118) + 0x14 && a < FakeBrawl::Tag(118) + 0x41))
+        << std::hex << a;
+  }
+  // Idempotent: it no longer holds the defaults, so the next frame (or a re-run) writes nothing.
+  const int writes = m.writes;
+  EXPECT_EQ(ApplyNameTags(m, ports), 0);
+  EXPECT_EQ(m.writes, writes);
+  // A friend in someone else's game who picks a tag at the defaults: the same, and the same bytes
+  // on either machine whoever is remote.
+  FakeBrawl host, joiner;
+  for (FakeBrawl* g : {&host, &joiner})
+  {
+    GameMadeTag(*g, 40, u"SPARE");
+    g->Join(0);
+    g->Join(1);
+    Wear(*g, 1, 40);
+  }
+  ApplyNameTags(host, {{0, "cy", false, {}}, {1, "ada", true, Profile(1, CustomLayout())}});
+  ApplyNameTags(joiner, {{0, "cy", true, {}}, {1, "ada", false, Profile(1, CustomLayout())}});
+  EXPECT_EQ(TagLayout(host, 40), CustomLayout());
+  EXPECT_EQ(host.Read8(FakeBrawl::Tag(40) + 0x0C), 1);
+  EXPECT_EQ(host.TagName(host.NameId(0)), u"CY");
+  EXPECT_EQ(TagLayout(host, host.NameId(0)), FakeBrawl::CONTROLS);
+  EXPECT_EQ(host.bytes, joiner.bytes);
+}
+
+TEST(OrcaUXNameTags, OnlyAWornTagHoldingExactlyTheDefaultsGetsThePortsControls)
+{
+  const std::vector<Orca::Events::PortInfo> carries{{0, "zeke", false, Profile(0, CustomLayout())}};
+  const auto untouched = [](FakeBrawl& m, const std::vector<Orca::Events::PortInfo>& ports) {
+    m.recording = true;
+    EXPECT_EQ(ApplyNameTags(m, ports), 0);
+    EXPECT_TRUE(m.written.empty());
+  };
+  {
+    // A port that carries no controls: the made tag keeps the defaults.
+    FakeBrawl m;
+    GameMadeTag(m, 118, u"MYTAG");
+    m.Join(0);
+    Wear(m, 0, 118);
+    untouched(m, {{0, "zeke", false, {}}});
+    // Nor does a wrong-sized profile count as controls.
+    std::vector<u8> short_profile = Profile(0, CustomLayout());
+    short_profile.pop_back();
+    untouched(m, {{0, "zeke", false, short_profile}});
+  }
+  {
+    // Rumble off, or one layout byte the player changed: their choice, left alone.
+    FakeBrawl rumble_off, one_byte;
+    GameMadeTag(rumble_off, 118, u"MYTAG");
+    rumble_off.Write8(FakeBrawl::Tag(118) + 0x0C, 0);
+    GameMadeTag(one_byte, 118, u"MYTAG");
+    one_byte.Write8(FakeBrawl::Tag(118) + 0x14 + 2, 0x02);
+    for (FakeBrawl* m : {&rumble_off, &one_byte})
+    {
+      m->Join(0);
+      Wear(*m, 0, 118);
+      untouched(*m, carries);
+    }
+  }
+  {
+    // Only the tag the carrying port wears: one at the defaults nobody wears, and the one a port
+    // with no values wears, stay as they are.
+    FakeBrawl m;
+    GameMadeTag(m, 100, u"ADAS");
+    GameMadeTag(m, 101, u"THEIR");
+    GameMadeTag(m, 102, u"NOONE");
+    m.Join(0);
+    m.Join(1);
+    Wear(m, 0, 101);
+    Wear(m, 1, 100);
+    EXPECT_EQ(ApplyNameTags(m, {{1, "ada", true, Profile(0, CustomLayout())}}), 0);
+    EXPECT_EQ(TagLayout(m, 100), CustomLayout());
+    EXPECT_EQ(TagLayout(m, 101), FakeBrawl::CONTROLS);
+    EXPECT_EQ(TagLayout(m, 102), FakeBrawl::CONTROLS);
+    EXPECT_EQ(m.Read8(FakeBrawl::Tag(101) + 0x0C), 1);
+  }
+  {
+    // A worn index past the table, or a slot with no name: nothing written.
+    FakeBrawl past, unnamed;
+    past.Join(0);
+    Wear(past, 0, 120);
+    untouched(past, carries);
+    GameMadeTag(unnamed, 118, u"");
+    unnamed.Join(0);
+    Wear(unnamed, 0, 118);
+    untouched(unnamed, carries);
+  }
+  {
+    // The port's own controls are the defaults with rumble on: nothing to write.
+    FakeBrawl m;
+    GameMadeTag(m, 118, u"MYTAG");
+    m.Join(0);
+    Wear(m, 0, 118);
+    untouched(m, {{0, "zeke", false, Profile(1, FakeBrawl::CONTROLS)}});
+  }
+  {
+    // The defaults unreadable: nothing written rather than a guess.
+    FakeBrawl m;
+    GameMadeTag(m, 118, u"MYTAG");
+    m.Join(0);
+    Wear(m, 0, 118);
+    m.bytes.erase(0x80406938 + 0x2C);
+    untouched(m, carries);
+  }
 }
 
 TEST(OrcaUXNameTags, ControlsOnlyAsTheGamesMenusSetThem)
@@ -1869,39 +2062,205 @@ TEST(OrcaUXNameTags, OnlyThePlayersOwnChangesToTheirTagArePublished)
   {
     // No profile yet: the auto-made tag's defaults are no change; their own edit is.
     OwnControlsWatch w;
-    EXPECT_FALSE(w.Next({}, {}, false));
-    EXPECT_FALSE(w.Next(defaults, {}, true));
-    EXPECT_FALSE(w.Next(defaults, {}, true));
-    EXPECT_EQ(w.Next(custom, {}, false), custom);
+    EXPECT_FALSE(w.Next({}, u"CY", {}, false));
+    EXPECT_FALSE(w.Next(defaults, u"CY", {}, true));
+    EXPECT_FALSE(w.Next(defaults, u"CY", {}, true));
+    EXPECT_EQ(w.Next(custom, u"CY", {}, false), custom);
     // Read again: nothing new.
-    EXPECT_FALSE(w.Next(custom, custom, false));
-    // Back to the defaults: that is a change too, now that they have a profile.
-    EXPECT_EQ(w.Next(defaults, custom, true), defaults);
+    EXPECT_FALSE(w.Next(custom, u"CY", custom, false));
+    // The tag they wear edited back to the defaults: that is a change too, now that they have a
+    // profile.
+    EXPECT_EQ(w.Next(defaults, u"CY", custom, true), defaults);
   }
   {
     // A kept profile: Orca writes it into their tag, which reads back as no change.
     OwnControlsWatch w;
-    EXPECT_FALSE(w.Next(custom, custom, false));
-    // A tag of their own they pick or edit: published.
-    EXPECT_EQ(w.Next(other, custom, false), other);
+    EXPECT_FALSE(w.Next(custom, u"CY", custom, false));
+    // A tag of their own they pick, with controls of its own: published.
+    EXPECT_EQ(w.Next(other, u"MINE", custom, false), other);
     // Nothing readable never clears it.
-    EXPECT_FALSE(w.Next({}, other, false));
-    EXPECT_FALSE(w.Next(other, other, false));
+    EXPECT_FALSE(w.Next({}, u"MINE", other, false));
+    EXPECT_FALSE(w.Next(other, u"MINE", other, false));
   }
   {
     // The app sets new controls while the old ones are still worn: the old read is no change, and
     // the tag that gets the new ones at the next select reads back as none either.
     OwnControlsWatch w;
-    EXPECT_FALSE(w.Next(custom, custom, false));
+    EXPECT_FALSE(w.Next(custom, u"CY", custom, false));
     w.Rebase();
-    EXPECT_FALSE(w.Next({}, other, false));
-    EXPECT_FALSE(w.Next(custom, other, false));
-    EXPECT_FALSE(w.Next(custom, other, false));
-    EXPECT_FALSE(w.Next(other, other, false));
+    EXPECT_FALSE(w.Next({}, u"CY", other, false));
+    EXPECT_FALSE(w.Next(custom, u"CY", other, false));
+    EXPECT_FALSE(w.Next(custom, u"CY", other, false));
+    EXPECT_FALSE(w.Next(other, u"CY", other, false));
     // After a resync, someone else's tag in the save they now run is no change.
     w.Rebase();
-    EXPECT_FALSE(w.Next(defaults, other, true));
-    EXPECT_EQ(w.Next(custom, other, false), custom);
+    EXPECT_FALSE(w.Next(defaults, u"CY", other, true));
+    EXPECT_EQ(w.Next(custom, u"CY", other, false), custom);
+  }
+}
+
+TEST(OrcaUXNameTags, ASwitchToATagAtTheDefaultsIsNoChange)
+{
+  const std::vector<u8> defaults = Profile(1, FakeBrawl::CONTROLS);
+  const std::vector<u8> custom = Profile(0, CustomLayout());
+  std::vector<u8> other = custom;
+  other[1] = 0x04;
+  {
+    // Their YouGame tag with their own controls, then a tag they make again, at the defaults:
+    // their own stay theirs (nothing to print, keep or send).
+    OwnControlsWatch w;
+    EXPECT_FALSE(w.Next(custom, u"ZEKE", custom, false));
+    EXPECT_FALSE(w.Next(defaults, u"MYTAG", custom, true));
+    EXPECT_FALSE(w.Next(defaults, u"MYTAG", custom, true));
+    // Orca's write reaching it reads back as none either.
+    EXPECT_FALSE(w.Next(custom, u"MYTAG", custom, false));
+    // Their own edit of that tag is published, and so is editing it back to the defaults.
+    EXPECT_EQ(w.Next(other, u"MYTAG", custom, false), other);
+    EXPECT_EQ(w.Next(defaults, u"MYTAG", other, true), defaults);
+  }
+  {
+    // The first read of a run, or the first after a rebase, on a tag at the defaults: no change.
+    OwnControlsWatch w;
+    EXPECT_FALSE(w.Next(defaults, u"MYTAG", custom, true));
+    OwnControlsWatch r;
+    r.Rebase();
+    EXPECT_FALSE(r.Next(defaults, u"MYTAG", custom, true));
+    EXPECT_FALSE(r.Next(defaults, u"OTHER", custom, true));
+    // A switch to a tag with controls of its own still is their pick.
+    EXPECT_EQ(r.Next(other, u"MINE", custom, false), other);
+  }
+  {
+    // On the reader: the port wears a tag the game just made, read before Orca's write reaches
+    // it (here no write at all): not a change, so the defaults never replace the kept controls.
+    FakeBrawl m;
+    GameMadeTag(m, 119, u"ZEKE");
+    for (u32 i = 0; i < 0x2D; ++i)
+      m.Write8(FakeBrawl::Tag(119) + 0x14 + i, custom[1 + i]);
+    m.Write8(FakeBrawl::Tag(119) + 0x0C, 0);
+    m.Join(0);
+    Wear(m, 0, 119);
+    const std::vector<Orca::Events::PortInfo> ports{{0, "zeke", false, custom}};
+    OwnControlsReader reader;
+    EXPECT_FALSE(reader.Read(m, ports, custom, 0));
+    GameMadeTag(m, 118, u"MYTAG");
+    Wear(m, 0, 118);
+    EXPECT_FALSE(reader.Read(m, ports, custom, 0));
+    // Orca's write reaches it.
+    for (u32 i = 0; i < 0x2D; ++i)
+      m.Write8(FakeBrawl::Tag(118) + 0x14 + i, custom[1 + i]);
+    m.Write8(FakeBrawl::Tag(118) + 0x0C, 0);
+    EXPECT_FALSE(reader.Read(m, ports, custom, 0));
+    // Off the character select with that tag gone, the YouGame tag at the defaults: none either.
+    m.SetTag(118, u"");
+    GameMadeTag(m, 119, u"ZEKE");
+    m.W32(FakeBrawl::SCENE, 0x806ff300);  // another scene's name: unreadable, not the select
+    EXPECT_FALSE(reader.Read(m, ports, custom, 0));
+  }
+}
+
+TEST(OrcaUXNameTags, AcrossRestartsATagMadeAgainKeepsTheKeptControls)
+{
+  // Two runs of Orca, each with fresh memory (tags made in the game die with it), the controls
+  // kept from the first passed to the second as the kept file does. In each, the player joins,
+  // gets their YouGame tag, makes MYTAG again and wears it. Nothing is ever published, so the kept
+  // file, the page and the account keep their controls, and MYTAG plays with them.
+  const std::vector<u8> custom = Profile(0, CustomLayout());
+  std::vector<u8> kept = custom;
+  for (int run = 0; run < 2; ++run)
+  {
+    FakeBrawl m;
+    m.Join(0);
+    const std::vector<Orca::Events::PortInfo> ports{{0, "zeke", false, kept}};
+    OwnControlsReader reader;
+    std::vector<std::vector<u8>> published;
+    const auto frame = [&] {
+      if (std::optional<std::vector<u8>> changed = NameTagsFrame(m, ports, ports, &reader, kept, 0))
+        published.push_back(*changed);
+    };
+    for (int f = 0; f < 3; ++f)
+      frame();
+    EXPECT_EQ(m.TagName(m.NameId(0)), u"ZEKE");
+    GameMadeTag(m, 118, u"MYTAG");
+    Wear(m, 0, 118);
+    for (int f = 0; f < 3; ++f)
+      frame();
+    EXPECT_TRUE(published.empty()) << "run " << run;
+    EXPECT_EQ(TagLayout(m, 118), CustomLayout()) << "run " << run;
+    EXPECT_EQ(m.Read8(FakeBrawl::Tag(118) + 0x0C), 0) << "run " << run;
+    if (!published.empty())
+      kept = published.back();
+  }
+  EXPECT_EQ(kept, custom);
+}
+
+TEST(OrcaUXNameTags, TheOwnControlsReadComesAfterTheWrites)
+{
+  const std::vector<u8> custom = Profile(0, CustomLayout());
+  const std::vector<Orca::Events::PortInfo> ports{{0, "zeke", false, custom}};
+  {
+    // Playing alone with controls kept from an earlier run: the YouGame tag gets them, no change.
+    FakeBrawl m;
+    m.Join(0);
+    OwnControlsReader reader;
+    EXPECT_FALSE(NameTagsFrame(m, ports, ports, &reader, custom, 0));
+    EXPECT_EQ(m.TagName(119), u"ZEKE");
+    EXPECT_EQ(TagLayout(m, 119), CustomLayout());
+    // They make MYTAG again (the game makes it at its defaults) and wear it: the same frame gives
+    // it their controls, and the read sees those, not the defaults.
+    GameMadeTag(m, 118, u"MYTAG");
+    Wear(m, 0, 118);
+    EXPECT_FALSE(NameTagsFrame(m, ports, ports, &reader, custom, 0));
+    EXPECT_EQ(TagLayout(m, 118), CustomLayout());
+    EXPECT_FALSE(NameTagsFrame(m, ports, ports, &reader, custom, 0));
+    // Their own edit of it is still their change.
+    m.Write8(FakeBrawl::Tag(118) + 0x14, 0x04);
+    const std::optional<std::vector<u8>> edited =
+        NameTagsFrame(m, ports, ports, &reader, custom, 0);
+    ASSERT_TRUE(edited);
+    EXPECT_EQ((*edited)[1], 0x04);
+  }
+  {
+    // The defaults land in the very tag the port wears on the character select: Orca puts the
+    // controls back in the same frame, and the read after the writes sees no change.
+    FakeBrawl m;
+    m.Join(0);
+    OwnControlsReader reader;
+    EXPECT_FALSE(NameTagsFrame(m, ports, ports, &reader, custom, 0));
+    GameMadeTag(m, 119, u"ZEKE");
+    EXPECT_FALSE(NameTagsFrame(m, ports, ports, &reader, custom, 0));
+    EXPECT_EQ(TagLayout(m, 119), CustomLayout());
+    // Read before the writes (the old order), that frame published the defaults.
+    FakeBrawl old;
+    old.Join(0);
+    OwnControlsReader before;
+    EXPECT_FALSE(NameTagsFrame(old, ports, ports, &before, custom, 0));
+    GameMadeTag(old, 119, u"ZEKE");
+    EXPECT_EQ(before.Read(old, ports, custom, 0), Profile(1, FakeBrawl::CONTROLS));
+  }
+  {
+    // Re-runs and sessions: the writes only.
+    FakeBrawl m;
+    m.Join(0);
+    EXPECT_FALSE(NameTagsFrame(m, ports, ports, nullptr, custom, 0));
+    EXPECT_EQ(TagLayout(m, 119), CustomLayout());
+  }
+  {
+    // The app sets new controls while the old ones are worn: the next read on this player's own
+    // port is the reference, even when frames without it come first.
+    std::vector<u8> old = custom;
+    old[1] = 0x04;
+    FakeBrawl m;
+    GameMadeTag(m, 119, u"ZEKE");
+    for (u32 i = 0; i < 0x2D; ++i)
+      m.Write8(FakeBrawl::Tag(119) + 0x14 + i, old[1 + i]);
+    m.Write8(FakeBrawl::Tag(119) + 0x0C, 0);
+    m.Join(0);
+    Wear(m, 0, 119);
+    OwnControlsReader reader;
+    reader.Rebase();
+    EXPECT_FALSE(reader.Read(m, {{0, "zeke", true, custom}}, custom, 0));
+    EXPECT_FALSE(reader.Read(m, ports, custom, 0));
+    EXPECT_FALSE(reader.Read(m, ports, custom, 0));
   }
 }
 

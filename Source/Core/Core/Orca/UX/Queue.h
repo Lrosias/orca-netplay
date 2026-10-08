@@ -284,6 +284,8 @@ void ClearReady();
 // The casual ready timer ran out and its frame is confirmed. Prints `orca queue timeout me|them`
 // once.
 void ConfirmTimeout(int confirmed, int local_port);
+// Discard notifications from the state that was replaced by a local snapshot.
+void ResetTimeouts();
 // Whether the last `orca queue timeout` said `me`. Cleared when read.
 bool TakeTimeoutWasMine();
 }  // namespace Orca::UX::Queue

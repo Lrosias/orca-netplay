@@ -11,6 +11,7 @@
 #include "Common/Logging/Log.h"
 #include "Core/Core.h"
 #include "Core/Orca/Session/PadCodec.h"
+#include "Core/Orca/Session/Replay.h"
 #include "Core/Rollback/Diag.h"
 #include "Core/System.h"
 
@@ -92,6 +93,7 @@ bool RingPort::Load(int frame)
 
 void RingPort::SetPads(int frame, const Orca::Net::Pads& pads)
 {
+  Orca::Net::ReplayRecordingScope::RecordPads(frame, pads);
   // Called once for every frame about to run.
   for (std::size_t port = 0; port < pads.size(); ++port)
     m_pads[port] = Orca::Net::DecodePad(pads[port]);

@@ -40,11 +40,14 @@ class CPUThreadGuard;
 // already holding that name, else the highest unused one, built as the game builds one. A duplicate
 // name gets its port number as the last character (SAND2). The player's controls are written into
 // it. A port with controls but no showable name gets "P<port>". A port with neither gets nothing.
+// A joined port with controls that wears a tag holding exactly what the game puts in a tag it makes
+// (rumble on, the default layout: a tag the player just made, or made again after a restart, since
+// tags made in the game last only until Orca closes) gets its controls written into that tag too.
 //
 // Determinism: writes depend only on emulated memory and the session's synced port list, and are
-// idempotent (a re-run frame writes the same bytes; a port that has a tag is left alone). Names and
-// controls come from the host (OnlineMatch.cpp, "Ports") and every machine has them before the
-// frame they apply from.
+// idempotent (a re-run frame writes the same bytes; a port that wears a tag is left alone once that
+// tag no longer holds the game's defaults). Names and controls come from the host (OnlineMatch.cpp,
+// "Ports") and every machine has them before the frame they apply from.
 //
 // TODO: the character select's name plate keeps "PLAYER n" until the game redraws it (its setter,
 // 0x8069B1CC, only runs when the player picks a tag). Needs a game-side code.
@@ -94,9 +97,10 @@ private:
 constexpr u32 CONTROLS_LAYOUT_SIZE = 0x2D;
 constexpr u32 CONTROLS_PROFILE_SIZE = 1 + CONTROLS_LAYOUT_SIZE;
 
-// One frame's writes for these ports. Returns how many ports got a tag. Profile bytes are clamped
-// to values the game's own menus could set (rumble 0 or 1, the flag bytes' own bits only, actions
-// up to 0xE), else the game's default, since profiles come from other machines.
+// One frame's writes for these ports. Returns how many ports got a tag (a worn default tag given
+// the port's controls is not counted). Profile bytes are clamped to values the game's own menus
+// could set (rumble 0 or 1, the flag bytes' own bits only, actions up to 0xE), else the game's
+// default, since profiles come from other machines.
 int ApplyNameTags(GuestMemory& memory, const std::vector<Events::PortInfo>& ports);
 
 // A profile as text (lowercase hex, 92 characters) and back. Parsing refuses any other size, and
@@ -105,40 +109,73 @@ std::string ControlsHex(const std::vector<u8>& profile);
 std::optional<std::vector<u8>> ParseControlsHex(std::string_view hex);
 bool ControlsValid(const std::vector<u8>& profile);
 
-// Runs from Events' frame callback on every frame (first runs and re-runs), before the session
-// saves a snapshot or keyframe, so those include what it wrote.
-void WriteNameTags(const Core::CPUThreadGuard& guard, const std::vector<Events::PortInfo>& ports);
-
 // This player's own controls, read from their own save, to carry into an online game. Uses the tag
 // `port` wears on the character select, else the tag named by `last_worn` (kept by the caller),
-// else the tag matching `own_name`. Empty means the game's defaults.
+// else the tag matching `own_name`. Empty means the game's defaults. `read_tag`, if given, gets the
+// name of the tag read (empty when none).
 std::vector<u8> ReadOwnControls(const GuestMemory& memory, int port, std::string_view own_name,
-                                std::u16string* last_worn);
+                                std::u16string* last_worn, std::u16string* read_tag = nullptr);
 
 // Which reads of the player's own tag are the player's own changes. A read that only shows what
-// Orca put in the tag, or a save that isn't this player's (after a resync, or before the app's
-// controls reached the tag), is no change.
+// Orca put in the tag, a save that isn't this player's (after a resync, or before the app's
+// controls reached the tag), or a switch to a tag at the game's defaults, is no change.
 class OwnControlsWatch
 {
 public:
   // The read becomes the reference without counting as a change: after a resync, and after the app
   // sets the controls (the worn tag still holds the old ones until the next character select).
   void Rebase() { m_rebase = true; }
-  // This frame's read; returns the controls to publish when the player changed them. `own` is the
-  // current profile, `is_default` whether the read is the game's defaults with rumble on.
-  std::optional<std::vector<u8>> Next(const std::vector<u8>& read, const std::vector<u8>& own,
-                                      bool is_default);
+  // This frame's read from the tag named `tag`; returns the controls to publish when the player
+  // changed them. `own` is the current profile, `is_default` whether the read is the game's
+  // defaults with rumble on.
+  std::optional<std::vector<u8>> Next(const std::vector<u8>& read, std::u16string_view tag,
+                                      const std::vector<u8>& own, bool is_default);
 
 private:
   std::vector<u8> m_last;
+  std::u16string m_tag;
   bool m_rebase = false;
 };
 
-// Frame hook: on first runs while playing alone, publishes this player's controls to the session
-// (Events::SetOwnControls) when they change them in the game. Each change prints
-// "orca controls <hex>" for the app and is kept in the user folder. Brawl rev 2 and Project+ only.
-void ReadOwnControlsFrame(const Core::CPUThreadGuard& guard,
-                          const std::vector<Events::PortInfo>& ports);
+// The frame hook's reader of this player's own controls: the tag their port wears (ReadOwnControls,
+// remembering the tag they last wore) through an OwnControlsWatch.
+class OwnControlsReader
+{
+public:
+  // The app just set the controls: the next read is the reference (OwnControlsWatch::Rebase).
+  void Rebase() { m_rebase = true; }
+  // One read, on the port that isn't remote. `own` is the current profile, `resyncs` the session's
+  // resync count (when it moves, the remembered tag is forgotten: a tag with its name may be in
+  // someone else's save). Returns the controls to publish when the player changed them.
+  std::optional<std::vector<u8>> Read(const GuestMemory& memory,
+                                      const std::vector<Events::PortInfo>& ports,
+                                      const std::vector<u8>& own, u64 resyncs);
+
+private:
+  std::u16string m_last_worn;
+  OwnControlsWatch m_watch;
+  u64 m_resyncs = 0;
+  bool m_rebase = false;
+};
+
+// One frame of name tags: ApplyNameTags with `write_ports`, then, with a `reader` (first runs while
+// playing alone), the read of this player's own controls from `ports`. The read comes after the
+// writes, so it sees what Orca just put in the tag they wear (a tag they just made, given their
+// controls) rather than the game's defaults that tag held before. Returns the controls to publish.
+std::optional<std::vector<u8>> NameTagsFrame(GuestMemory& memory,
+                                             const std::vector<Events::PortInfo>& write_ports,
+                                             const std::vector<Events::PortInfo>& ports,
+                                             OwnControlsReader* reader, const std::vector<u8>& own,
+                                             u64 resyncs);
+
+// Runs from Events' frame callback on every frame (first runs and re-runs), before the session
+// saves a snapshot or keyframe, so those include what it wrote: NameTagsFrame on emulated memory,
+// reading only when `read_own` (first runs while playing alone). A change the player made to their
+// controls in the game is published to the session (Events::SetOwnControls), printed as
+// "orca controls <hex>" for the app and kept in the user folder. Brawl rev 2 and Project+ only.
+void NameTagsFrameHook(const Core::CPUThreadGuard& guard,
+                       const std::vector<Events::PortInfo>& write_ports,
+                       const std::vector<Events::PortInfo>& ports, bool read_own);
 
 // The controls this player starts with, at boot: ORCA_CONTROLS=<hex> from the app, else the ones
 // kept from an earlier run of this game (printed as "orca controls <hex>" for the page). Unset or

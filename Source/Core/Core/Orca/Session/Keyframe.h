@@ -12,11 +12,12 @@
 
 #include "Common/CommonTypes.h"
 #include "Core/Orca/Session/YouGameRoom.h"
+#include "Core/Orca/Session/Replay.h"
 #include "Core/Rollback/Rollback.h"
 
-// Drop-in keyframes: the host's whole machine at one frame boundary (device state, MEM1/MEM2 and
-// the session NAND's files, which rollback snapshots leave out), zstd-compressed. A friend joining
-// a running game loads it, then catches up through the host's inputs since that frame.
+// Network drop-in transfers are bounded controller-input replays with typed UI events. Each
+// machine restores its own local boot snapshot and executes the replay before joining live play.
+// NAND helpers below serve local snapshots only; no NAND or Dolphin state is accepted from peers.
 namespace Orca::Net
 {
 // One file or folder of the session NAND, by its '/'-separated path under the NAND root.
@@ -47,10 +48,8 @@ bool ReadNandTree(const std::string& root, std::vector<NandEntry>* entries);
 bool ReplaceNandTree(const std::string& root, const std::vector<NandEntry>& entries);
 
 // Packs and unpacks a keyframe. `hash` is the hex XXH3 of the compressed bytes.
-std::vector<u8> PackKeyframe(int frame, const Rollback::MachineImage& image,
-                             const std::vector<NandEntry>& nand);
-bool UnpackKeyframe(const std::vector<u8>& blob, int* frame, Rollback::MachineImage* image,
-                    std::vector<NandEntry>* nand);
+std::vector<u8> PackKeyframe(int frame, const ReplayArchive& replay);
+bool UnpackKeyframe(const std::vector<u8>& blob, int* frame, ReplayArchive* replay);
 std::string KeyframeHash(const std::vector<u8>& blob);
 
 // AES-256-GCM over a packed keyframe, so YouGame's store only holds ciphertext. The key is random

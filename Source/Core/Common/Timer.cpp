@@ -179,6 +179,14 @@ void PrecisionTimer::SleepUntil(Clock::time_point target)
   }
 #else
   // Sleeping on Linux generally isn't as terrible as it is on Windows.
+#ifdef __APPLE__
+  // Orca: macOS lets a long sleep wake late, by about a millisecond in a session and several in a
+  // plain process (timer coalescing grows with the wait), which no spin can take back. Short sleeps
+  // keep their time, so long waits go in steps of the timer resolution.
+  constexpr auto STEP = std::chrono::milliseconds{TIMER_RESOLUTION_MS};
+  while (target - Clock::now() > SPIN_TIME + STEP)
+    std::this_thread::sleep_for(STEP);
+#endif
   std::this_thread::sleep_until(target - SPIN_TIME);
 #endif
 

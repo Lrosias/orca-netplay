@@ -32,6 +32,7 @@
 #include "Common/Timer.h"
 #include "Core/Core.h"
 #include "Core/HW/CPU.h"
+#include "Core/HW/Memmap.h"
 #include "Core/IOS/FS/HostBackend/FS.h"
 #include "Core/IOS/IOS.h"
 #include "Core/Orca/Profile.h"
@@ -47,6 +48,7 @@
 #include "Core/Orca/UX/RankedSet.h"
 #include "Core/Orca/UX/Results.h"
 #include "Core/Orca/UX/SetEnd.h"
+#include "Core/PowerPC/JitInterface.h"
 #include "Core/Rollback/Rollback.h"
 #include "Core/Rollback/SessionPort.h"
 #include "Core/System.h"
@@ -90,21 +92,6 @@ struct KeyframeJob
   }
 };
 
-// The host's NAND file hashes at Profile::boot_nand_frame, read on a thread from a copy.
-struct BootNandJob
-{
-  std::thread thread;
-  std::atomic<bool> done{false};
-  std::map<std::string, u64> hashes;
-  // Boot /tmp files, so a later join can resolve hash references after the game rewrites /tmp.
-  std::map<std::string, std::vector<u8>> tmp_files;
-  ~BootNandJob()
-  {
-    if (thread.joinable())
-      thread.join();
-  }
-};
-
 // A joining player's download of the host's keyframe, unpacked on its own thread.
 struct Download
 {
@@ -118,8 +105,7 @@ struct Download
   std::string refusal;
   Orca::Net::KeyframeInfo info;
   int frame = -1;
-  MachineImage image;
-  std::vector<Orca::Net::NandEntry> nand;
+  Orca::Net::ReplayArchive replay;
   double transfer_ms = 0, unpack_ms = 0;
   ~Download()
   {
@@ -184,6 +170,11 @@ struct Match
 
   // A joining player.
   std::unique_ptr<Download> download;
+  std::unique_ptr<Download> replaying;
+  MachineImage origin;
+  std::vector<Orca::Net::NandEntry> origin_nand;
+  Orca::Net::ReplayArchive replay;
+  Clock::time_point replay_heartbeat{};
   int host_seat = 0;
   std::string host_name;
   bool host_here = false;
@@ -194,11 +185,8 @@ struct Match
   bool joined = false;
   int leave_at = -1;
   bool leave_requested = false;
-  // The joiner runs its own boot to this frame before loading (Profile::boot_nand_frame).
-  int boot_ahead_to = 0;
   std::string join_status;
-  // Host: NAND hashes at Profile::boot_nand_frame; keyframes reference those files, not send them.
-  std::unique_ptr<BootNandJob> boot_nand;
+
   int last_percent = -1;
 
   u32 round_trip_sequence = 0;
@@ -246,12 +234,18 @@ struct Match
   // once that room is over. Armed once the room was actually entered.
   struct QueueImage
   {
+    int frame = 0;
+    int local_seat = 0;
+    Clock::time_point loaded_time{};
     MachineImage image;
     std::vector<Orca::Net::NandEntry> nand;
+    Orca::Net::ReplayArchive replay;
     bool armed = false;
     Clock::time_point taken{};
   };
   std::unique_ptr<QueueImage> queue_image;
+  // Trusted local return point while an unverified replay is being rebuilt.
+  std::unique_ptr<QueueImage> before_join;
   bool want_queue_image = false;
   // A fight was played in the ranked room this queue image is for: the restored character select
   // comes back not ready, so Start searches again.
@@ -303,6 +297,7 @@ void SetNames(Match& match, const Orca::Net::KeyframeInfo& from_host);
 void RefreshOwnValues(Match& match, int frame);
 std::vector<Orca::Events::PortInfo> PortsAt(Match& match, int frame);
 void Leave(Match& match);
+void JoinInPlay(Match& match, const std::string& code);
 
 Match& TheMatch()
 {
@@ -419,167 +414,57 @@ void StartKeyframe(Core::System& system, Match& match, int frame)
 {
   auto job = std::make_unique<KeyframeJob>();
   job->frame = frame;
-  const auto start = Clock::now();
-  MachineImage image;
-  if (!SnapshotRing::Capture(system, &image, !match.session))
+  if (frame < 0 || static_cast<size_t>(frame) > Orca::Net::MAX_REPLAY_FRAMES ||
+      match.replay.frames.size() <= static_cast<size_t>(frame))
   {
-    ERROR_LOG_FMT(ROLLBACK, "Drop-in: capturing a keyframe at frame {} failed", frame);
+    job->error = "restart the game to accept more players";
+    job->refusal = "replay_limit";
+    job->done = true;
+    match.job = std::move(job);
     return;
   }
-  // The NAND as of this boundary: a copy-on-write clone where possible, else read now.
-  IOS::HLE::FS::HostFileSystem* nand = HostNand(system);
-  std::string clone;
-  std::vector<Orca::Net::NandEntry> entries;
-  bool nand_ok = nand != nullptr;
-#ifdef __APPLE__
-  if (nand)
-  {
-    clone = File::GetUserPath(D_USER_IDX) + fmt::format("OrcaKeyframeNand-{}", frame);
-    File::DeleteDirRecursively(clone);
-    // Flush and close open files first, or buffered writes miss the clone.
-    nand->CloseHostFiles();
-    if (clonefile(nand->HostRoot().c_str(), clone.c_str(), CLONE_NOFOLLOW) != 0)
-      clone.clear();
-    nand->ReopenHostFiles();
-  }
-#endif
-  if (nand && clone.empty())
-  {
-    // Flush and close the game's open files first: Windows can't read them while they're open.
-    nand->CloseHostFiles();
-    nand_ok = Orca::Net::ReadNandTree(nand->HostRoot(), &entries);
-    nand->ReopenHostFiles();
-  }
-  job->capture_ms = MsSince(start);
-  if (!nand_ok)
-  {
-    ERROR_LOG_FMT(ROLLBACK, "Drop-in: reading the NAND for a keyframe failed");
-    return;
-  }
-
+  Orca::Net::ReplayArchive replay = match.replay;
+  replay.boundary = replay.frames[frame];
+  replay.frames.resize(frame);
+  auto& memory = system.GetMemory();
+  replay.target_hash = RamChecksum({memory.GetRAM(), memory.GetRamSize()},
+                                  {memory.GetEXRAM(), memory.GetEXRAM() ? memory.GetExRamSize() : 0});
   KeyframeJob* const raw = job.get();
   Orca::Net::KeyframeStore* const store = match.store.get();
-  std::map<std::string, u64> boot;
-  if (match.boot_nand && match.boot_nand->done)
-    boot = match.boot_nand->hashes;
-  raw->thread = std::thread([raw, store, clone, image = std::move(image),
-                             entries = std::move(entries), boot = std::move(boot)]() mutable {
-    if (!clone.empty())
+  raw->thread = std::thread([raw, store, replay = std::move(replay)] {
+    try
     {
-      if (!Orca::Net::ReadNandTree(clone, &entries))
-        raw->error = "reading the NAND clone failed";
-      File::DeleteDirRecursively(clone);
+      std::vector<u8> blob = Orca::Net::PackKeyframe(raw->frame, replay);
+      raw->raw_size = replay.frames.size() * sizeof(Orca::Net::ReplayFrame);
+      if (blob.empty())
+      {
+        raw->error = "the game's replay is too large; start a new game to accept more players";
+        raw->refusal = "replay_limit";
+      }
+      if (raw->error.empty() && !Orca::Net::EncryptKeyframe(raw->frame, &blob, &raw->info.key))
+        raw->error = "encryption failed";
+      if (raw->error.empty())
+      {
+        raw->info.frame = raw->frame;
+        raw->info.size = blob.size();
+        raw->info.hash = Orca::Net::KeyframeHash(blob);
+        raw->info.id = fmt::format("replay-{}-{}", raw->frame, raw->info.hash.substr(0, 8));
+        raw->ok = store->Put(raw->info, blob, &raw->error);
+        if (!raw->ok)
+          raw->refusal = Orca::Net::LastRefusal();
+      }
     }
-    // /tmp files the joiner's own boot also writes travel as hashes. Saves always travel: Project+
-    // writes Brawl's saves during boot, and they can depend on the host's inputs.
-    for (Orca::Net::NandEntry& entry : entries)
+    catch (const std::exception&)
     {
-      if (entry.directory || !entry.path.starts_with("tmp/"))
-        continue;
-      const auto it = boot.find(entry.path);
-      const u64 hash = Orca::Net::NandHash(entry.data);
-      if (it == boot.end() || it->second != hash)
-        continue;
-      raw->referenced += entry.data.size();
-      entry.reference = true;
-      entry.hash = hash;
-      entry.data.clear();
-      entry.data.shrink_to_fit();
-    }
-    const auto pack_start = Clock::now();
-    u64 raw_size = image.state.size() + image.mem1.size() + image.mem2.size();
-    for (const auto& e : entries)
-      raw_size += e.data.size();
-    raw->raw_size = raw_size;
-    std::vector<u8> blob =
-        raw->error.empty() ? Orca::Net::PackKeyframe(raw->frame, image, entries) : std::vector<u8>{};
-    if (raw->error.empty() && blob.empty())
-      raw->error = "compression failed";
-    // The store sees ciphertext only; the key goes to the joiner inside the room.
-    if (raw->error.empty() && !Orca::Net::EncryptKeyframe(raw->frame, &blob, &raw->info.key))
-      raw->error = "encryption failed";
-    raw->pack_ms = MsSince(pack_start);
-    if (raw->error.empty())
-    {
-      raw->info.frame = raw->frame;
-      raw->info.size = blob.size();
-      raw->info.hash = Orca::Net::KeyframeHash(blob);
-      raw->info.id = fmt::format("kf-{}-{}", raw->frame, raw->info.hash.substr(0, 8));
-      const auto put_start = Clock::now();
-      raw->ok = store->Put(raw->info, blob, &raw->error);
-      if (!raw->ok)
-        raw->refusal = Orca::Net::LastRefusal();
-      raw->put_ms = MsSince(put_start);
+      raw->error = "couldn't prepare the game's replay";
     }
     raw->done = true;
   });
   match.job = std::move(job);
-  NOTICE_LOG_FMT(ROLLBACK, "Drop-in: keyframe of frame {} captured in {:.1f} ms", frame,
-                 match.job->capture_ms);
 }
+
 
 // Host: at Profile::boot_nand_frame, hash what the boot wrote; a joiner's boot writes the same.
-void MaybeHashBootNand(Core::System& system, Match& match)
-{
-  const Orca::Profile* profile = Orca::ActiveProfile();
-  if (!profile || !profile->boot_nand_frame || match.boot_nand ||
-      match.running + 1 != static_cast<int>(*profile->boot_nand_frame))
-  {
-    return;
-  }
-  IOS::HLE::FS::HostFileSystem* nand = HostNand(system);
-  if (!nand)
-    return;
-  auto job = std::make_unique<BootNandJob>();
-  std::string clone;
-#ifdef __APPLE__
-  clone = File::GetUserPath(D_USER_IDX) + "OrcaBootNand";
-  File::DeleteDirRecursively(clone);
-  // Flushed and closed first, so the hashes match this boundary.
-  nand->CloseHostFiles();
-  if (clonefile(nand->HostRoot().c_str(), clone.c_str(), CLONE_NOFOLLOW) != 0)
-    clone.clear();
-  nand->ReopenHostFiles();
-#endif
-  if (clone.empty())
-  {
-    // No clone: copy now with files flushed and closed (Windows can't read open files).
-    const auto copy_start = Clock::now();
-    clone = File::GetUserPath(D_USER_IDX) + "OrcaBootNand";
-    File::DeleteDirRecursively(clone);
-    nand->CloseHostFiles();
-    const bool copied = File::Copy(nand->HostRoot(), clone);
-    nand->ReopenHostFiles();
-    NOTICE_LOG_FMT(ROLLBACK, "Drop-in: boot NAND copied for hashing in {:.1f} ms ({})",
-                   MsSince(copy_start), copied ? "ok" : "failed");
-    if (!copied)
-    {
-      File::DeleteDirRecursively(clone);
-      clone.clear();
-    }
-  }
-  // No copy: hash the live NAND. A file written meanwhile hashes wrong and is just sent whole.
-  BootNandJob* const raw = job.get();
-  const std::string root = clone.empty() ? nand->HostRoot() : clone;
-  raw->thread = std::thread([raw, root, cloned = !clone.empty()] {
-    raw->hashes = Orca::Net::HashNandTree(root);
-    std::vector<Orca::Net::NandEntry> entries;
-    if (Orca::Net::ReadNandTree(root, &entries))
-    {
-      for (Orca::Net::NandEntry& entry : entries)
-      {
-        if (!entry.directory && entry.path.starts_with("tmp/"))
-          raw->tmp_files[entry.path] = std::move(entry.data);
-      }
-    }
-    if (cloned)
-      File::DeleteDirRecursively(root);
-    raw->done = true;
-  });
-  match.boot_nand = std::move(job);
-}
-
-// A solo frame: this player's pad on its port (port 1 for a host), every other port unplugged.
 void RunSolo(Match& match, const std::function<Pad(int)>& local_pad)
 {
   Pad pad;
@@ -670,6 +555,8 @@ std::unique_ptr<Orca::Net::KeyframeStore> MakeStore()
 // Drops drop-in work for the room being left; the next room gets a new store.
 void ResetDropIn(Match& match)
 {
+  match.replaying.reset();
+  match.before_join.reset();
   if (match.keyframe && match.store)
     match.store->Delete(match.keyframe->id);
   match.keyframe.reset();
@@ -1036,6 +923,20 @@ void HostEvents(Core::System& system, Match& match)
                      event.host ? " that says it hosts" : "");
         continue;
       }
+      // One friend at a time. A friend still rebuilding the replay acknowledges nothing past its
+      // keyframe, which holds what the host sends everyone (Session::SendPacket, take_up_to): a
+      // friend already playing would stall for the whole rebuild and both would be dropped.
+      if (std::any_of(match.seated.begin(), match.seated.end(),
+                      [&event](int seat) { return seat != event.seat; }) ||
+          std::any_of(match.waiting.begin(), match.waiting.end(),
+                      [&event](const auto& waiting) { return waiting.first != event.seat; }))
+      {
+        NOTICE_LOG_FMT(ROLLBACK,
+                       "Drop-in: {} arrived for port {} with another friend in: room_full",
+                       event.name, event.seat + 1);
+        Orca::Online::DropPeer(event.seat, "room_full");
+        continue;
+      }
       NOTICE_LOG_FMT(ROLLBACK, "Drop-in: {} arrived for port {}", event.name, event.seat + 1);
       Core::DisplayMessage(fmt::format("{} is joining on port {}", event.name, event.seat + 1), 4000);
       match.waiting[event.seat] = {event.name, event.controls, event.queue};
@@ -1084,7 +985,8 @@ void HostEvents(Core::System& system, Match& match)
     {
       // Refused for good (say, a signed-out ticket): another keyframe gets the same answer, so
       // whoever waits hears it now instead of after its join times out.
-      const std::string why = job->refusal == "signed_out" ? "signed_out" : "refused";
+      const std::string why = job->refusal == "signed_out" || job->refusal == "replay_limit" ?
+                                  job->refusal : "refused";
       ERROR_LOG_FMT(ROLLBACK, "Drop-in: keyframe of frame {} refused ({}): {}; {} waiting told",
                     job->frame, job->refusal, job->error, match.waiting.size());
       for (const auto& [seat, arrival] : match.waiting)
@@ -1293,22 +1195,24 @@ void StartDownload(Match& match, const Orca::Net::KeyframeInfo& info)
   Download* const raw = download.get();
   Orca::Net::KeyframeStore* const store = match.store.get();
   raw->thread = std::thread([raw, store] {
-    const auto start = Clock::now();
-    std::string error;
-    auto blob = store->Get(
-        raw->info,
-        [raw](u64 done, u64 total) {
-          raw->percent = static_cast<int>(done * 100 / std::max<u64>(total, 1));
-          return !raw->cancel.load();
-        },
-        &error);
-    raw->transfer_ms = MsSince(start);
-    if (!blob)
+    try
     {
-      raw->error = error;
-      raw->refusal = Orca::Net::LastRefusal();
-      raw->done = true;
-      return;
+      const auto start = Clock::now();
+      std::string error;
+      auto blob = store->Get(
+          raw->info,
+          [raw](u64 done, u64 total) {
+            raw->percent = static_cast<int>(done * 100 / std::max<u64>(total, 1));
+            return !raw->cancel.load();
+          },
+          &error);
+      raw->transfer_ms = MsSince(start);
+      if (!blob)
+      {
+        raw->error = error;
+        raw->refusal = Orca::Net::LastRefusal();
+        raw->done = true;
+        return;
     }
     std::vector<u8> plain = std::move(*blob);
     if (Orca::Net::KeyframeHash(plain) != raw->info.hash ||
@@ -1319,11 +1223,17 @@ void StartDownload(Match& match, const Orca::Net::KeyframeInfo& info)
       return;
     }
     const auto unpack_start = Clock::now();
-    raw->ok = Orca::Net::UnpackKeyframe(plain, &raw->frame, &raw->image, &raw->nand) &&
+    raw->ok = Orca::Net::UnpackKeyframe(plain, &raw->frame, &raw->replay) &&
               raw->frame == raw->info.frame;
     raw->unpack_ms = MsSince(unpack_start);
     if (!raw->ok)
       raw->error = "the keyframe doesn't unpack";
+    }
+    catch (const std::exception&)
+    {
+      raw->error = "couldn't read the replay";
+      raw->ok = false;
+    }
     raw->done = true;
   });
   match.download = std::move(download);
@@ -1483,8 +1393,8 @@ enum class Load
   Broken,
 };
 
-// Loads the host's downloaded keyframe and starts the joiner's session. On Done, `*frame_out` is
-// the frame the state now starts at.
+// Restores only a snapshot and NAND captured by this process at its own first boundary.
+// Peer data is a bounded input replay; it never enters Dolphin's state loader.
 Load LoadKeyframe(Core::System& system, Match& match, int* frame_out)
 {
   std::unique_ptr<Download> download = std::move(match.download);
@@ -1492,96 +1402,80 @@ Load LoadKeyframe(Core::System& system, Match& match, int* frame_out)
     download->thread.join();
   if (!download->ok)
   {
-    ERROR_LOG_FMT(ROLLBACK, "Drop-in: keyframe {}: {}{}", download->info.id, download->error,
-                  download->refusal.empty() ? "" : " (refused: " + download->refusal + ")");
-    if (download->refusal == "signed_out")
-    {
-      match.join_error_code = "signed_out";
-      match.join_error = "Sign in to YouGame to join your friend's game";
-    }
-    else
-    {
-      match.join_error_code = "network";
-      match.join_error = "Couldn't load your friend's game";
-    }
+    match.join_error_code = download->refusal == "signed_out" ? "signed_out" : "network";
+    match.join_error = "Couldn't download your friend's replay";
     return Load::Failed;
   }
-
-  // The host's NAND first, then its machine state. The session NAND is a temporary folder.
-  const auto load_start = Clock::now();
-  IOS::HLE::FS::HostFileSystem* nand = HostNand(system);
-  // Files the keyframe only references were also written by this boot: take them from this boot's
-  // kept /tmp copies first, then from the NAND as it is.
-  if (match.boot_nand && match.boot_nand->done)
+  if (match.origin.state.empty() || download->replay.origin_hash != match.replay.origin_hash)
   {
-    for (Orca::Net::NandEntry& entry : download->nand)
-    {
-      if (!entry.reference)
-        continue;
-      const auto it = match.boot_nand->tmp_files.find(entry.path);
-      if (it == match.boot_nand->tmp_files.end() || Orca::Net::NandHash(it->second) != entry.hash)
-        continue;
-      entry.data = it->second;
-      entry.reference = false;
-    }
-  }
-  // Close every NAND file: Windows can't read or delete open ones. The state reopens them.
-  if (nand)
-    nand->CloseHostFiles();
-  std::string missing;
-  if (nand && !Orca::Net::ResolveNandReferences(nand->HostRoot(), &download->nand, &missing))
-  {
-    ERROR_LOG_FMT(ROLLBACK, "Drop-in: this boot's NAND doesn't match the host's: {}", missing);
-    // This game plays on solo with its own files.
-    nand->ReopenHostFiles();
     match.join_error_code = "room_mismatch";
     match.join_error = "Your friend's game data differs from yours";
     return Load::Failed;
   }
-  // Snapshots and NAND journal belong to the old game: new ring before the NAND changes.
+  IOS::HLE::FS::HostFileSystem* nand = HostNand(system);
+  if (!nand || !Core::WiiRootIsTemporary())
+  {
+    match.join_error_code = "internal";
+    match.join_error = "Couldn't restore this game's local boot";
+    return Load::Failed;
+  }
+  auto before = std::make_unique<Match::QueueImage>();
+  before->frame = match.running + 1;
+  before->local_seat = match.local_seat;
+  before->loaded_time = match.loaded_time;
+  before->replay = match.replay;
+  if (!SnapshotRing::Capture(system, &before->image, false))
+    return Load::Failed;
+  nand->CloseHostFiles();
+  if (!Orca::Net::ReadNandTree(nand->HostRoot(), &before->nand))
+  {
+    nand->ReopenHostFiles();
+    return Load::Failed;
+  }
+  match.before_join = std::move(before);
   match.port.reset();
   match.port = std::make_unique<RingPort>(system, MAX_ROLLBACK);
-  if (!nand || !Core::WiiRootIsTemporary() ||
-      !Orca::Net::ReplaceNandTree(nand->HostRoot(), download->nand))
+  if (!Orca::Net::ReplaceNandTree(nand->HostRoot(), match.origin_nand))
   {
-    ERROR_LOG_FMT(ROLLBACK, "Drop-in: replacing the NAND failed (nand {}, temporary {})",
-                  nand != nullptr, Core::WiiRootIsTemporary());
-    StopEmulation(system, "Couldn't join: the game's save folder couldn't be replaced");
-    Orca::Status::Error("internal", "Couldn't load your friend's game");
-    End("couldn't join");
+    StopEmulation(system, "Couldn't restore this game's local save folder");
+    End("replay origin");
     return Load::Broken;
   }
   nand->ReloadFst();
-  const int frame = download->frame;
-  if (!match.port->LoadImage(std::move(download->image), frame))
+  if (!match.port->LoadImage(match.origin, 0))
   {
-    ERROR_LOG_FMT(ROLLBACK, "Drop-in: loading keyframe frame {} into the ring failed", frame);
-    StopEmulation(system, "Couldn't join: your friend's game state didn't load");
-    Orca::Status::Error("internal", "Couldn't load your friend's game");
-    End("couldn't join");
+    StopEmulation(system, "Couldn't restore this game's local boot");
+    End("replay origin");
     return Load::Broken;
   }
-  match.load_ms = MsSince(load_start);
+  system.GetJitInterface().ClearSafe();
+  match.replay = std::move(download->replay);
+  match.running = -1;
+  match.join_in_play = false;
   match.loaded_time = Clock::now();
-  // This machine's game is now the host's: the UI's readers start over from it.
+  match.replay_heartbeat = {};
+  match.replaying = std::move(download);
+  match.port->SetCatchingUp(true);
+  Orca::UX::Queue::ResetTimeouts();
+  Orca::UX::Tracker().Reset();
   Orca::Events::NoteResync();
-  if (match.store)
-    match.store->Delete(download->info.id);
-  NOTICE_LOG_FMT(ROLLBACK,
-                 "Drop-in: loaded keyframe frame {}: waited {:.0f} ms for it, transfer {:.0f} ms, "
-                 "unpack {:.0f} ms, load {:.0f} ms",
-                 frame, std::chrono::duration<double, std::milli>(match.offered_time - match.boot_time).count(),
-                 download->transfer_ms, download->unpack_ms, match.load_ms);
+  Orca::UX::Rules::MemoryReplaced();
+  *frame_out = 0;
+  return Load::Done;
+}
 
-  // A join during play takes its seat from the friend's room now.
+void FinishReplay(Match& match)
+{
+  const Download& download = *match.replaying;
+  const int frame = download.frame;
+  if (match.store)
+    match.store->Delete(download.info.id);
   match.local_seat = Orca::Online::Seat();
-  // The host's port values: the newest heard (the offer's, or a later broadcast's).
-  if (match.later_names && match.later_names->names_version > download->info.names_version)
+  if (match.later_names && match.later_names->names_version > download.info.names_version)
     SetNames(match, *match.later_names);
   else
-    SetNames(match, download->info);
+    SetNames(match, download.info);
   match.later_names.reset();
-  match.join_in_play = false;
   match.log.clear();
   match.log_base = frame;
   match.queued_local.clear();
@@ -1594,20 +1488,152 @@ Load LoadKeyframe(Core::System& system, Match& match, int* frame_out)
   config.plan = plan;
   match.session =
       std::make_unique<Orca::Net::Session>(config, *match.port, *Orca::Online::Transport());
-  // Acknowledge the host's port values from the first packet; the host waits for that to plug in.
   match.session->SetValuesHeld(match.names_version);
   SeedRoundTrips(match);
-  match.port->SetCatchingUp(true);
   match.running = frame - 1;
-  // Restart the stats line's frame rate: the frames before the keyframe never ran here.
   match.stats_frame = -1;
-  // Into a friends room this player's own queue is over (JoinEndsQueue).
   EndQueueForJoin(match);
-  // The host's game must carry this room's header (none for friends); checked at the next hook.
   Orca::UX::Rules::ExpectHeader(QueueMode(Orca::Online::RoomQueue()), Orca::Online::Code(),
                                 RoomFlags());
-  *frame_out = frame;
-  return Load::Done;
+  NOTICE_LOG_FMT(ROLLBACK, "Drop-in: rebuilt replay frame {} locally in {:.0f} ms", frame,
+                 MsSince(match.loaded_time));
+  match.replaying.reset();
+  match.before_join.reset();
+}
+
+bool RestoreBeforeJoin(Core::System& system, Match& match)
+{
+  auto before = std::move(match.before_join);
+  auto* nand = HostNand(system);
+  if (!before || !nand || !Core::WiiRootIsTemporary())
+    return false;
+  nand->CloseHostFiles();
+  match.port.reset();
+  match.port = std::make_unique<RingPort>(system, MAX_ROLLBACK);
+  if (!Orca::Net::ReplaceNandTree(nand->HostRoot(), before->nand))
+    return false;
+  nand->ReloadFst();
+  if (!match.port->LoadImage(std::move(before->image), before->frame))
+    return false;
+  // As after loading the origin: a rebuild cancelled before its jit_clear_frame leaves blocks
+  // compiled from the boot's code.
+  system.GetJitInterface().ClearSafe();
+  match.running = before->frame - 1;
+  match.local_seat = before->local_seat;
+  match.loaded_time = before->loaded_time;
+  match.replay = std::move(before->replay);
+  match.replaying.reset();
+  Orca::Events::NoteResync();
+  Orca::UX::Queue::ResetTimeouts();
+  Orca::UX::Tracker().Reset();
+  Orca::UX::Rules::MemoryReplaced();
+  return true;
+}
+
+enum class ReplayStep { Running, Done, Failed };
+
+ReplayStep AdvanceReplay(Core::System& system, Match& match, const FrameHook& on_frame)
+{
+  const bool leave = Orca::Status::Cap("leave") && Orca::Online::TakeLeaveRequest();
+  const auto join = Orca::Status::Cap("join") ? Orca::Online::TakeJoinRequest() : std::nullopt;
+  if (leave || (join && *join != Orca::Online::Code()))
+  {
+    if (!RestoreBeforeJoin(system, match))
+    {
+      StopEmulation(system, "Couldn't return to your own game");
+      End("replay cancelled");
+    }
+    else if (join)
+      JoinInPlay(match, *join);
+    else
+      Leave(match);
+    return ReplayStep::Failed;
+  }
+  const int frame = match.running + 1;
+  const int target = match.replaying->frame;
+  if (MsSince(match.loaded_time) > 180000 || Orca::Online::RoomEnded() ||
+      Orca::Online::HostLeftPending())
+  {
+    if (!RestoreBeforeJoin(system, match))
+    {
+      StopEmulation(system, "Couldn't return to your own game");
+      End("replay failed");
+      return ReplayStep::Failed;
+    }
+    // As PumpJoin: a room that ended gives its own code (match-over, kicked, room_full...).
+    if (Orca::Online::RoomEnded())
+    {
+      match.join_error_code.clear();
+      match.join_error = fmt::format("Couldn't join: {}", Orca::Online::StatusLine());
+    }
+    else if (Orca::Online::HostLeftPending())
+    {
+      match.join_error_code = "peer_left";
+      match.join_error = "Your friend left before you could join";
+    }
+    else
+    {
+      match.join_error_code = "network";
+      match.join_error = "Couldn't finish rebuilding your friend's game";
+    }
+    FailJoin(system, match);
+    return ReplayStep::Failed;
+  }
+  // Keep the unjoined seat alive without acknowledging live values or claiming any new history.
+  if (Clock::now() - match.replay_heartbeat >= std::chrono::seconds(1))
+  {
+    Orca::Net::Packet heartbeat;
+    heartbeat.seat = Orca::Online::Seat();
+    heartbeat.first_frame = target;
+    heartbeat.current_frame = target;
+    heartbeat.history_ack = target - 1;
+    if (auto* transport = Orca::Online::Transport())
+      transport->Send(heartbeat);
+    match.replay_heartbeat = Clock::now();
+  }
+  // Every machine cleared the JIT once at the profile's jit_clear_frame of its own boot
+  // (Rollback.cpp, JitClearDue), and the replay's frames count from that boot's first boundary. A
+  // joiner long past that frame never gets JitClearDue again, so the rebuild clears here, at the
+  // same frame. A launch joiner's JitClearDue fires at this boundary too; a second clear is free.
+  if (const Orca::Profile* profile = Orca::ActiveProfile();
+      profile && profile->jit_clear_frame && frame == static_cast<int>(*profile->jit_clear_frame))
+  {
+    system.GetJitInterface().ClearSafe();
+    NOTICE_LOG_FMT(ROLLBACK, "Drop-in: JIT cleared at replay frame {}", frame);
+  }
+  Orca::Net::ReplayFrame& record = frame < target ? match.replay.frames[frame] : match.replay.boundary;
+  {
+    Orca::Net::ReplayScope scope(&record, true, true);
+    on_frame(frame, true, *record.ports, false);
+  }
+  if (frame < target)
+  {
+    match.port->SetPads(frame, record.pads);
+    match.running = frame;
+    if (frame % 60 == 0)
+      Orca::Status::State(fmt::format("joining {}", 50 + (target ? frame * 40 / target : 40)));
+    return ReplayStep::Running;
+  }
+  auto& memory = system.GetMemory();
+  const u64 hash = RamChecksum({memory.GetRAM(), memory.GetRamSize()},
+                              {memory.GetEXRAM(), memory.GetEXRAM() ? memory.GetExRamSize() : 0});
+  if (hash != match.replay.target_hash)
+  {
+    if (!RestoreBeforeJoin(system, match))
+    {
+      StopEmulation(system, "Couldn't return to your own game");
+      End("replay mismatch");
+      return ReplayStep::Failed;
+    }
+    match.join_error_code = "room_mismatch";
+    match.join_error = "Your friend's replay didn't reproduce the same game";
+    FailJoin(system, match);
+    return ReplayStep::Failed;
+  }
+  // Preserve the boundary's typed events for future joins from this machine.
+  match.replay.frames.push_back(match.replay.boundary);
+  FinishReplay(match);
+  return ReplayStep::Done;
 }
 
 // A launch join (ORCA_JOIN, or an invite the app opened): blocks until the host's keyframe is in.
@@ -1740,16 +1766,6 @@ void JoinInPlay(Match& match, const std::string& code)
   match.leave_requested = false;
   match.last_percent = -1;
   match.join_status.clear();
-  // Too early in this game's boot to have the files the keyframe only references: run the boot to
-  // boot_nand_frame first, unthrottled and unseen.
-  if (const Orca::Profile* profile = Orca::ActiveProfile();
-      profile && profile->boot_nand_frame &&
-      match.running + 1 < static_cast<int>(*profile->boot_nand_frame))
-  {
-    match.join_in_play = false;
-    match.boot_ahead_to = static_cast<int>(*profile->boot_nand_frame);
-    match.port->SetCatchingUp(true);
-  }
   Orca::Status::State("joining 0");
 }
 
@@ -1827,6 +1843,8 @@ void CaptureQueueImage(Core::System& system, Match& match)
   match.want_queue_image = false;
   match.ranked_fought = false;
   auto qi = std::make_unique<Match::QueueImage>();
+  qi->frame = match.running + 1;
+  qi->replay = match.replay;
   const auto start = Clock::now();
   if (!SnapshotRing::Capture(system, &qi->image, false))
   {
@@ -1909,7 +1927,7 @@ bool MaybeRestoreQueueImage(Core::System& system, Match& match)
     return false;
   }
   nand->ReloadFst();
-  const int frame = match.running + 1;
+  const int frame = image->frame;
   if (!match.port->LoadImage(std::move(image->image), frame))
   {
     StopEmulation(system, "Couldn't go back to your own game");
@@ -1922,6 +1940,8 @@ bool MaybeRestoreQueueImage(Core::System& system, Match& match)
   Orca::UX::Rules::MemoryReplaced();
   match.log.clear();
   match.log_base = frame;
+  match.running = frame - 1;
+  match.replay = std::move(image->replay);
   match.queued_local.clear();
   match.keyframe.reset();
   // This player's own game plays port 1, and a room of its own opens (a former joiner had none).
@@ -2747,8 +2767,6 @@ std::optional<int> Boundary(Core::System& system,
       Orca::Status::State("joining 0");
       match.port = std::make_unique<RingPort>(system, MAX_ROLLBACK);
       match.port->SetCatchingUp(true);
-      if (const Orca::Profile* profile = Orca::ActiveProfile(); profile && profile->boot_nand_frame)
-        match.boot_ahead_to = static_cast<int>(*profile->boot_nand_frame);
     }
     else
     {
@@ -2756,11 +2774,48 @@ std::optional<int> Boundary(Core::System& system,
       Orca::Status::State("playing");
       NOTICE_LOG_FMT(ROLLBACK, "Drop-in: playing solo on port 1; room {}", Orca::Online::StatusLine());
     }
+    system.GetJitInterface().ClearSafe();
+    IOS::HLE::FS::HostFileSystem* nand = HostNand(system);
+    if (nand)
+      nand->CloseHostFiles();
+    const bool origin_ok = nand && Core::WiiRootIsTemporary() &&
+                           Orca::Net::ReadNandTree(nand->HostRoot(), &match.origin_nand);
+    if (nand)
+      nand->ReopenHostFiles();
+    if (!origin_ok || !SnapshotRing::Capture(system, &match.origin, true))
+    {
+      StopEmulation(system, "Couldn't prepare this game's local replay origin");
+      End("replay origin");
+      return std::nullopt;
+    }
+    match.replay.origin_hash = RamChecksum(match.origin.mem1, match.origin.mem2);
+  }
+
+  Orca::Net::ReplayRecordingScope recording(&match.replay);
+  bool replay_boundary = false;
+  if (match.replaying)
+  {
+    switch (AdvanceReplay(system, match, on_frame))
+    {
+    case ReplayStep::Running:
+      return std::nullopt;
+    case ReplayStep::Failed:
+      if (match.finished)
+        return std::nullopt;
+      rewound_to = match.running + 1;
+      RunSolo(match, local_pad);
+      return rewound_to;
+    case ReplayStep::Done:
+      replay_boundary = true;
+      rewound_to = match.running + 1;
+      break;
+    }
   }
 
   // Once a queue room is over, restore this player's own game first, so this boundary's hook
   // already sees its own character select.
-  MaybeRestoreQueueImage(system, match);
+  if (MaybeRestoreQueueImage(system, match))
+    rewound_to = match.running + 1;
 
   // The header this game's room calls for, written only where HeaderFreeAt allows.
   UpdateWanted(match);
@@ -2770,10 +2825,24 @@ std::optional<int> Boundary(Core::System& system,
                    match.keyframe ? std::optional(match.keyframe->frame) : std::nullopt));
 
   // The in-game UI's frame hook, before the snapshot or keyframe so they capture its writes.
+  if (!replay_boundary)
   {
     const int frame = match.running + 1;
     const bool resimulating = match.session && match.session->Resimulating();
     const std::vector<Orca::Events::PortInfo> ports = PortsAt(match, frame);
+    auto* record = Orca::Net::ReplayRecordingScope::Frame(frame);
+    if (record)
+    {
+      auto canonical = ports;
+      for (auto& port : canonical)
+        port.remote = false;
+      if (frame > 0 && match.replay.frames[frame - 1].ports &&
+          *match.replay.frames[frame - 1].ports == canonical)
+        record->ports = match.replay.frames[frame - 1].ports;
+      else
+        record->ports = std::make_shared<const std::vector<Orca::Events::PortInfo>>(std::move(canonical));
+    }
+    Orca::Net::ReplayScope replay_scope(record, resimulating);
     on_frame(frame, resimulating, ports,
              !resimulating &&
                  AloneAt(frame, SoloIdle(match), Orca::Online::DropInPending(),
@@ -2790,7 +2859,10 @@ std::optional<int> Boundary(Core::System& system,
   if (match.want_queue_image)
     CaptureQueueImage(system, match);
   else
-    MaybeRestoreQueueImage(system, match);
+  {
+    if (MaybeRestoreQueueImage(system, match))
+      rewound_to = match.running + 1;
+  }
   // After the app's commands and the frame hook: a Casual or Ranked pick made with friends, a kept
   // pick to arm, a former joiner's way home, then "no-room" for one that didn't come home.
   TakeLobbyPickNow(match);
@@ -2831,36 +2903,27 @@ std::optional<int> Boundary(Core::System& system,
   }
   else if (match.joining && !match.session)
   {
-    if (match.running + 1 < match.boot_ahead_to)
+    rewound_to = JoinHost(system, match);
+    // Failed (with "caps join" this player now plays solo), or stopping.
+    if (!rewound_to && (match.joining || match.finished || Stopping(system)))
+      return std::nullopt;
+  }
+
+  if (match.replaying)
+  {
+    const auto step = AdvanceReplay(system, match, on_frame);
+    if (step == ReplayStep::Failed && !match.finished)
     {
-      if (PumpJoin(match, &match.join_status) == JoinPump::Failed)
-      {
-        FailJoin(system, match);
-        if (match.finished)
-          return std::nullopt;
-      }
-      else
-      {
-        Pads pads;
-        pads.fill(Orca::Net::UNPLUGGED_PAD);
-        pads[0] = Pad{};
-        match.port->SetPads(match.running + 1, pads);
-        ++match.running;
-        return std::nullopt;
-      }
+      rewound_to = match.running + 1;
+      RunSolo(match, local_pad);
     }
-    else
-    {
-      rewound_to = JoinHost(system, match);
-      // Failed (with "caps join" this player now plays solo), or stopping.
-      if (!rewound_to && (match.joining || match.finished || Stopping(system)))
-        return std::nullopt;
-    }
+    if (step != ReplayStep::Done)
+      return rewound_to;
   }
 
   if (!match.joining)
   {
-    MaybeHashBootNand(system, match);
+
     Linger(match);
     if (!Stopping(system))
       KeepRoomOpen(match);
@@ -2980,7 +3043,15 @@ std::optional<int> Boundary(Core::System& system,
       match.stats_rbmax = std::max(match.stats_rbmax, running_before - step.frame + 1);
       // The loaded snapshot holds the hook's writes made with the ports known then, and the
       // rollback may be due to those ports changing. Rerun the hook for the frame landed on.
-      on_frame(step.frame, true, PortsAt(match, step.frame), false);
+      auto* record = Orca::Net::ReplayRecordingScope::Frame(step.frame);
+      auto ports = PortsAt(match, step.frame);
+      auto canonical = ports;
+      for (auto& port : canonical)
+        port.remote = false;
+      if (record)
+        record->ports = std::make_shared<const std::vector<Orca::Events::PortInfo>>(std::move(canonical));
+      Orca::Net::ReplayScope replay_scope(record, true);
+      on_frame(step.frame, true, ports, false);
     }
     if (step.kind == Orca::Net::StepKind::Run || step.kind == Orca::Net::StepKind::Rollback)
     {
@@ -3307,6 +3378,7 @@ std::optional<int> OnBoundary(Core::System& system,
                               const FrameHook& on_frame)
 {
   s_solo_idle = false;
+  const bool was_replaying = TheMatch().replaying != nullptr;
   // The local pad as this boundary read it for the game (for SetOverLeave).
   const std::function<Orca::Net::Pad(int)> seen = [&local_pad](int local_seat) {
     const Orca::Net::Pad pad = local_pad(local_seat);
@@ -3314,6 +3386,11 @@ std::optional<int> OnBoundary(Core::System& system,
     return pad;
   };
   const std::optional<int> rewound_to = Boundary(system, seen, on_frame);
+  if (TheMatch().replaying || (was_replaying && !TheMatch().session))
+  {
+    s_solo_idle = SoloIdle(TheMatch());
+    return rewound_to;
+  }
   ConfirmResults(TheMatch());
   NoteRankedFight(TheMatch());
   SetOverLeave(TheMatch());
@@ -3367,6 +3444,7 @@ void End(const char* reason)
   match.session.reset();
   match.port.reset();
   match.download.reset();
+  match.replaying.reset();
   match.job.reset();
   if (match.keyframe && match.store)
     match.store->Delete(match.keyframe->id);

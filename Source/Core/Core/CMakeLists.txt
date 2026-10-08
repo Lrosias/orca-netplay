@@ -981,6 +981,11 @@ if(NOT MSVC)
   get_target_property(ORCA_DETERMINISTIC_SOURCES core SOURCES)
   list(FILTER ORCA_DETERMINISTIC_SOURCES INCLUDE REGEX "^(Orca|Rollback)/.*\\.cpp$")
   set_property(SOURCE ${ORCA_DETERMINISTIC_SOURCES} APPEND PROPERTY COMPILE_OPTIONS -ffp-contract=off)
+  # The replay codec and the threads that pack and unpack replays catch their own size and
+  # allocation failures (try/catch, as MSVC's /EHsc builds them); the rest of a non-MSVC build has
+  # -fno-exceptions.
+  set_property(SOURCE Orca/Session/Keyframe.cpp Rollback/OnlineMatch.cpp APPEND PROPERTY
+               COMPILE_OPTIONS -fexceptions)
 endif()
 
 if(USE_RETRO_ACHIEVEMENTS)

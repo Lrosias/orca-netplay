@@ -17,6 +17,7 @@
 #include "Common/Logging/Log.h"
 #include "Core/Orca/Profile.h"
 #include "Core/Orca/Session/Events.h"
+#include "Core/Orca/Session/Replay.h"
 #include "Core/Orca/Status.h"
 #include "Core/Orca/UX/CharOrder.h"
 #include "Core/Orca/UX/NameTags.h"
@@ -1004,6 +1005,12 @@ void ConfirmTimeout(int confirmed, int local_port)
   }
 }
 
+void ResetTimeouts()
+{
+  Timeouts() = {};
+  s_last_timeout_mine = false;
+}
+
 void Frame(const Core::CPUThreadGuard& guard, int frame, bool resimulating,
            const std::vector<Events::PortInfo>& ports, bool alone)
 {
@@ -1012,8 +1019,12 @@ void Frame(const Core::CPUThreadGuard& guard, int frame, bool resimulating,
   GuardMemory m(guard);
   // After a room that should not keep this player ready, clear ready at a solo frame.
   std::string cleared;
-  if (alone && !resimulating && s_clear_ready.exchange(false))
+  const bool replay_clear = Orca::Net::ReplayScope::Playing() &&
+                            Orca::Net::ReplayScope::Current()->clear_ready;
+  if (replay_clear || (alone && !resimulating && s_clear_ready.exchange(false)))
   {
+    if (auto* replay = Orca::Net::ReplayScope::Current(); replay && !Orca::Net::ReplayScope::Playing())
+      replay->clear_ready = true;
     const Rules::Header h = Rules::ReadHeader(m);
     if (h.Solo() && RegionMapped(m))
     {
@@ -1067,9 +1078,17 @@ void Frame(const Core::CPUThreadGuard& guard, int frame, bool resimulating,
   }
   if (frame > t.last_frame)
   {
-    t.pending[frame] = (after.flags & FLAG_TIMED_OUT) && v.queue2 && !v.solo ?
-                           static_cast<u8>(0x80 | (after.timeout_who & 3)) :
-                           0;
+    const u8 value = (after.flags & FLAG_TIMED_OUT) && v.queue2 && !v.solo ?
+                         static_cast<u8>(0x80 | (after.timeout_who & 3)) : 0;
+    if (Orca::Net::ReplayScope::NetworkPlaying())
+    {
+      t.pending.clear();
+      t.last = value;
+      t.last_frame = frame;
+      s_last_timeout_mine = false;
+    }
+    else
+      t.pending[frame] = value;
     while (t.pending.size() > 4096)
       t.pending.erase(t.pending.begin());
   }

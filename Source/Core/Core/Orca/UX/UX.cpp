@@ -142,10 +142,6 @@ void Init()
     // Local display only. The overlay matches the session's game.
     Kit::SetLook(Rules::ProfileRuleset() == Rules::Ruleset::PPlus ? Kit::Look::ProjectPlus :
                                                                     Kit::Look::Brawl);
-    // Read only, first runs only (it keeps and prints changes). Captures this player's own controls
-    // while playing alone, so the session can carry them into a game it joins or hosts.
-    if (alone && !resimulating)
-      ReadOwnControlsFrame(guard, ports);
     // Test only, ORCA_UX_TEST_LATE_NAME=<frame>. Simulates a friend's name arriving late: first
     // runs before that frame see it empty and re-runs see it, to show the desync the session's
     // synced value channel prevents.
@@ -154,9 +150,11 @@ void Init()
       return v ? std::atoi(v) : -1;
     }();
     // Checked every frame because a host that boots solo can have a friend join later.
-    if (s_late >= 0 && !resimulating && frame < s_late && TestKnobsAllowed())
+    std::vector<Orca::Events::PortInfo> early;
+    const bool late = s_late >= 0 && !resimulating && frame < s_late && TestKnobsAllowed();
+    if (late)
     {
-      std::vector<Orca::Events::PortInfo> early = ports;
+      early = ports;
       // PortInfo.remote differs per machine: the friend is whoever is not on port 1.
       for (Orca::Events::PortInfo& p : early)
       {
@@ -166,12 +164,12 @@ void Init()
           p.controls.clear();
         }
       }
-      WriteNameTags(guard, early);
     }
-    else
-    {
-      WriteNameTags(guard, ports);
-    }
+    // The name tags, then (read only, first runs only, while playing alone: it keeps and prints
+    // changes) this player's own controls, so the session can carry them into a game it joins or
+    // hosts. The read comes after the writes so it never mistakes a tag Orca is about to give
+    // their controls for a change back to the game's defaults.
+    NameTagsFrameHook(guard, late ? early : ports, ports, alone && !resimulating);
     // The online rules: rule, stage and ready-timer locks for queue rooms.
     u8 plugged = 0;
     for (const Orca::Events::PortInfo& p : ports)

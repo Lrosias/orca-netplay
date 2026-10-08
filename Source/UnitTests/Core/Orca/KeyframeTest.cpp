@@ -3,115 +3,224 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <zstd.h>
 
 #include "Common/FileUtil.h"
 #include "Common/IOFile.h"
-
 #include "Core/Orca/Session/Keyframe.h"
 
 using namespace Orca::Net;
 
 namespace
 {
-Rollback::MachineImage Image(u32 seed, size_t ram)
+ReplayArchive Replay(size_t count)
 {
-  std::mt19937 rng(seed);
-  Rollback::MachineImage image;
-  image.state.resize(70000);
-  image.mem1.resize(ram);
-  image.mem2.resize(ram * 2);
-  image.l1_cache.resize(16384);
-  for (auto* v : {&image.state, &image.mem1, &image.mem2, &image.l1_cache})
+  ReplayArchive replay;
+  replay.origin_hash = 0x123456789abcdef0;
+  replay.target_hash = 0xfedcba9876543210;
+  auto ports = std::make_shared<const std::vector<Orca::Events::PortInfo>>(
+      std::vector<Orca::Events::PortInfo>{{0, "player", false, {1, 2, 3}, {4, 5}},
+                                        {2, "friend", true, {6, 7}, {8}}});
+  std::mt19937 rng(1);
+  replay.frames.resize(count);
+  for (auto& frame : replay.frames)
   {
-    // Compressible, like RAM: runs of one random byte.
-    for (size_t i = 0; i < v->size(); i += 64)
-      std::fill(v->begin() + i, v->begin() + std::min(v->size(), i + 64), static_cast<u8>(rng()));
+    for (auto& pad : frame.pads)
+      for (auto& byte : pad)
+        byte = static_cast<u8>(rng());
+    frame.ports = ports;
   }
-  return image;
+  replay.boundary.ports = ports;
+  replay.boundary.header = ReplayHeader{2, 1, 1, 2, 0x11223344};
+  replay.boundary.clear_ready = true;
+  return replay;
 }
 
-std::vector<NandEntry> Nand()
+std::vector<u8> Raw(const std::vector<u8>& blob)
 {
-  return {{"shared2", true, {}},
-          {"title/00010000/52534245/data/autosv0.bin", false, std::vector<u8>(5000, 7)},
-          {"tmp/2d13", false, std::vector<u8>{1, 2, 3}},
-          {"fst.bin", false, {}}};
+  std::vector<u8> raw(ZSTD_getFrameContentSize(blob.data(), blob.size()));
+  EXPECT_EQ(ZSTD_decompress(raw.data(), raw.size(), blob.data(), blob.size()), raw.size());
+  return raw;
+}
+
+std::vector<u8> Compressed(const std::vector<u8>& raw)
+{
+  std::vector<u8> blob(ZSTD_compressBound(raw.size()));
+  const auto size = ZSTD_compress(blob.data(), blob.size(), raw.data(), raw.size(), 1);
+  EXPECT_FALSE(ZSTD_isError(size));
+  blob.resize(size);
+  return blob;
+}
+
+void U32(std::vector<u8>& raw, size_t offset, u32 value)
+{
+  std::memcpy(raw.data() + offset, &value, sizeof(value));
 }
 }  // namespace
 
-TEST(OrcaKeyframe, PackUnpackRoundTrips)
+TEST(OrcaKeyframe, ReplayRoundTripsInputsAndTypedEvents)
 {
-  const auto image = Image(1, 1 << 20);
-  const std::vector<u8> blob = PackKeyframe(4321, image, Nand());
+  auto original = Replay(4321);
+  original.frames[42].header = ReplayHeader{1, 2, 0, 3, 55};
+  original.frames[99].clear_ready = true;
+  const auto blob = PackKeyframe(4321, original);
   ASSERT_FALSE(blob.empty());
-  EXPECT_LT(blob.size(), image.mem1.size());
-  EXPECT_EQ(KeyframeHash(blob).size(), 16u);
-  int frame = 0;
-  Rollback::MachineImage got;
-  std::vector<NandEntry> nand;
-  ASSERT_TRUE(UnpackKeyframe(blob, &frame, &got, &nand));
+  int frame = -1;
+  ReplayArchive decoded;
+  ASSERT_TRUE(UnpackKeyframe(blob, &frame, &decoded));
   EXPECT_EQ(frame, 4321);
-  EXPECT_EQ(got.state, image.state);
-  EXPECT_EQ(got.mem1, image.mem1);
-  EXPECT_EQ(got.mem2, image.mem2);
-  EXPECT_EQ(got.l1_cache, image.l1_cache);
-  ASSERT_EQ(nand.size(), Nand().size());
-  for (size_t i = 0; i < nand.size(); ++i)
+  EXPECT_EQ(decoded.origin_hash, original.origin_hash);
+  EXPECT_EQ(decoded.target_hash, original.target_hash);
+  ASSERT_EQ(decoded.frames.size(), original.frames.size());
+  for (size_t i = 0; i < decoded.frames.size(); ++i)
   {
-    EXPECT_EQ(nand[i].path, Nand()[i].path);
-    EXPECT_EQ(nand[i].directory, Nand()[i].directory);
-    EXPECT_EQ(nand[i].data, Nand()[i].data);
+    EXPECT_EQ(decoded.frames[i].pads, original.frames[i].pads);
+    EXPECT_EQ(decoded.frames[i].header, original.frames[i].header);
+    EXPECT_EQ(decoded.frames[i].clear_ready, original.frames[i].clear_ready);
+    EXPECT_EQ(decoded.frames[i].ports->at(0).controls, original.frames[i].ports->at(0).controls);
+    EXPECT_EQ(decoded.frames[i].ports->at(1).queue, original.frames[i].ports->at(1).queue);
   }
+  EXPECT_EQ(decoded.frames[0].ports, decoded.frames[1].ports);
+  EXPECT_EQ(decoded.boundary.header, original.boundary.header);
+  EXPECT_TRUE(decoded.boundary.clear_ready);
 }
 
-TEST(OrcaKeyframe, RefusesDamagedAndHostileKeyframes)
+TEST(OrcaKeyframe, RejectsLegacyStatesTruncationAndTrailingData)
 {
-  std::vector<u8> blob = PackKeyframe(10, Image(2, 4096), Nand());
-  int frame;
-  Rollback::MachineImage image;
-  std::vector<NandEntry> nand;
-  std::vector<u8> cut(blob.begin(), blob.begin() + blob.size() / 2);
-  EXPECT_FALSE(UnpackKeyframe(cut, &frame, &image, &nand));
-  blob[blob.size() / 2] ^= 0xff;
-  EXPECT_FALSE(UnpackKeyframe(blob, &frame, &image, &nand));
-  // Paths that would leave the NAND's folder never unpack.
-  for (const std::string path : {"../etc/passwd", "/abs", "a/../b", "a//b", ""})
+  const auto blob = PackKeyframe(2, Replay(2));
+  auto raw = Raw(blob);
+  int frame = 77;
+  ReplayArchive decoded;
+  decoded.origin_hash = 99;
+  for (size_t n = 0; n < raw.size(); ++n)
   {
-    std::vector<NandEntry> bad = {{path, false, {1}}};
-    const std::vector<u8> packed = PackKeyframe(1, Image(3, 4096), bad);
-    EXPECT_FALSE(UnpackKeyframe(packed, &frame, &image, &nand)) << path;
+    const std::vector<u8> truncated(raw.begin(), raw.begin() + n);
+    EXPECT_FALSE(UnpackKeyframe(Compressed(truncated), &frame, &decoded));
+  }
+  EXPECT_EQ(frame, 77);
+  EXPECT_EQ(decoded.origin_hash, 99);
+  std::memcpy(raw.data(), "OKF2", 4);
+  EXPECT_FALSE(UnpackKeyframe(Compressed(raw), &frame, &decoded));
+  raw = Raw(blob);
+  raw.push_back(0);
+  EXPECT_FALSE(UnpackKeyframe(Compressed(raw), &frame, &decoded));
+}
+
+TEST(OrcaKeyframe, BoundsCountsSeatsAndPayloadLengthsBeforeAllocation)
+{
+  const auto blob = PackKeyframe(1, Replay(1));
+  const auto original = Raw(blob);
+  int frame;
+  ReplayArchive decoded;
+  // Archive count, port count, first seat, name length, controls length, second seat.
+  for (const auto [offset, value] : std::vector<std::pair<size_t, u32>>{
+           {4, 0xffffffff}, {56, 0xffffffff}, {60, 4}, {64, 129}, {74, 65}, {95, 0}})
+  {
+    auto raw = original;
+    U32(raw, offset, value);
+    EXPECT_FALSE(UnpackKeyframe(Compressed(raw), &frame, &decoded)) << offset;
   }
 }
 
-// Encryption: the store only ever holds ciphertext; the right key and frame open it, nothing else.
+TEST(OrcaKeyframe, BoundsDecompressionAndTypedHeaderValues)
+{
+  int frame;
+  ReplayArchive decoded;
+  std::vector<u8> oversized((64 << 20) + 1, 0);
+  EXPECT_FALSE(UnpackKeyframe(Compressed(oversized), &frame, &decoded));
+  auto replay = Replay(0);
+  replay.boundary.ports = std::make_shared<const std::vector<Orca::Events::PortInfo>>();
+  const auto original = Raw(PackKeyframe(0, replay));
+  // Header presence, mode, ruleset, coin, flags, and clear-ready presence.
+  for (const auto [offset, value] : std::vector<std::pair<size_t, u32>>{
+           {60, 2}, {64, 3}, {68, 3}, {72, 2}, {76, 4}, {84, 2}})
+  {
+    auto raw = original;
+    U32(raw, offset, value);
+    EXPECT_FALSE(UnpackKeyframe(Compressed(raw), &frame, &decoded)) << offset;
+  }
+}
+
+TEST(OrcaKeyframe, ReplayRecordingRetainsWinningInputsAndEventsAcrossRollback)
+{
+  ReplayArchive archive;
+  ReplayRecordingScope recording(&archive);
+  auto* frame = ReplayRecordingScope::Frame(0);
+  frame->header = ReplayHeader{1, 1, 0, 0, 7};
+  frame->clear_ready = true;
+  Pads predicted{};
+  ReplayRecordingScope::RecordPads(0, predicted);
+  Pads corrected{};
+  corrected[2][3] = 99;
+  ReplayRecordingScope::RecordPads(0, corrected);
+  ASSERT_EQ(archive.frames.size(), 1u);
+  EXPECT_EQ(archive.frames[0].pads, corrected);
+  EXPECT_TRUE(archive.frames[0].clear_ready);
+  EXPECT_EQ(archive.frames[0].header->room, 7u);
+  EXPECT_EQ(ReplayRecordingScope::Frame(MAX_REPLAY_FRAMES + 1), nullptr);
+}
+
+TEST(OrcaKeyframe, BoundsDecodedMetadataWhenCompressedDataIsSmall)
+{
+  ReplayArchive replay;
+  replay.boundary.ports = std::make_shared<const std::vector<Orca::Events::PortInfo>>(
+      std::vector<Orca::Events::PortInfo>{{0, "a", false, {}, {}}, {1, "b", false, {}, {}},
+                                        {2, "c", false, {}, {}}, {3, "d", false, {}, {}}});
+  const auto single = Raw(PackKeyframe(0, replay));
+  constexpr u32 count = 80000;
+  const size_t record_size = single.size() - 24;
+  std::vector<u8> raw(24 + (count + 1) * record_size);
+  std::copy_n(single.begin(), 24, raw.begin());
+  U32(raw, 4, count);
+  for (u32 i = 0; i <= count; ++i)
+  {
+    std::copy(single.begin() + 24, single.end(), raw.begin() + 24 + i * record_size);
+    raw[24 + i * record_size + 44] = static_cast<u8>('a' + i % 26);
+  }
+  const auto blob = Compressed(raw);
+  EXPECT_LT(blob.size(), 1u << 20);
+  int frame = -1;
+  ReplayArchive decoded;
+  EXPECT_FALSE(UnpackKeyframe(blob, &frame, &decoded));
+  EXPECT_EQ(frame, -1);
+}
+
+TEST(OrcaKeyframe, RejectsLegacyAndRedirectingDownloadIds)
+{
+  EXPECT_TRUE(ValidReplayId("replay-0-01234567"));
+  EXPECT_TRUE(ValidReplayId("replay-216000-abcdef01"));
+  for (const std::string id : {"kf-1-01234567", "../thumb?u=host", "replay-01-01234567",
+                               "replay-216001-01234567", "replay-1-0123456g",
+                               "replay-1-01234567?u=host", "replay-1-01234567/../x"})
+    EXPECT_FALSE(ValidReplayId(id)) << id;
+}
+
 TEST(OrcaKeyframe, EncryptionRoundTripsAndRefusesTampering)
 {
-  const std::vector<u8> packed = PackKeyframe(77, Image(5, 8192), Nand());
+  const std::vector<u8> packed = PackKeyframe(77, Replay(77));
   std::vector<u8> sealed = packed;
   std::string key;
   ASSERT_TRUE(EncryptKeyframe(77, &sealed, &key));
   EXPECT_EQ(key.size(), 64u);
   EXPECT_EQ(sealed.size(), packed.size() + 28);
-  EXPECT_EQ(std::search(sealed.begin(), sealed.end(), packed.begin() + 8, packed.begin() + 40),
-            sealed.end());
   std::string other_key;
   std::vector<u8> twice = packed;
   ASSERT_TRUE(EncryptKeyframe(77, &twice, &other_key));
   EXPECT_NE(key, other_key);
   EXPECT_NE(twice, sealed);
-
   std::vector<u8> opened = sealed;
   ASSERT_TRUE(DecryptKeyframe(77, key, &opened));
   EXPECT_EQ(opened, packed);
   opened = sealed;
   EXPECT_FALSE(DecryptKeyframe(77, other_key, &opened));
   opened = sealed;
-  EXPECT_FALSE(DecryptKeyframe(78, key, &opened)) << "the frame is authenticated";
+  EXPECT_FALSE(DecryptKeyframe(78, key, &opened));
   opened = sealed;
   opened[opened.size() / 2] ^= 1;
   EXPECT_FALSE(DecryptKeyframe(77, key, &opened));
@@ -151,7 +260,7 @@ TEST(OrcaKeyframe, HttpStoreAgainstAFakeServer)
     for (u8& b : blob)
       b = static_cast<u8>(rng());
     const std::string hash = KeyframeHash(blob);
-    KeyframeInfo info{1200, "kf-1200-" + hash.substr(0, 8), blob.size(), hash, ""};
+    KeyframeInfo info{1200, "replay-1200-" + hash.substr(0, 8), blob.size(), hash, ""};
     std::string error;
     ASSERT_TRUE(store->Put(info, blob, &error)) << error;
     EXPECT_EQ(minted, 1);
@@ -188,7 +297,7 @@ TEST(OrcaKeyframe, HttpStoreAgainstAFakeServer)
     auto putter = store_for("room2", "good", "good");
     const std::vector<u8> blob(50000, 3);
     const std::string hash = KeyframeHash(blob);
-    const KeyframeInfo info{7, "kf-7-" + hash.substr(0, 8), blob.size(), hash, ""};
+    const KeyframeInfo info{7, "replay-7-" + hash.substr(0, 8), blob.size(), hash, ""};
     std::string error;
     ASSERT_TRUE(putter->Put(info, blob, &error)) << error;
     minted = 0;
@@ -209,7 +318,7 @@ TEST(OrcaKeyframe, HttpStoreAgainstAFakeServer)
     const std::vector<u8> blob(1000, 2);
     const std::string hash = KeyframeHash(blob);
     std::string error;
-    EXPECT_FALSE(store->Put({3, "kf-3-" + hash.substr(0, 8), blob.size(), hash, ""}, blob, &error));
+    EXPECT_FALSE(store->Put({3, "replay-3-" + hash.substr(0, 8), blob.size(), hash, ""}, blob, &error));
     EXPECT_EQ(error, "cancelled");
     EXPECT_EQ(LastRefusal(), "");
   }
@@ -218,7 +327,7 @@ TEST(OrcaKeyframe, HttpStoreAgainstAFakeServer)
   {
     const std::vector<u8> blob(2000, 4);
     const std::string hash = KeyframeHash(blob);
-    const KeyframeInfo info{9, "kf-9-" + hash.substr(0, 8), blob.size(), hash, ""};
+    const KeyframeInfo info{9, "replay-9-" + hash.substr(0, 8), blob.size(), hash, ""};
     std::string error;
     minted = 0;
     ASSERT_TRUE(store_for("room3", "guest", "good")->Put(info, blob, &error)) << error;
@@ -238,47 +347,7 @@ TEST(OrcaKeyframe, HttpStoreAgainstAFakeServer)
   std::string error;
   const std::vector<u8> blob(1000, 1);
   const std::string hash = KeyframeHash(blob);
-  EXPECT_FALSE(refused->Put({1, "kf-1-" + hash.substr(0, 8), blob.size(), hash, ""}, blob, &error));
+  EXPECT_FALSE(refused->Put({1, "replay-1-" + hash.substr(0, 8), blob.size(), hash, ""}, blob, &error));
   EXPECT_NE(error.find("401"), std::string::npos) << error;
   EXPECT_EQ(LastRefusal(), "ticket");
-}
-
-// NAND files the joiner's own boot writes travel as hashes: the joiner fills them in from its NAND
-// and refuses a keyframe whose named file it lacks or holds differently.
-TEST(OrcaKeyframe, NandReferencesResolveFromTheJoinersOwnNand)
-{
-  const std::string root = File::CreateTempDir();
-  ASSERT_FALSE(root.empty());
-  const std::vector<u8> pack(200000, 9);
-  File::CreateFullPath(root + "/tmp/");
-  File::IOFile(root + "/tmp/2d13", "wb").WriteBytes(pack.data(), pack.size());
-
-  std::vector<NandEntry> nand = Nand();
-  nand.push_back({"tmp/2d13", false, {}, true, NandHash(pack)});
-  const std::vector<u8> with_reference = PackKeyframe(5, Image(4, 4096), nand);
-  std::vector<NandEntry> full = Nand();
-  full.push_back({"tmp/2d13", false, pack, false, 0});
-  EXPECT_LT(with_reference.size(), PackKeyframe(5, Image(4, 4096), full).size())
-      << "a reference costs a hash, not the file";
-
-  int frame;
-  Rollback::MachineImage image;
-  std::vector<NandEntry> got;
-  ASSERT_TRUE(UnpackKeyframe(with_reference, &frame, &image, &got));
-  ASSERT_TRUE(got.back().reference);
-  std::string error;
-  ASSERT_TRUE(ResolveNandReferences(root, &got, &error)) << error;
-  EXPECT_FALSE(got.back().reference);
-  EXPECT_EQ(got.back().data, pack);
-
-  // A different file, or none, refuses.
-  ASSERT_TRUE(UnpackKeyframe(with_reference, &frame, &image, &got));
-  const std::vector<u8> other(200000, 8);
-  File::IOFile(root + "/tmp/2d13", "wb").WriteBytes(other.data(), other.size());
-  EXPECT_FALSE(ResolveNandReferences(root, &got, &error));
-  EXPECT_NE(error.find("differs"), std::string::npos) << error;
-  File::Delete(root + "/tmp/2d13");
-  EXPECT_FALSE(ResolveNandReferences(root, &got, &error));
-  EXPECT_NE(error.find("missing"), std::string::npos) << error;
-  File::DeleteDirRecursively(root);
 }

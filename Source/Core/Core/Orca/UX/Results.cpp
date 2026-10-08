@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "Core/Orca/UX/Results.h"
+#include "Core/Orca/Session/Replay.h"
 
 #include <atomic>
 
@@ -231,6 +232,21 @@ void ResultsTracker::Store(int frame, const Reading& reading, u64 resyncs)
     m_pending.erase(m_pending.begin());
 }
 
+void ResultsTracker::Rebase(int frame, const Reading& reading, u64 resyncs)
+{
+  Reset();
+  m_started = true;
+  m_resyncs = resyncs;
+  m_have_last = true;
+  m_last_frame = frame;
+  m_last = reading;
+  if (reading.set)
+  {
+    m_have_set = true;
+    m_set_games = reading.set->games;
+  }
+}
+
 std::vector<GameResult> ResultsTracker::Confirm(int confirmed, int plug_frame)
 {
   using Scene = Reading::Scene;
@@ -355,7 +371,10 @@ void ReadResultsFrame(const Core::CPUThreadGuard& guard, int frame)
   {
     reading.set = SetBlock::ReadSet(memory);
   }
-  Tracker().Store(frame, reading, Orca::Events::Resyncs());
+  if (Orca::Net::ReplayScope::NetworkPlaying())
+    Tracker().Rebase(frame, reading, Orca::Events::Resyncs());
+  else
+    Tracker().Store(frame, reading, Orca::Events::Resyncs());
 }
 
 void RequestQueueRules()

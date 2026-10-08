@@ -8,6 +8,7 @@
 
 #include "VideoCommon/OnScreenUIKeyMap.h"
 #include "VideoCommon/PresentLayout.h"
+#include "VideoCommon/PresentPacing.h"
 #include "VideoCommon/TextureCacheBase.h"
 #include "VideoCommon/TextureConfig.h"
 #include "VideoCommon/VideoCommon.h"
@@ -39,7 +40,9 @@ public:
 
   void ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height, u64 ticks,
               TimePoint presentation_time);
-  void ImmediateSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height);
+  // Orca: `redisplay` is a state load showing its frame again, due at once.
+  void ImmediateSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height,
+                     bool redisplay = false);
 
   void SetNextSwapEstimatedTime(u64 ticks, TimePoint host_time);
 
@@ -222,6 +225,8 @@ private:
 
   // Used by the SmoothEarlyPresentation setting.
   DT m_presentation_time_offset{};
+  // Orca: SmoothEarlyPresentation's rule for Immediate XFB frames.
+  PresentPacer m_present_pacer;
 
   // Calculated from the previous swap time and current refresh rate.
   // Can be used for presentation of ImmediateXFB swaps which don't have timing information.

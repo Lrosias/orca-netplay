@@ -167,10 +167,12 @@ void ForEachUniversalSetting(F&& f)
   // nothing in single core. Brawl and P+ make one XFB copy per frame, so CapImmediateXFB stays off.
   // See ORCA.md, "Input latency".
   f(Config::GFX_HACK_IMMEDIATE_XFB, true);
-  // Smooth Early Presentation evens out Immediate XFB's present times by about 2 ms, which cuts
-  // repeated and dropped refreshes on a 60 Hz screen during rollbacks and link spikes. Host-side
-  // only.
+  // Smooth Early Presentation: Immediate XFB frames are shown at a steady offset from their VI time
+  // that covers the usual rollback re-run (VideoCommon/PresentPacing.h), so with the v-sync move's
+  // early copy a re-run doesn't move the picture. Host-side only.
   f(Config::MAIN_SMOOTH_EARLY_PRESENTATION, true);
+  // Those presents wait until a set time: sleep to it precisely (Dolphin's default). Host-only.
+  f(Config::MAIN_PRECISION_FRAME_TIMING, true);
   // VSync adds 2-19 ms of display latency with no pacing gain (a composited window never tears)
   // and, below 60 Hz, would slow the game: always off in a session, whatever GFX.ini says.
   f(Config::GFX_VSYNC, false);

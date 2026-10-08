@@ -141,6 +141,8 @@ public:
   // finish, in order.
   std::vector<GameResult> Confirm(int confirmed, int plug_frame);
   void Reset();
+  // Baseline a reconstructed frame without reporting games that happened before joining.
+  void Rebase(int frame, const Reading& reading, u64 resyncs);
   // Scene of the last final reading, and of the newest (possibly predicted) reading.
   std::optional<Reading::Scene> FinalScene() const;
   std::optional<Reading::Scene> LatestScene() const;

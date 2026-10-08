@@ -28,6 +28,7 @@
 #include "Core/Orca/Profile.h"
 #include "Core/Orca/Session/DirectLink.h"
 #include "Core/Orca/Session/Online.h"
+#include "Core/Orca/Session/Replay.h"
 #include "Core/Orca/Status.h"
 #include "Core/Orca/UX/Overlay.h"
 #include "Core/Orca/UX/Queue.h"
@@ -2955,6 +2956,8 @@ struct YouGameRoom::Impl
         End("Your friend needs to sign in to YouGame to share their game", "signed_out");
       else if (reason == "refused")
         End("YouGame couldn't pass your friend's game to you", "network");
+      else if (reason == "room_full")
+        End("Your friend's game already has another friend in it", "room_full");
       else
         End("Your friend's game disconnected you", "network");
       return;
@@ -3039,8 +3042,9 @@ struct YouGameRoom::Impl
       info.id = Str(d, "id");
       info.hash = Str(d, "x");
       info.key = Str(d, "key");
-      if (!frame || !size || info.id.empty() || info.id.size() > 128 || info.hash.size() > 64 ||
-          info.key.size() != 64)
+      if (!frame || *frame > MAX_REPLAY_FRAMES || !size || !ValidReplayId(info.id) ||
+          info.hash.size() != 16 || info.key.size() != 64 ||
+          info.id != fmt::format("replay-{}-{}", *frame, info.hash.substr(0, 8)))
       {
         return;
       }

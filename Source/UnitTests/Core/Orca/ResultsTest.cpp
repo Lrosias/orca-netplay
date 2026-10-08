@@ -290,6 +290,23 @@ TEST(OrcaResults, AFightRunningWhenTheOpponentPluggedInNeverCounts)
   EXPECT_EQ(t.out.size(), 1u);
 }
 
+TEST(OrcaResults, ReconstructedHistoryNeverReportsOldResults)
+{
+  ResultsTracker tracker;
+  tracker.Store(1, At(Scene::Fight), 0);
+  tracker.Store(2, At(Scene::Results, 0), 0);
+  tracker.Rebase(100, At(Scene::Fight), 1);
+  EXPECT_TRUE(tracker.Confirm(100, 90).empty());
+  tracker.Store(101, At(Scene::Results, 0), 1);
+  EXPECT_TRUE(tracker.Confirm(101, 90).empty());
+  tracker.Store(102, At(Scene::Other), 1);
+  tracker.Store(103, At(Scene::Fight), 1);
+  tracker.Store(104, At(Scene::Results, 0), 1);
+  const auto results = tracker.Confirm(104, 90);
+  ASSERT_EQ(results.size(), 1u);
+  EXPECT_EQ(results[0].frame, 104);
+}
+
 TEST(OrcaResults, AFightThatEndsWithoutItsResultsIsNoContest)
 {
   Timeline t;

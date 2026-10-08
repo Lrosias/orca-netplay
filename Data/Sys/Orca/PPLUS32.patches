@@ -10,7 +10,8 @@
 # Groups: the boot's save prompt skipped; the main menu's Play Online, the game's own ONLINE page
 # with no connection and every way on from it to the local Versus character select, and B from
 # there back to the page it came from (ORCA.md "Online menu"; Orca's texture pack relabels With
-# Anyone CASUAL / RANKED, UX/MenuText.h drops "(Discontinued)"); the rules' items off by default.
+# Anyone CASUAL / RANKED, UX/MenuText.h drops "(Discontinued)"); the rules' items off by default;
+# Options > Sound's balance held in the middle.
 
 # muBootNandTask (Brawl's sora_menu_boot, loaded at 0x811A6000 on the boot scene; process
 # 0x811A6300, state at +0x78), which Project+ loads unchanged at the same address (the six original
@@ -232,6 +233,19 @@ when 806F238C & 01000000 == 00000000    # not the queue's own character select (
 806DCC04 48000008 48000008    # b      0x806DCC0C (guard)
 end
 
+# Project+'s own "Move v-sync call for Brawl/PM" (its codes write these two words with plain stores
+# from frame 1 on), the same groups as RSBE01.patches: written here at the first live boundary
+# through the memory-patch path, which drops the JIT's copies, so every machine runs the move from
+# frame 1 whatever its JIT compiled during the boot, and the codes then write the same words. See
+# ORCA.md "Code the JIT doesn't see".
+80023B84 2C000000 2C000000    # cmpwi r0, 0 (guard)
+80023B88 4182FF7C 60000000    # beq   0x80023B04 -> nop
+80023B8C 881F0074 881F0074    # lbz   r0, 0x74(r31) (guard)
+
+80024020 7C0803A6 7C0803A6    # mtlr  r0 (guard)
+80024024 38210020 38210020    # addi  r1, r1, 0x20 (guard)
+80024028 4E800020 481C4904    # blr -> b 0x801E892C (VIWaitForRetrace, a tail call)
+
 # The rules menu's item default, as RSBE01.patches sets it for Brawl (which describes these four
 # words of Brawl's gmGlobalRecord menu data): Project+ keeps Brawl's record and its Item Switch page
 # reads and writes the same words. With no save in the session NAND every match had items at
@@ -249,3 +263,17 @@ end
 9017BE54 00000000 4F524341    # menu data +4 (unused): 'ORCA', the group has landed
 9017BE58 FFE7FFFF FFE7FFFF    # item switch: Project+'s default (guard only, left as is)
 9017BE5C FFFFFFFF FFFFFFFF    # (guard only)
+
+# Options > Sound's balance slider stays in the middle, as RSBE01.patches does for Brawl (which
+# describes the handler): Project+ keeps Brawl's record and its own sora_menu_main has the same
+# Sound page at the same offsets, so the words are Brawl's + 0x1480 (read in Project+'s RAM on the
+# Sound page, 2026-10-07; its codeset doesn't touch the page or the balance). In a room the host's
+# slider silenced the friend's music (two Project+ Orcas, 2026-10-07). Clamp instead of lock (10 to
+# 90): 2800005A and 2C00000A, as in Brawl's file.
+8117C8BC A003066C A003066C    # lhz    r0, 0x66C(r3) (the slider's value; guard)
+8117C8C0 28000064 28000032    # cmplwi r0, 100 -> 50: left stops at 50
+8117C8C4 408000B4 408000B4    # bge    0x8117C978 (to the right check; guard)
+
+8117C980 A003066C A003066C    # lhz    r0, 0x66C(r3) (guard)
+8117C984 2C000000 2C000032    # cmpwi  r0, 0 -> 50: right stops at 50
+8117C988 418200B0 408100B0    # beq -> ble 0x8117CA38 (the handler's end)

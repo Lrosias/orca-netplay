@@ -292,6 +292,130 @@ TEST(OrcaOnlineMenuGates, SceneGroupsAreTheSameInBothGames)
 
 namespace
 {
+// Options > Sound's balance slider (RSBE01.patches "Options > Sound"): the limits its input handler
+// stops at, read from one game's two groups. `module` as in ExpectOnlineGates.
+struct SliderLimits
+{
+  u32 left = 100;          // cmplwi r0, <left>; bge: no step left at or over it
+  s32 right = 0;           // cmpwi r0, <right>; then the branch: no step right at (or under) it
+  bool right_ble = false;  // the game's beq (stop only at it) became ble (stop at or under it)
+};
+
+SliderLimits SliderGroups(const std::vector<GamePatch>& patches, u32 module)
+{
+  const auto left = GroupAt(patches, 0x8117B43C + module);
+  const auto right = GroupAt(patches, 0x8117B500 + module);
+  // The words read in both games' RAM on the Sound page: the value's load, the compare, the branch.
+  EXPECT_EQ(Originals(left), (std::vector<u32>{0xA003066C, 0x28000064, 0x408000B4}));
+  EXPECT_EQ(Originals(right), (std::vector<u32>{0xA003066C, 0x2C000000, 0x418200B0}));
+  if (left.size() != 3 || right.size() != 3)
+  {
+    ADD_FAILURE() << "no slider groups";
+    return {};
+  }
+  // The loads and left's branch only guard; each compare keeps its opcode and register, and right's
+  // branch keeps its target (the handler's end).
+  EXPECT_EQ(left[0].value, *left[0].original);
+  EXPECT_EQ(left[2].value, *left[2].original);
+  EXPECT_EQ(right[0].value, *right[0].original);
+  EXPECT_EQ(left[1].value & 0xFFFF0000, 0x28000000u);   // cmplwi r0, imm
+  EXPECT_EQ(right[1].value & 0xFFFF0000, 0x2C000000u);  // cmpwi r0, imm
+  EXPECT_EQ(right[2].value, 0x408100B0u);               // ble +0xB0
+  return {left[1].value & 0xFFFF, static_cast<s16>(right[1].value & 0xFFFF),
+          right[2].value == 0x408100B0};
+}
+
+// One frame of the handler (0x8117B424-0x8117B5B4) with directions held: left first (and right only
+// when left can't step), a 20-frame pause in the middle. `pause` is the page's +0x66E.
+u16 SliderFrame(u16 value, u16* pause, bool left, bool right, const SliderLimits& limits)
+{
+  const auto step = [&](int by) -> u16 {
+    if (value == 50 && *pause < 20)
+    {
+      ++*pause;
+      return value;
+    }
+    *pause = 0;
+    return static_cast<u16>(value + by);
+  };
+  if (left && value < limits.left)
+    return step(1);
+  // lhz zero-extends, so cmpwi compares 0..65535.
+  const s32 v = value;
+  if (right && !(limits.right_ble ? v <= limits.right : v == limits.right))
+    return step(-1);
+  return value;
+}
+
+// The value after holding left, then right, for `frames` each, from `start`; every value on the
+// way goes into `seen`.
+std::pair<u16, u16> HoldBothWays(u16 start, int frames, const SliderLimits& limits,
+                                 std::set<u16>* seen)
+{
+  u16 pause = 20, value = start;  // the page opens with the pause spent
+  for (int i = 0; i < frames; ++i)
+    seen->insert(value = SliderFrame(value, &pause, true, false, limits));
+  const u16 after_left = value;
+  for (int i = 0; i < frames; ++i)
+    seen->insert(value = SliderFrame(value, &pause, false, true, limits));
+  return {after_left, value};
+}
+}  // namespace
+
+// In a room the host's balance was everyone's (a joiner plays on a copy of the host's machine), so
+// at the MUSIC end it silenced the friend's music. Both games' handlers stop at 50 both ways: the
+// value GameGlobal::init sets never moves, in any session.
+TEST(OrcaOnlineMenuSound, TheBalanceSliderStaysInTheMiddleInBothGames)
+{
+  const auto brawl = Shipped("RSBE01.patches");
+  const auto pplus = Shipped("PPLUS32.patches");
+  for (const u32 at : {0x8117B43Cu, 0x8117B500u})
+  {
+    SCOPED_TRACE(at);
+    EXPECT_EQ(Values(GroupAt(brawl, at)), Values(GroupAt(pplus, at + 0x1480)));
+  }
+  for (const auto& [name, patches, module] :
+       {std::tuple{"RSBE01.patches", brawl, 0u}, std::tuple{"PPLUS32.patches", pplus, 0x1480u}})
+  {
+    SCOPED_TRACE(name);
+    const SliderLimits limits = SliderGroups(patches, module);
+    EXPECT_EQ(limits.left, 50u);
+    EXPECT_EQ(limits.right, 50);
+    std::set<u16> seen;
+    EXPECT_EQ(HoldBothWays(50, 600, limits, &seen), (std::pair<u16, u16>{50, 50}));
+    EXPECT_EQ(seen, std::set<u16>{50});
+    // Both held at once: left can't step, right can't either.
+    u16 both_pause = 0;
+    EXPECT_EQ(SliderFrame(50, &both_pause, true, true, limits), 50);
+    // Any other start (none in a session: no save) only ever comes to the middle, never past it
+    // and never below 0.
+    for (const u16 start : {u16{0}, u16{10}, u16{49}, u16{51}, u16{90}, u16{100}})
+    {
+      SCOPED_TRACE(start);
+      std::set<u16> way;
+      HoldBothWays(start, 600, limits, &way);
+      EXPECT_GE(*way.begin(), std::min<u16>(start, 50));
+      EXPECT_LE(*way.rbegin(), std::max<u16>(start, 50));
+      // Right held from under the middle: ble stops it where it is (the game's beq would have gone
+      // on through 0 into 65535).
+      u16 pause = 20, value = start;
+      for (int i = 0; i < 600; ++i)
+        value = SliderFrame(value, &pause, false, true, limits);
+      EXPECT_EQ(value, std::min<u16>(start, 50));
+    }
+  }
+  // The same model with the game's own limits reaches both ends, as the game does (0x9017BE68 went
+  // to 100 under the harness); with the clamp RSBE01.patches names instead (2800005A, 2C00000A),
+  // 90 and 10.
+  std::set<u16> seen;
+  EXPECT_EQ(HoldBothWays(50, 600, SliderLimits{100, 0, false}, &seen),
+            (std::pair<u16, u16>{100, 0}));
+  EXPECT_EQ(HoldBothWays(50, 600, SliderLimits{0x5A, 0x0A, true}, &seen),
+            (std::pair<u16, u16>{90, 10}));
+}
+
+namespace
+{
 // A PNG's size from its IHDR chunk.
 std::optional<std::pair<u32, u32>> PngSize(const std::string& path)
 {

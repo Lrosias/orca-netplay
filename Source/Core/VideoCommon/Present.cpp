@@ -13,6 +13,7 @@
 #include "Common/ChunkFile.h"
 #include "Core/Config/GraphicsSettings.h"
 #include "Core/Config/MainSettings.h"
+#include "Core/Core.h"
 #include "Core/CoreTiming.h"
 #include "Core/HW/VideoInterface.h"
 #include "Core/Host.h"
@@ -257,7 +258,8 @@ void Presenter::ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height,
   }
 }
 
-void Presenter::ImmediateSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height)
+void Presenter::ImmediateSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height,
+                              bool redisplay)
 {
   if (m_immediate_swap_happened_this_field.exchange(true, std::memory_order_relaxed) &&
       Config::Get(Config::GFX_HACK_CAP_IMMEDIATE_XFB))
@@ -267,13 +269,21 @@ void Presenter::ImmediateSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_
 
   const u64 ticks = m_next_swap_estimated_ticks;
 
+  // Orca: when the throttle schedules that field now. The estimate's own host time was taken at
+  // the field before it, and a rollback's re-run (whose fields run unthrottled) or a stall's pacing
+  // reset may have come since. Single core only: the CPU thread owns the throttle. Not for a
+  // redisplay: a loaded state's ticks belong to another timeline than the throttle's.
+  TimePoint due = m_next_swap_estimated_time;
+  if (!redisplay && Core::IsCPUThread())
+    due = Core::System::GetInstance().GetCoreTiming().GetTargetHostTime(static_cast<s64>(ticks));
+
   FetchXFB(xfb_addr, fb_width, fb_stride, fb_height, ticks);
 
   PresentInfo present_info{
       .frame_count = m_frame_count++,
       .present_count = m_present_count++,
       .emulated_timestamp = ticks,
-      .intended_present_time = m_next_swap_estimated_time,
+      .intended_present_time = due,
       .reason = PresentInfo::PresentReason::Immediate,
       .frame_buffer_width = fb_width,
       .frame_buffer_height = fb_height,
@@ -1150,6 +1160,18 @@ TimePoint Presenter::GetUpdatedPresentationTime(TimePoint intended_presentation_
     return intended_presentation_time;
   }
 
+  // Orca: Immediate XFB frames follow a quantile of recent arrivals instead (PresentPacing.h). The
+  // rule below moves half the way to any late frame at once, so with the copy early in the frame
+  // each rollback's re-run dragged the presents after it.
+  if (g_ActiveConfig.bImmediateXFB)
+  {
+    m_presentation_time_offset = std::chrono::duration_cast<DT>(m_present_pacer.Next(
+        std::chrono::duration_cast<PresentPacer::Duration>(now - intended_presentation_time)));
+    // A copy is never due more than a field or so ahead: never hold the CPU thread longer than two.
+    return std::min(intended_presentation_time + m_presentation_time_offset,
+                    now + std::chrono::milliseconds(34));
+  }
+
   // Adjust slowly backward in time but quickly forward in time.
   // This keeps the pacing moderately smooth even if games produce regular sporadic bumps.
   // This was tuned to handle the terrible pacing in Brawl with "Immediate XFB".
@@ -1206,7 +1228,7 @@ void Presenter::DoState(PointerWrap& p)
 
     m_immediate_swap_happened_this_field.store(false, std::memory_order_relaxed);
 
-    ImmediateSwap(m_last_xfb_addr, m_last_xfb_width, m_last_xfb_stride, m_last_xfb_height);
+    ImmediateSwap(m_last_xfb_addr, m_last_xfb_width, m_last_xfb_stride, m_last_xfb_height, true);
   }
 }
 

@@ -146,7 +146,7 @@ std::string CompatibilityKey()
   // Version of what the in-game UX writes to emulated memory (name tags, mode locks).
   parts += fmt::format("|ux={}", Events::UXCompatVersion());
   // The room allows 1-64 characters of [a-zA-Z0-9._:-].
-  const std::string key = fmt::format("orca1:{:016x}", XXH3_64bits(parts.data(), parts.size()));
+  const std::string key = fmt::format("orca2:{:016x}", XXH3_64bits(parts.data(), parts.size()));
   // What went into it, when that changes: a player alone in a queue shows which input split them.
   {
     static std::mutex logged_mutex;

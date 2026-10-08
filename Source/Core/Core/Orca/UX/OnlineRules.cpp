@@ -18,6 +18,7 @@
 #include "Core/Orca/Profile.h"
 #include "Core/Orca/Session/Events.h"
 #include "Core/Orca/Session/Online.h"
+#include "Core/Orca/Session/Replay.h"
 #include "Core/Orca/UX/NameTags.h"
 #include "Core/Orca/UX/OnlineMenu.h"
 #include "Core/Orca/UX/OnlineSeats.h"
@@ -614,6 +615,8 @@ void FreshSet(Writer& w, Mode mode, Ruleset ruleset, u8 coin)
 
 int WriteHeader(GuestMemory& m, Mode mode, Ruleset ruleset, u8 coin, u32 room, u8 queue_flags)
 {
+  if (auto* replay = Orca::Net::ReplayScope::Current(); replay && !Orca::Net::ReplayScope::Playing())
+    replay->header = {static_cast<u8>(mode), static_cast<u8>(ruleset), coin, queue_flags, room};
   if (!BlockMapped(m))
     return 0;
   Writer w{m};
@@ -945,6 +948,7 @@ bool HeaderInPlace()
 void MemoryReplaced()
 {
   s_in_place = false;
+  NoShows() = {};
 }
 
 void SetHeaderFree(bool free)
@@ -1054,6 +1058,12 @@ void OnFrame(const Core::CPUThreadGuard& guard, int frame, bool resimulating, bo
     return;
   }
   GuardMemory m(guard);
+  if (Orca::Net::ReplayScope::Playing())
+  {
+    if (const auto& header = Orca::Net::ReplayScope::Current()->header)
+      WriteHeader(m, static_cast<Mode>(header->mode), static_cast<Ruleset>(header->ruleset),
+                  header->coin, header->room, header->flags);
+  }
   // The room code (made by the server) decides game 1's first striker, so neither player chooses.
   Header wanted;
   {
@@ -1078,7 +1088,7 @@ void OnFrame(const Core::CPUThreadGuard& guard, int frame, bool resimulating, bo
     wanted.coin = test->coin;
     wanted.room = 0;
   }
-  if (((alone || s_header_free) && !resimulating) || test)
+  if (!Orca::Net::ReplayScope::Playing() && (((alone || s_header_free) && !resimulating) || test))
   {
     if (const int changed =
             WriteHeader(m, wanted.mode, ruleset, wanted.coin, wanted.room, wanted.flags);
@@ -1147,7 +1157,15 @@ void OnFrame(const Core::CPUThreadGuard& guard, int frame, bool resimulating, bo
   }
   if (frame > t.last_frame)
   {
-    t.pending[frame] = ReadHeader(m).Locked() ? m.Read8(B::CSS_NO_SHOW) : 0;
+    const u8 value = ReadHeader(m).Locked() ? m.Read8(B::CSS_NO_SHOW) : 0;
+    if (Orca::Net::ReplayScope::NetworkPlaying())
+    {
+      t.pending.clear();
+      t.last = value;
+      t.last_frame = frame;
+    }
+    else
+      t.pending[frame] = value;
     while (t.pending.size() > 4096)
       t.pending.erase(t.pending.begin());
   }
