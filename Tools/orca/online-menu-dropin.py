@@ -24,12 +24,16 @@
 # Then the join goes on and step 3 follows.
 #
 # --invite (one Orca at a time, two boots): the app invites a friend who hasn't arrived yet. The
-# host, on the ONLINE page, gets "prepare-join" and stores its keyframe; nobody takes it.
-#   fresh: the host picks With Anyone > Casual about 15 s later. A friend arriving within 30 s
-#          would replay from that keyframe, pick included, so nothing prints.
-#   stale: the pick comes over 30 s after the keyframe, which a friend would no longer use, so
-#          "orca menu online casual local" prints.
-# Each checks that the keyframe was stored before the pick.
+# host, on the ONLINE page, gets "prepare-join". Since 0.3.34 that makes no keyframe (the friend's
+# arrival may fresh-start the host first, ORCA.md "Fresh starts"), so the game stays its player's
+# alone: a pick of With Anyone > Casual some 15 s (`fresh`) or 45 s (`stale`) later prints
+# "orca menu online casual local" either way. Each checks that no keyframe was made.
+#
+# Since 0.3.34 a friend arriving more than 10 s after the host's origin fresh-starts it straight to
+# With Friends' character select (ORCA.md "Fresh starts"), with no FriendsMove. So both Orcas run
+# with ORCA_TEST_FRESH_AFTER=100000000: the friend joins in place, which is what this tool checks.
+# Set ORCA_TEST_FRESH or ORCA_TEST_FRESH_AFTER yourself to override that (long-join.py checks fresh
+# starts). A local rooms stack: ORCA_SITE=http://127.0.0.1:<port>.
 import os
 import queue
 import random
@@ -108,6 +112,13 @@ class Orca:
         }
         if PPLUS:
             env["ORCA_PROFILE"] = "PPLUS32"
+        # A local rooms stack (ORCA_SITE), and the fresh start's knobs: by default the friend joins
+        # in place and FriendsMove moves both games.
+        if not os.environ.get("ORCA_TEST_FRESH") and not os.environ.get("ORCA_TEST_FRESH_AFTER"):
+            env["ORCA_TEST_FRESH_AFTER"] = "100000000"
+        for key in ("ORCA_SITE", "ORCA_TEST_FRESH", "ORCA_TEST_FRESH_AFTER"):
+            if os.environ.get(key):
+                env[key] = os.environ[key]
         env.update(env_extra)
         args = ["nice", "-n", "10", BIN, "-p", "headless", "-u", user, "-v", "Null",
                 "-C", "Dolphin.DSP.Backend=No Audio Output",
@@ -214,39 +225,18 @@ def invite(case):
     # Project+ boots into its character select: the one that counts is the next.
     css_before = len(host.log_lines("-> scSelctCharacter"))
     host.send("prepare-join")
-    # Logged once the keyframe is packed and in the store ("Drop-in: keyframe of frame N: ...
-    # stored; ..."), after the capture's own line.
-    stored_re = re.compile(r"Drop-in: keyframe of frame (\d+): .* stored;")
-    end = time.time() + 60
-    while not any(stored_re.search(l) for l in host.log_lines("Drop-in: keyframe of frame")):
-        if time.time() > end or host.proc.poll() is not None:
-            fail(f"{host.name}: no keyframe stored after prepare-join")
-        time.sleep(1)
-    keyframe = next(l for l in host.log_lines("Drop-in: keyframe of frame") if stored_re.search(l))
-    log(f"{host.name}: {keyframe[keyframe.find('Drop-in'):]}")
-    kf_frame = int(stored_re.search(keyframe).group(1))
     css = host.wait_log("-> scSelctCharacter", 180, after=css_before)
     log(f"{host.name}: {css[css.find('Scene frame'):]}")
     time.sleep(5)
-    lines = host.log_lines("")
-    stored = next((i for i, l in enumerate(lines) if stored_re.search(l)), None)
-    menu = max(i for i, l in enumerate(lines) if "-> muMenuMain" in l)
-    left = next((i for i, l in enumerate(lines) if "-> scMemoryChange" in l and i > menu), None)
-    if stored is None or left is None or left < stored:
-        fail(f"{host.name}: the menu was left before the invite's keyframe was stored")
-    # The pick shows at the first boundary between scenes.
-    since = frame_of(lines[left], "Scene frame ") - kf_frame
-    fresh = since <= 30 * 60
-    if fresh != (case == "fresh"):
-        fail(f"{host.name}: the pick came {since} frames after the keyframe")
+    if host.log_lines("Drop-in: keyframe of frame"):
+        fail(f"{host.name}: prepare-join made a keyframe: "
+             f"{host.log_lines('Drop-in: keyframe of frame')[0]}")
     if host.proc.poll() is not None:
         fail(f"{host.name} stopped")
-    want = [] if case == "fresh" else ["orca menu online casual local"]
+    want = ["orca menu online casual local"]
     if host.menu != want:
-        fail(f"{host.name} printed {host.menu}, {since} frames after the invite's keyframe "
-             f"(expected {want})")
-    log(f"{host.name}: left the menu {since} frames after the invite's keyframe, nobody took it; "
-        f"printed {host.menu}")
+        fail(f"{host.name} printed {host.menu} after the invite (expected {want})")
+    log(f"{host.name}: no keyframe for the invite; the pick printed {host.menu}")
     host.stop()
     orcas.remove(host)
 

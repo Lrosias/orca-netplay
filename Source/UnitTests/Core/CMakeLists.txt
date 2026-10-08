@@ -27,6 +27,7 @@ add_dolphin_test(OrcaBootLogsTest Orca/BootLogsTest.cpp)
 add_dolphin_test(OrcaLaunchTest Orca/LaunchTest.cpp)
 add_dolphin_test(OrcaCowTest Orca/CowTest.cpp)
 add_dolphin_test(OrcaKeyframeTest Orca/KeyframeTest.cpp)
+add_dolphin_test(OrcaFreshStartTest Orca/FreshStartTest.cpp)
 add_dolphin_test(OrcaUXTest Orca/UXTest.cpp)
 # The overlay draw tests set up ImGui frames of their own.
 target_link_libraries(OrcaUXTest PRIVATE imgui)

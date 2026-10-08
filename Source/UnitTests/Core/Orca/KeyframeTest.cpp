@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <random>
 #include <string>
 #include <vector>
@@ -19,9 +21,10 @@ using namespace Orca::Net;
 
 namespace
 {
-ReplayArchive Replay(size_t count)
+ReplayArchive Replay(size_t count, int first_frame = 0)
 {
   ReplayArchive replay;
+  replay.first_frame = first_frame;
   replay.origin_hash = 0x123456789abcdef0;
   replay.target_hash = 0xfedcba9876543210;
   auto ports = std::make_shared<const std::vector<Orca::Events::PortInfo>>(
@@ -118,9 +121,15 @@ TEST(OrcaKeyframe, BoundsCountsSeatsAndPayloadLengthsBeforeAllocation)
   const auto original = Raw(blob);
   int frame;
   ReplayArchive decoded;
-  // Archive count, port count, first seat, name length, controls length, second seat.
-  for (const auto [offset, value] : std::vector<std::pair<size_t, u32>>{
-           {4, 0xffffffff}, {56, 0xffffffff}, {60, 4}, {64, 129}, {74, 65}, {95, 0}})
+  // Archive count, first frame, port count, first seat, name length, controls length, second
+  // seat.
+  for (const auto [offset, value] : std::vector<std::pair<size_t, u32>>{{4, 0xffffffff},
+                                                                        {8, 2},
+                                                                        {60, 0xffffffff},
+                                                                        {64, 4},
+                                                                        {68, 129},
+                                                                        {78, 65},
+                                                                        {99, 0}})
   {
     auto raw = original;
     U32(raw, offset, value);
@@ -137,9 +146,9 @@ TEST(OrcaKeyframe, BoundsDecompressionAndTypedHeaderValues)
   auto replay = Replay(0);
   replay.boundary.ports = std::make_shared<const std::vector<Orca::Events::PortInfo>>();
   const auto original = Raw(PackKeyframe(0, replay));
-  // Header presence, mode, ruleset, coin, flags, and clear-ready presence.
+  // Header presence, mode, ruleset, coin, flags, clear-ready presence, and the menu exit.
   for (const auto [offset, value] : std::vector<std::pair<size_t, u32>>{
-           {60, 2}, {64, 3}, {68, 3}, {72, 2}, {76, 4}, {84, 2}})
+           {64, 2}, {68, 3}, {72, 3}, {76, 2}, {80, 4}, {88, 2}, {92, 24}, {92, 26}, {92, 255}})
   {
     auto raw = original;
     U32(raw, offset, value);
@@ -150,6 +159,7 @@ TEST(OrcaKeyframe, BoundsDecompressionAndTypedHeaderValues)
 TEST(OrcaKeyframe, ReplayRecordingRetainsWinningInputsAndEventsAcrossRollback)
 {
   ReplayArchive archive;
+  archive.first_frame = 0;
   ReplayRecordingScope recording(&archive);
   auto* frame = ReplayRecordingScope::Frame(0);
   frame->header = ReplayHeader{1, 1, 0, 0, 7};
@@ -166,22 +176,199 @@ TEST(OrcaKeyframe, ReplayRecordingRetainsWinningInputsAndEventsAcrossRollback)
   EXPECT_EQ(ReplayRecordingScope::Frame(MAX_REPLAY_FRAMES + 1), nullptr);
 }
 
+TEST(OrcaKeyframe, AReplayFromAFreshStartHoldsOnlyItsOwnFrames)
+{
+  // A host that fresh-started at its origin frame 1480 offers frame 1700: 220 frames travel,
+  // and the first one leaves the main menu for Casual.
+  auto original = Replay(220, 1480);
+  original.frames[0].menu_exit = MENU_EXIT_CASUAL;
+  original.frames[17].header = ReplayHeader{1, 1, 0, 2, 9};
+  const auto blob = PackKeyframe(1700, original);
+  ASSERT_FALSE(blob.empty());
+  int frame = -1;
+  ReplayArchive decoded;
+  ASSERT_TRUE(UnpackKeyframe(blob, &frame, &decoded));
+  EXPECT_EQ(frame, 1700);
+  EXPECT_EQ(decoded.first_frame, 1480);
+  ASSERT_EQ(decoded.frames.size(), 220u);
+  EXPECT_EQ(decoded.EndFrame(), 1700);
+  EXPECT_EQ(decoded.frames[0].menu_exit, MENU_EXIT_CASUAL);
+  EXPECT_EQ(decoded.At(1480)->menu_exit, MENU_EXIT_CASUAL);
+  EXPECT_EQ(decoded.At(1497)->header, original.frames[17].header);
+  EXPECT_EQ(decoded.At(1479), nullptr);
+  EXPECT_EQ(decoded.At(1700), nullptr);
+  for (size_t i = 0; i < decoded.frames.size(); ++i)
+    EXPECT_EQ(decoded.frames[i].pads, original.frames[i].pads) << i;
+  // Each exit a fresh start may take.
+  for (const u8 exit : {MENU_EXIT_FRIENDS, MENU_EXIT_CASUAL, MENU_EXIT_RANKED})
+  {
+    auto replay = Replay(3, 200);
+    replay.frames[0].menu_exit = exit;
+    ASSERT_TRUE(UnpackKeyframe(PackKeyframe(203, replay), &frame, &decoded)) << int{exit};
+    EXPECT_EQ(decoded.frames[0].menu_exit, exit);
+  }
+  // A keyframe at the origin itself: the boundary is the first frame, so it may carry the exit.
+  auto at_origin = Replay(0, 230);
+  at_origin.boundary.menu_exit = MENU_EXIT_RANKED;
+  ASSERT_TRUE(UnpackKeyframe(PackKeyframe(230, at_origin), &frame, &decoded));
+  EXPECT_EQ(frame, 230);
+  EXPECT_TRUE(decoded.frames.empty());
+  EXPECT_EQ(decoded.boundary.menu_exit, MENU_EXIT_RANKED);
+}
+
+TEST(OrcaKeyframe, PackingRefusesAReplayThatDoesntFitItsOrigin)
+{
+  // No origin yet, a frame before the origin, too few frames held.
+  EXPECT_TRUE(PackKeyframe(10, Replay(10, -1)).empty());
+  EXPECT_TRUE(PackKeyframe(99, Replay(10, 100)).empty());
+  EXPECT_TRUE(PackKeyframe(111, Replay(10, 100)).empty());
+  EXPECT_FALSE(PackKeyframe(110, Replay(10, 100)).empty());
+  // The count limit is the frame's, not the number of frames held.
+  EXPECT_FALSE(PackKeyframe(static_cast<int>(MAX_REPLAY_FRAMES),
+                            Replay(10, static_cast<int>(MAX_REPLAY_FRAMES) - 10))
+                   .empty());
+  EXPECT_TRUE(PackKeyframe(static_cast<int>(MAX_REPLAY_FRAMES) + 1,
+                           Replay(10, static_cast<int>(MAX_REPLAY_FRAMES) - 9))
+                  .empty());
+  // A menu exit anywhere but the first frame, or one that isn't an exit a fresh start takes.
+  auto late = Replay(10, 100);
+  late.frames[1].menu_exit = MENU_EXIT_FRIENDS;
+  EXPECT_TRUE(PackKeyframe(110, late).empty());
+  auto boundary = Replay(10, 100);
+  boundary.boundary.menu_exit = MENU_EXIT_CASUAL;
+  EXPECT_TRUE(PackKeyframe(110, boundary).empty());
+  for (const u8 exit : {u8{1}, u8{24}, u8{26}, u8{29}, u8{32}, u8{255}})
+  {
+    auto bad = Replay(10, 100);
+    bad.frames[0].menu_exit = exit;
+    EXPECT_TRUE(PackKeyframe(110, bad).empty()) << int{exit};
+  }
+}
+
+TEST(OrcaKeyframe, UnpackingRefusesAMenuExitOffTheFirstFrame)
+{
+  // Two frames whose records are the same size, so the second's exit is at a known offset.
+  auto replay = Replay(2, 50);
+  replay.boundary.header.reset();
+  replay.boundary.clear_ready = false;
+  const auto original = Raw(PackKeyframe(52, replay));
+  const size_t record = (original.size() - 28) / 3;
+  ASSERT_EQ(28 + 3 * record, original.size());
+  int frame = -1;
+  ReplayArchive decoded;
+  ASSERT_TRUE(UnpackKeyframe(Compressed(original), &frame, &decoded));
+  // The first frame's exit is fine; the second's, or the boundary's, is refused.
+  auto raw = original;
+  U32(raw, 28 + record - 4, MENU_EXIT_CASUAL);
+  EXPECT_TRUE(UnpackKeyframe(Compressed(raw), &frame, &decoded));
+  EXPECT_EQ(decoded.frames[0].menu_exit, MENU_EXIT_CASUAL);
+  for (const size_t at : {28 + 2 * record - 4, 28 + 3 * record - 4})
+  {
+    raw = original;
+    U32(raw, at, MENU_EXIT_FRIENDS);
+    EXPECT_FALSE(UnpackKeyframe(Compressed(raw), &frame, &decoded)) << at;
+  }
+  // A first frame past the archive's frame.
+  raw = original;
+  U32(raw, 8, 53);
+  EXPECT_FALSE(UnpackKeyframe(Compressed(raw), &frame, &decoded));
+}
+
+TEST(OrcaKeyframe, RecordingStartsAtTheOrigin)
+{
+  ReplayArchive archive;
+  ReplayRecordingScope recording(&archive);
+  // No origin yet: nothing is recorded.
+  EXPECT_EQ(ReplayRecordingScope::Frame(0), nullptr);
+  ReplayRecordingScope::RecordPads(5, Pads{});
+  EXPECT_TRUE(archive.frames.empty());
+  archive.first_frame = 1480;
+  EXPECT_EQ(ReplayRecordingScope::Frame(1479), nullptr);
+  Pads pads{};
+  pads[0][1] = 0x10;
+  ReplayRecordingScope::RecordPads(1482, pads);
+  ASSERT_EQ(archive.frames.size(), 3u);
+  EXPECT_EQ(archive.frames[2].pads, pads);
+  EXPECT_EQ(archive.At(1482), &archive.frames[2]);
+  EXPECT_EQ(archive.EndFrame(), 1483);
+  EXPECT_EQ(ReplayRecordingScope::Frame(1480), &archive.frames[0]);
+  EXPECT_EQ(ReplayRecordingScope::Frame(static_cast<int>(MAX_REPLAY_FRAMES) + 1), nullptr);
+}
+
+TEST(OrcaKeyframe, ReplacingTheNandWritesOnlyWhatDiffers)
+{
+  const std::string root = File::CreateTempDir() + "/nand";
+  const auto write = [&](const std::string& path, const std::string& text) {
+    ASSERT_TRUE(File::CreateFullPath(root + "/" + path));
+    ASSERT_TRUE(File::WriteStringToFile(root + "/" + path, text));
+  };
+  write("tmp/boot.bin", std::string(4096, 'b'));
+  write("title/save.dat", "old save");
+  write("title/extra.dat", "gone after");
+  write("stray/inner/file", "gone after");
+  write("kind", "a file where a folder belongs");
+  // The unchanged file keeps its old time, so a rewrite would show.
+  const auto old_time = std::filesystem::file_time_type::clock::now() - std::chrono::hours(48);
+  std::filesystem::last_write_time(std::filesystem::path(root + "/tmp/boot.bin"), old_time);
+  std::vector<NandEntry> entries;
+  const auto dir = [&](const std::string& path) {
+    NandEntry e;
+    e.path = path;
+    e.directory = true;
+    entries.push_back(e);
+  };
+  const auto file = [&](const std::string& path, const std::string& text) {
+    NandEntry e;
+    e.path = path;
+    e.data.assign(text.begin(), text.end());
+    entries.push_back(e);
+  };
+  dir("kind");
+  file("kind/inside", "now a folder");
+  dir("title");
+  file("title/new.dat", "");
+  file("title/save.dat", "new save!");
+  dir("tmp");
+  file("tmp/boot.bin", std::string(4096, 'b'));
+  ASSERT_TRUE(ReplaceNandTree(root, entries));
+  std::vector<NandEntry> read;
+  ASSERT_TRUE(ReadNandTree(root, &read));
+  ASSERT_EQ(read.size(), entries.size());
+  for (size_t i = 0; i < read.size(); ++i)
+  {
+    EXPECT_EQ(read[i].path, entries[i].path);
+    EXPECT_EQ(read[i].directory, entries[i].directory) << read[i].path;
+    EXPECT_EQ(read[i].data, entries[i].data) << read[i].path;
+  }
+  EXPECT_TRUE(std::filesystem::last_write_time(std::filesystem::path(root + "/tmp/boot.bin")) ==
+              old_time);
+  // An unsafe path changes nothing.
+  NandEntry escape;
+  escape.path = "../outside";
+  EXPECT_FALSE(ReplaceNandTree(root, {escape}));
+  ASSERT_TRUE(ReadNandTree(root, &read));
+  EXPECT_EQ(read.size(), entries.size());
+  File::DeleteDirRecursively(root);
+}
+
 TEST(OrcaKeyframe, BoundsDecodedMetadataWhenCompressedDataIsSmall)
 {
   ReplayArchive replay;
   replay.boundary.ports = std::make_shared<const std::vector<Orca::Events::PortInfo>>(
       std::vector<Orca::Events::PortInfo>{{0, "a", false, {}, {}}, {1, "b", false, {}, {}},
                                         {2, "c", false, {}, {}}, {3, "d", false, {}, {}}});
+  replay.first_frame = 0;
   const auto single = Raw(PackKeyframe(0, replay));
   constexpr u32 count = 80000;
-  const size_t record_size = single.size() - 24;
-  std::vector<u8> raw(24 + (count + 1) * record_size);
-  std::copy_n(single.begin(), 24, raw.begin());
+  constexpr size_t preamble = 28;
+  const size_t record_size = single.size() - preamble;
+  std::vector<u8> raw(preamble + (count + 1) * record_size);
+  std::copy_n(single.begin(), preamble, raw.begin());
   U32(raw, 4, count);
   for (u32 i = 0; i <= count; ++i)
   {
-    std::copy(single.begin() + 24, single.end(), raw.begin() + 24 + i * record_size);
-    raw[24 + i * record_size + 44] = static_cast<u8>('a' + i % 26);
+    std::copy(single.begin() + preamble, single.end(), raw.begin() + preamble + i * record_size);
+    raw[preamble + i * record_size + 44] = static_cast<u8>('a' + i % 26);
   }
   const auto blob = Compressed(raw);
   EXPECT_LT(blob.size(), 1u << 20);

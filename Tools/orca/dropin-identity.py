@@ -91,6 +91,10 @@ class Orca:
         }
         if PPLUS:
             env["ORCA_PROFILE"] = "PPLUS32"
+        # A local rooms stack (ORCA_SITE) and the fresh start's knobs (ORCA.md "Fresh starts").
+        for key in ("ORCA_SITE", "ORCA_TEST_FRESH", "ORCA_TEST_FRESH_AFTER"):
+            if os.environ.get(key):
+                env[key] = os.environ[key]
         env.update(env_extra)
         args = [BIN, "-p", "headless", "-u", self.user, "-v", "Null",
                 "-C", "Dolphin.DSP.Backend=No Audio Output",

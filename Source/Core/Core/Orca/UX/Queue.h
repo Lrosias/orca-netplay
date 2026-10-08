@@ -234,7 +234,50 @@ std::pair<u8, u8> SteerToward(float x, float y, float tx, float ty);
 // about 0.03 a frame after the stick is released). Integer only.
 bool HandStill(float x, float y, float prev_x, float prev_y);
 
+// ---- The host's own pick after a fresh start (Rollback/OnlineMatch.cpp) ----
+// A fresh start takes a queue room's host to a new character select, so its token is no longer on
+// the character it readied with on its own select. Its own inputs put it back, from its queue
+// identity: the hand goes to where the token was placed, A once the hand is still over that
+// character, B if the token landed on another, X until the costume matches (any colour for
+// Random). These are this player's inputs like any other, recorded and sent as such, so the
+// opponent's game computes nothing for them. Local only.
+struct OwnSteer
+{
+  int frames = 0;  // frames steered so far
+  // The frame count when the token first lay on the pick in the wrong colour (-1: not yet).
+  int costume_from = -1;
+  bool has_prev = false;
+  float prev_x = 0;
+  float prev_y = 0;
+};
+struct OwnStep
+{
+  bool done = false;
+  // Port 1's stick and buttons for this frame, while not done.
+  u8 stick_x = static_cast<u8>(GCPadStatus::MAIN_STICK_CENTER_X);
+  u8 stick_y = static_cast<u8>(GCPadStatus::MAIN_STICK_CENTER_Y);
+  u16 buttons = 0;
+  bool operator==(const OwnStep&) const = default;
+};
+// One frame: port 1 as the character select shows it, and the pick to put back. Advances `steer`.
+// Done once the token is down on the pick in its colour, after STEER_LIMIT_FRAMES, after
+// COSTUME_LIMIT_FRAMES of turning the colour, or at once with no pick. Pure, integer steering.
+OwnStep StepOwnPick(const CssPort& port, const Identity& pick, OwnSteer* steer);
+// This player's own pick, as its queue identity carries it (empty when it never readied one).
+Identity OwnIdentity();
+// Steers port 1 onto `pick` from the next room character select the frame hook sees (game 1),
+// giving up after STEER_LIMIT_FRAMES. CPU thread.
+void ArmOwnPick(const Identity& pick);
+void DisarmOwnPick();
+bool OwnPickArmed();
+// The pad the last first-run frame hook chose for port 1 while armed; nullopt when it didn't steer
+// at that frame (not on the room's character select yet). CPU thread.
+std::optional<GCPadStatus> OwnPickPad();
+
 // ---- Memory ----
+// Whether a character select's task and its first two panels can be read (scSelctCharacter), the
+// condition for View::css, under any header or none.
+bool CssTaskReadable(const GuestMemory& memory);
 View ReadView(const GuestMemory& memory, const std::vector<Events::PortInfo>& ports);
 State ReadState(const GuestMemory& memory);
 // Writes the state fields (not RAW/RAW_PREV, which the latch owns), only where they differ.

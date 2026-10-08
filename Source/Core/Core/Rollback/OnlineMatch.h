@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // Online drop-in play: friends join this game through a YouGame room. The host plays solo from
-// boot; a friend who joins loads the host's keyframe, replays the host's inputs since then, and
-// takes the next free port. From there a rollback session over the room's transport runs both
-// games. See ORCA.md, "Drop-in".
+// boot; a friend who joins goes back to its own origin, replays the host's inputs since that
+// origin, and takes the next free port. From there a rollback session over the room's transport
+// runs both games. Before a queue match, and before a friend joins a host that has played on its
+// own for a while, the host goes back to its origin too (a fresh start), so a join replays only the
+// match's own frames. See ORCA.md, "Drop-in".
 
 #pragma once
 
@@ -37,6 +39,78 @@ std::optional<int> OnBoundary(Core::System& system,
 // A keyframe at most this old (30 s at 60 fps) still serves a new joiner, who replays the frames
 // since.
 constexpr int KEYFRAME_FRESH_FRAMES = 30 * 60;
+
+// ---- The origin and fresh starts ----
+// Every Orca boots the same way up to its origin: port 1 plugged in with nothing pressed, ports 2-4
+// unplugged, whatever the player's seat or controller, and nobody's name or controls. The origin is
+// the first boundary at which the main menu has been built for ORIGIN_SETTLE_FRAMES frames
+// (UX/OnlineMenu.h FreshMove), captured before that boundary's frame hook: this machine's own
+// snapshot, NAND and RAM checksum. A replay starts there, so a join never re-runs the boot, and
+// two machines whose RAM differs there never meet (room_mismatch).
+constexpr int ORIGIN_SETTLE_FRAMES = 30;
+// A game whose main menu isn't built by then has no origin: it can't take or join players.
+constexpr int ORIGIN_DEADLINE = 6000;
+// The pads of every frame before the origin.
+Orca::Net::Pads CanonicalBootPads();
+enum class OriginStep
+{
+  Wait,
+  Capture,
+  Fail,
+};
+// At the boundary of `frame`, before its hook: `menu_built_streak` frames in a row (up to the last)
+// showed the built main menu. The origin must come after the profile's JIT clear.
+OriginStep DecideOrigin(int frame, int menu_built_streak, std::optional<u32> jit_clear_frame);
+
+// A fresh start: the host restores its own origin, leaves the main menu for the match's character
+// select (With Friends, Casual or Ranked) with a recorded exit, and runs unseen and unthrottled
+// until that select is up (the tail). Its history starts again at the origin, so the joiner
+// replays only the tail and the frames since. Never while a session runs.
+//
+// A queue room's host always fresh-starts, once per room, once the room's welcome has come. A
+// friend arriving at a host with no session fresh-starts it when the host's history since its last
+// start is over FRESH_FRIENDS_AFTER frames; a shorter one joins in place. A host in a single-player
+// mode holds the friend first, as before.
+constexpr int FRESH_FRIENDS_AFTER = 10 * 60;
+// The tail ends once the character select has been up this many frames, or after FRESH_TAIL_LIMIT.
+constexpr int FRESH_CSS_SETTLE = 30;
+constexpr int FRESH_TAIL_LIMIT = 600;
+enum class FreshStep
+{
+  None,  // nothing to do: no fresh start (a join, if any, goes on in place)
+  Now,   // fresh-start at the next boundary
+  Hold,  // a fresh start is due later: make no keyframe yet
+};
+struct FreshInputs
+{
+  // Fresh starts are on (ORCA_TEST_FRESH=off turns them off) and this game's origin is the built
+  // main menu.
+  bool enabled = true;
+  bool origin_ready = false;
+  bool joining = false;
+  bool session = false;
+  // A friend seated or plugging in.
+  bool seated_or_plugging = false;
+  // A fresh start's tail is running, or a keyframe is being made.
+  bool busy = false;
+  // `host <code>` matched this game: its room fresh-starts once the welcome names the queue.
+  bool queue_armed = false;
+  bool in_queue_room = false;
+  // A friend waits for a keyframe.
+  bool waiting = false;
+  // The friends waiting were already taken in place (None for them earlier): their keyframe may be
+  // on its way, so the decision stands until nobody waits.
+  bool in_place = false;
+  // The host is in a single-player mode (UX/OnlineMenu.h DropInHeld).
+  bool single_player = false;
+  // Frames since the host's last start (its origin or its last fresh start).
+  int history_frames = 0;
+  int fresh_after = FRESH_FRIENDS_AFTER;
+};
+FreshStep DecideFreshStart(const FreshInputs& in);
+// The main menu exit a friends fresh start takes: the Casual or Ranked select the host is on
+// (UX/OnlineMenu.h CssPick), so Play again re-arms there, else With Friends.
+u8 FriendsFreshExit(std::optional<bool> css_pick_ranked);
 
 // True when `frame` belongs to this player alone: playing solo, no drop-in pending, and no fresh
 // keyframe a joining friend would replay from. Only then may the UI announce things.

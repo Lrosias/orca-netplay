@@ -104,6 +104,10 @@ class Orca:
         # Without the input script, the pad is the app's controller stream (the bridge's live pad).
         if script:
             env["YG_INPUT"] = INPUT
+        # A local rooms stack (ORCA_SITE) and the fresh start's knobs (ORCA.md "Fresh starts").
+        for key in ("ORCA_SITE", "ORCA_TEST_FRESH", "ORCA_TEST_FRESH_AFTER"):
+            if os.environ.get(key):
+                env[key] = os.environ[key]
         env.update(env_extra)
         args = ["nice", "-n", "10", BIN, "-p", "headless", "-u", user, "-v", "Null",
                 "-C", "Dolphin.DSP.Backend=No Audio Output", "-C", "Dolphin.Input.BackgroundInput=True",

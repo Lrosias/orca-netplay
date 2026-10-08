@@ -44,11 +44,13 @@
 #include "Core/Orca/UX/NameTags.h"
 #include "Core/Orca/UX/OnlineMenu.h"
 #include "Core/Orca/UX/OnlineRules.h"
+#include "Core/Orca/UX/Probe.h"
 #include "Core/Orca/UX/Queue.h"
 #include "Core/Orca/UX/RankedSet.h"
 #include "Core/Orca/UX/Results.h"
 #include "Core/Orca/UX/SetEnd.h"
 #include "Core/PowerPC/JitInterface.h"
+#include "Core/Rollback/Harness.h"
 #include "Core/Rollback/Rollback.h"
 #include "Core/Rollback/SessionPort.h"
 #include "Core/System.h"
@@ -171,8 +173,16 @@ struct Match
   // A joining player.
   std::unique_ptr<Download> download;
   std::unique_ptr<Download> replaying;
+  // This machine's own origin (CaptureOrigin): the only state it ever restores for a join or a
+  // fresh start. `origin_frame` is -1 until it is captured.
   MachineImage origin;
   std::vector<Orca::Net::NandEntry> origin_nand;
+  int origin_frame = -1;
+  u64 origin_hash = 0;
+  // Frames in a row the frame hook saw the built main menu, before the origin.
+  int menu_built_streak = 0;
+  // No origin could be found (the menu never built in time): this game takes and joins nobody.
+  bool origin_failed = false;
   Orca::Net::ReplayArchive replay;
   Clock::time_point replay_heartbeat{};
   int host_seat = 0;
@@ -250,6 +260,38 @@ struct Match
   // A fight was played in the ranked room this queue image is for: the restored character select
   // comes back not ready, so Start searches again.
   bool ranked_fought = false;
+
+  // Fresh starts (FreshStart). `fresh_pending`: the main menu exit of one due at the next
+  // boundary. `fresh_queue_armed`: `host` matched this game, so its queue room fresh-starts once
+  // the welcome names it; `fresh_room` is the room the last fresh start was for.
+  u8 fresh_pending = 0;
+  bool fresh_queue_armed = false;
+  std::string fresh_room;
+  // The friends waiting now join in place (DecideFreshStart said None for them).
+  bool friends_in_place = false;
+  // The fresh start under way: its unseen tail, then (a queue room) neutral pads until the room's
+  // header is in, then port 1's own pick put back (UX/Queue.h ArmOwnPick).
+  struct Fresh
+  {
+    enum class Phase
+    {
+      Tail,
+      Hold,
+      Steer,
+    };
+    Phase phase = Phase::Tail;
+    u8 exit = 0;
+    bool queue = false;
+    std::string room;
+    // Frames in a row the tail has seen the character select up.
+    int css_streak = 0;
+    Clock::time_point started{};
+  };
+  std::optional<Fresh> fresh;
+  // ORCA_TEST_FAST_UNTIL: solo frames run unthrottled, until then or the first fresh start or
+  // session (`fast_spent`).
+  bool fast = false;
+  bool fast_spent = false;
 
   // A Casual or Ranked pick handed over while this game wasn't alone, at a boundary the app's
   // commands may not take (TakeLobbyPickNow): retried at the next one while it still stands
@@ -367,6 +409,48 @@ std::optional<int> ChosenDelay()
   return DEFAULT_DELAY;
 }
 
+// ---- Test knobs (UX/Probe.h TestKnobsAllowed) ----
+// ORCA_TEST_FRESH=off: no fresh starts; every join replays from the host's origin in place.
+bool FreshStartsOn()
+{
+  static const bool off = Orca::GetEnv("ORCA_TEST_FRESH") == "off";
+  return !(off && Orca::UX::TestKnobsAllowed());
+}
+// ORCA_TEST_FRESH_AFTER=<frames>: a friend fresh-starts a host whose history is longer than this.
+int FreshFriendsAfter()
+{
+  static const int after = [] {
+    const std::string value = Orca::GetEnv("ORCA_TEST_FRESH_AFTER");
+    return value.empty() ? -1 : std::max(0, std::atoi(value.c_str()));
+  }();
+  return after >= 0 && Orca::UX::TestKnobsAllowed() ? after : FRESH_FRIENDS_AFTER;
+}
+// ORCA_TEST_FAST_UNTIL=<frame>: solo frames before it run unthrottled, to age a host quickly; never
+// after its first fresh start or session.
+int FastUntil()
+{
+  static const int until = std::atoi(Orca::GetEnv("ORCA_TEST_FAST_UNTIL").c_str());
+  return until > 0 && Orca::UX::TestKnobsAllowed() ? until : 0;
+}
+
+// The origin has been captured; frames from it on are recorded.
+bool OriginReady(const Match& match)
+{
+  return match.origin_frame >= 0;
+}
+
+// Before the origin, every Orca plays the canonical boot (CanonicalBootPads).
+bool CanonicalBoot(const Match& match)
+{
+  return !OriginReady(match) && !match.origin_failed;
+}
+
+// A fresh start's unseen tail is running.
+bool InTail(const Match& match)
+{
+  return match.fresh && match.fresh->phase == Match::Fresh::Phase::Tail;
+}
+
 // A round-trip sample the session has not seen yet (the room numbers its samples).
 std::optional<int> NewRoundTrip(u32* last_sequence)
 {
@@ -425,8 +509,9 @@ void StartKeyframe(Core::System& system, Match& match, int frame)
 {
   auto job = std::make_unique<KeyframeJob>();
   job->frame = frame;
-  if (frame < 0 || static_cast<size_t>(frame) > Orca::Net::MAX_REPLAY_FRAMES ||
-      match.replay.frames.size() <= static_cast<size_t>(frame))
+  // The replay holds this game's frames from its origin (or its last fresh start) on.
+  const Orca::Net::ReplayFrame* boundary = match.replay.At(frame);
+  if (!boundary || static_cast<size_t>(frame) > Orca::Net::MAX_REPLAY_FRAMES)
   {
     job->error = "restart the game to accept more players";
     job->refusal = "replay_limit";
@@ -435,8 +520,8 @@ void StartKeyframe(Core::System& system, Match& match, int frame)
     return;
   }
   Orca::Net::ReplayArchive replay = match.replay;
-  replay.boundary = replay.frames[frame];
-  replay.frames.resize(frame);
+  replay.boundary = *boundary;
+  replay.frames.resize(static_cast<size_t>(frame - replay.first_frame));
   auto& memory = system.GetMemory();
   replay.target_hash = RamChecksum({memory.GetRAM(), memory.GetRamSize()},
                                   {memory.GetEXRAM(), memory.GetEXRAM() ? memory.GetExRamSize() : 0});
@@ -475,9 +560,89 @@ void StartKeyframe(Core::System& system, Match& match, int frame)
 }
 
 
-// Host: at Profile::boot_nand_frame, hash what the boot wrote; a joiner's boot writes the same.
+void EndFresh(Match& match, const char* why);
+
+// Port 1's pad while a fresh start runs (FreshStart): nothing pressed through the tail and, in a
+// queue room, until the room's header is in; then the player's own pick put back by its own
+// inputs (UX/Queue.h ArmOwnPick); then the player's controller.
+Pad FreshPad(Match& match, const Pad& local, int frame)
+{
+  if (!match.fresh)
+    return local;
+  Match::Fresh& fresh = *match.fresh;
+  using Phase = Match::Fresh::Phase;
+  // The queue room went away while holding: the player plays on.
+  if (fresh.phase != Phase::Tail && fresh.queue &&
+      (Orca::Online::RoomEnded() || Orca::Online::Code() != fresh.room))
+  {
+    EndFresh(match, "the room is gone");
+    return local;
+  }
+  if (fresh.phase == Phase::Hold && Orca::UX::Rules::HeaderInPlace())
+  {
+    const Orca::UX::Queue::Identity pick = Orca::UX::Queue::OwnIdentity();
+    if (Orca::Status::Cap("queue2") && pick.HasPick())
+    {
+      fresh.phase = Phase::Steer;
+      Orca::UX::Queue::ArmOwnPick(pick);
+    }
+    else
+    {
+      EndFresh(match, "the room's header is in");
+      return local;
+    }
+  }
+  if (fresh.phase == Phase::Steer)
+  {
+    if (!Orca::UX::Queue::OwnPickArmed())
+    {
+      NOTICE_LOG_FMT(ROLLBACK, "Drop-in: port 1's pick is back at frame {} ({:.0f} ms after the "
+                               "fresh start)",
+                     frame, MsSince(fresh.started));
+      EndFresh(match, nullptr);
+      return local;
+    }
+    const std::optional<GCPadStatus> steer = Orca::UX::Queue::OwnPickPad();
+    return steer ? Orca::Net::EncodePad(*steer) : Pad{};
+  }
+  return Pad{};
+}
+
+// The tail is over once the character select has been up FRESH_CSS_SETTLE frames (this frame's
+// hook read it), or after FRESH_TAIL_LIMIT frames. Then the game runs and shows as usual.
+void StepTail(Match& match, int frame)
+{
+  if (!InTail(match))
+    return;
+  Match::Fresh& fresh = *match.fresh;
+  fresh.css_streak = Orca::UX::FreshMove::LastSeen().css ? fresh.css_streak + 1 : 0;
+  const int length = frame - match.origin_frame + 1;
+  if (fresh.css_streak < FRESH_CSS_SETTLE && length < FRESH_TAIL_LIMIT)
+    return;
+  if (fresh.css_streak < FRESH_CSS_SETTLE)
+  {
+    WARN_LOG_FMT(ROLLBACK, "Drop-in: the fresh start's tail found no character select in {} "
+                           "frames; it ends at frame {}",
+                 FRESH_TAIL_LIMIT, frame);
+  }
+  NOTICE_LOG_FMT(ROLLBACK, "Drop-in: the fresh start's tail ran frames {}-{} in {:.0f} ms",
+                 match.origin_frame, frame, MsSince(fresh.started));
+  match.port->SetCatchingUp(false);
+  // The readers start over on the character select, silently.
+  Orca::Events::NoteResync();
+  match.stats_frame = -1;
+  // A queue room's host holds port 1 until the room's header is in (FreshPad); a friend's fresh
+  // start is over.
+  if (fresh.queue)
+    fresh.phase = Match::Fresh::Phase::Hold;
+  else
+    match.fresh.reset();
+}
+
 void RunSolo(Match& match, const std::function<Pad(int)>& local_pad)
 {
+  // The local pad is read every frame, even when the frame doesn't use it, so the app's stream and
+  // the input stats see each frame.
   Pad pad;
   if (!match.queued_local.empty())
   {
@@ -488,13 +653,30 @@ void RunSolo(Match& match, const std::function<Pad(int)>& local_pad)
   {
     pad = local_pad(match.local_seat);
   }
-  Pads pads;
-  pads.fill(Orca::Net::UNPLUGGED_PAD);
-  pads[match.local_seat] = pad;
   const int frame = match.running + 1;
+  if (const int until = FastUntil();
+      until > 0 && (!match.fast_spent && frame < until) != match.fast)
+  {
+    match.fast = !match.fast_spent && frame < until;
+    Core::SetIsThrottlerTempDisabled(match.fast);
+    NOTICE_LOG_FMT(ROLLBACK, "Drop-in: frames run {} from frame {} (ORCA_TEST_FAST_UNTIL)",
+                   match.fast ? "unthrottled" : "at their own pace", frame);
+  }
+  Pads pads;
+  if (CanonicalBoot(match))
+  {
+    // Every Orca's boot plays the same inputs to its origin, whatever its seat or controller.
+    pads = CanonicalBootPads();
+  }
+  else
+  {
+    pads.fill(Orca::Net::UNPLUGGED_PAD);
+    pads[match.local_seat] = FreshPad(match, pad, frame);
+  }
   match.port->SetPads(frame, pads);
   match.log.push_back(pads);
   match.running = frame;
+  StepTail(match, frame);
   // No keyframe stored or in progress: only the newest frames can serve the next, so cap the log.
   if (!match.keyframe && !match.job && match.log.size() > 4 * KEYFRAME_FRESH_FRAMES)
   {
@@ -563,11 +745,31 @@ std::unique_ptr<Orca::Net::KeyframeStore> MakeStore()
       });
 }
 
+// The fresh start's hold or steer is over (a tail always runs to its end: StepTail).
+void EndFresh(Match& match, const char* why)
+{
+  if (!match.fresh || InTail(match))
+    return;
+  if (why)
+  {
+    NOTICE_LOG_FMT(ROLLBACK, "Drop-in: the fresh start hands port 1 back to the player at frame {} "
+                             "({})",
+                   match.running + 1, why);
+  }
+  if (match.fresh->phase == Match::Fresh::Phase::Steer)
+    Orca::UX::Queue::DisarmOwnPick();
+  match.fresh.reset();
+}
+
 // Drops drop-in work for the room being left; the next room gets a new store.
 void ResetDropIn(Match& match)
 {
   match.replaying.reset();
   match.before_join.reset();
+  // A fresh start due, armed or holding for this room is over with it.
+  match.fresh_pending = 0;
+  match.fresh_queue_armed = false;
+  EndFresh(match, "the room is left");
   if (match.keyframe && match.store)
     match.store->Delete(match.keyframe->id);
   match.keyframe.reset();
@@ -978,9 +1180,19 @@ void HostEvents(Core::System& system, Match& match)
       }
     }
   }
+  // An invite on its way ends the queue, but makes no keyframe: the friend's arrival may
+  // fresh-start this game first (DecideFreshStart).
   const bool invited = Orca::Online::TakePrepareJoin();
-  if (invited)
-    match.keyframe_wanted = true;
+  // A game with no origin can't be rebuilt anywhere: say so now rather than at the join's limit.
+  if (match.origin_failed && !match.waiting.empty())
+  {
+    for (const auto& [seat, arrival] : match.waiting)
+      Orca::Online::DropPeer(seat, "refused");
+    match.waiting.clear();
+    match.keyframe_wanted = false;
+    Orca::Status::State("friend-left refused");
+    match.friend_left_told = true;
+  }
   // A friend on the way ends this player's queue (before UpdateWanted).
   EndQueueForFriend(match, arrived, invited);
   // Refresh the wanted header: the room's welcome may have come after this boundary's hook.
@@ -1058,13 +1270,61 @@ void HostEvents(Core::System& system, Match& match)
   if (hold)
     return;
 
+  // A fresh start first, so the friend or the queue's opponent replays only this match's frames.
+  if (match.waiting.empty())
+    match.friends_in_place = false;
+  FreshInputs start;
+  start.enabled = FreshStartsOn() && match.origin_frame > 0;
+  start.origin_ready = OriginReady(match);
+  start.joining = match.joining;
+  start.session = match.session != nullptr;
+  start.seated_or_plugging = !match.seated.empty() || !match.plugging.empty();
+  start.busy = InTail(match) || match.job != nullptr || match.fresh_pending != 0;
+  start.queue_armed = match.fresh_queue_armed;
+  start.in_queue_room = InQueueRoom();
+  start.waiting = !match.waiting.empty();
+  start.in_place = match.friends_in_place;
+  start.single_player = Orca::UX::DropInHeld();
+  start.history_frames = match.running + 1 - match.replay.first_frame;
+  start.fresh_after = FreshFriendsAfter();
+  switch (DecideFreshStart(start))
+  {
+  case FreshStep::None:
+    // Whoever waits now joins in place, even if the history passes the threshold meanwhile.
+    match.friends_in_place = !match.waiting.empty();
+    break;
+  case FreshStep::Hold:
+    return;
+  case FreshStep::Now:
+    if (start.queue_armed)
+    {
+      match.fresh_pending = Orca::Online::RoomQueue() == "ranked" ? Orca::Net::MENU_EXIT_RANKED :
+                                                                    Orca::Net::MENU_EXIT_CASUAL;
+      NOTICE_LOG_FMT(ROLLBACK, "Drop-in: {} room {}: a fresh start at the next boundary (frame {})",
+                     Orca::Online::RoomQueue(), Orca::Online::Code(), match.running + 2);
+    }
+    else
+    {
+      const std::optional<Orca::UX::OnlinePick> pick = Orca::UX::CssPick();
+      match.fresh_pending = FriendsFreshExit(
+          pick ? std::optional(*pick == Orca::UX::OnlinePick::Ranked) : std::nullopt);
+      NOTICE_LOG_FMT(ROLLBACK, "Drop-in: a friend arrives after {} frames of this game's own: a "
+                               "fresh start at the next boundary (frame {}, exit {})",
+                     start.history_frames, match.running + 2, match.fresh_pending);
+    }
+    return;
+  }
+
   // A queue room's opponent must replay a keyframe carrying the room's header, so wait for it. If
   // it never lands, fail the join rather than start the match on the wrong header.
   DropStaleKeyframe(match);
   const u64 generation = Orca::UX::Rules::WantedGeneration();
   const bool in_place = Orca::UX::Rules::HeaderInPlace();
-  const HeaderWait header = StepHeaderWait(&match.header_waited, in_place,
-                                           !match.waiting.empty(), InQueueRoom());
+  // A fresh start's tail can't write the header (it runs as a re-run), so its boundaries don't
+  // count toward the header's limit.
+  const HeaderWait header = InTail(match) ? HeaderWait::Wait :
+                                            StepHeaderWait(&match.header_waited, in_place,
+                                                           !match.waiting.empty(), InQueueRoom());
   if (header == HeaderWait::Fail)
   {
     FailHeaderWait(match);
@@ -1089,7 +1349,11 @@ void HostEvents(Core::System& system, Match& match)
   {
     if (fresh)
       match.keyframe_wanted = false;
-    else if (next >= FIRST_KEYFRAME_FRAME && (!match.session || match.session->Settled()))
+    // Not while a fresh start runs (its tail, the queue host's hold, its own pick being put back):
+    // the session starts as soon as the keyframe is stored, and the player's pad then replaces the
+    // steering, so the pick would be left half done.
+    else if (next >= FIRST_KEYFRAME_FRAME && OriginReady(match) && next > match.replay.first_frame &&
+             !match.fresh && (!match.session || match.session->Settled()))
     {
       match.keyframe_wanted = false;
       StartKeyframe(system, match, next);
@@ -1144,6 +1408,13 @@ void HostEvents(Core::System& system, Match& match)
       match.log.clear();
       // Solo pads had no delay; now they do, and skipped frames repeat the current pad (start_pad).
       match.queued_local.clear();
+      // A fresh start still putting port 1's pick back hands it to the player: in a session the
+      // local pad is sampled ahead of the frame it plays.
+      EndFresh(match, "a session starts");
+      // A session keeps time with its friends (ORCA_TEST_FAST_UNTIL ages a host before one).
+      match.fast_spent = true;
+      if (std::exchange(match.fast, false))
+        Core::SetIsThrottlerTempDisabled(false);
       // The host's own controls apply from the next frame (this frame's hook already ran) and never
       // change mid-session: a friend may already have run that frame.
       RefreshOwnValues(match, next + 1);
@@ -1404,7 +1675,156 @@ enum class Load
   Broken,
 };
 
-// Restores only a snapshot and NAND captured by this process at its own first boundary.
+// Puts this machine's own image and NAND back as `frame`, on a new ring (the old snapshots belong
+// to the game being replaced). Only ever images this process captured itself.
+enum class Restore
+{
+  Done,
+  // Nothing changed.
+  Failed,
+  // Half restored: the caller stops the game.
+  Broken,
+};
+Restore RestoreLocal(Core::System& system, Match& match, MachineImage image,
+                     const std::vector<Orca::Net::NandEntry>& nand_entries, int frame)
+{
+  IOS::HLE::FS::HostFileSystem* nand = HostNand(system);
+  if (!nand || !Core::WiiRootIsTemporary())
+    return Restore::Failed;
+  nand->CloseHostFiles();
+  match.port.reset();
+  match.port = std::make_unique<RingPort>(system, MAX_ROLLBACK);
+  if (!Orca::Net::ReplaceNandTree(nand->HostRoot(), nand_entries))
+    return Restore::Broken;
+  nand->ReloadFst();
+  if (!match.port->LoadImage(std::move(image), frame))
+    return Restore::Broken;
+  // Frames from here are a new timeline; test runs' harness counts them as first passes.
+  Rollback::Harness::Restart();
+  return Restore::Done;
+}
+
+// Captures this machine's origin at the start of `frame`, before its hook: its own snapshot, NAND
+// and RAM checksum. The replay starts here.
+bool CaptureOrigin(Core::System& system, Match& match, int frame)
+{
+  const auto start = Clock::now();
+  IOS::HLE::FS::HostFileSystem* nand = HostNand(system);
+  if (nand)
+    nand->CloseHostFiles();
+  const bool nand_ok = nand && Core::WiiRootIsTemporary() &&
+                       Orca::Net::ReadNandTree(nand->HostRoot(), &match.origin_nand);
+  if (nand)
+    nand->ReopenHostFiles();
+  if (!nand_ok || !SnapshotRing::Capture(system, &match.origin, true))
+  {
+    StopEmulation(system, "Couldn't prepare this game's local replay origin");
+    End("replay origin");
+    return false;
+  }
+  match.origin_frame = frame;
+  match.origin_hash = RamChecksum(match.origin.mem1, match.origin.mem2);
+  match.replay = {};
+  match.replay.origin_hash = match.origin_hash;
+  match.replay.first_frame = frame;
+  match.log.clear();
+  match.log_base = frame;
+  // Every way into the origin's frame starts with an empty JIT: this one, a fresh start and a
+  // joiner's restore (both clear after RestoreLocal). So a host whose friend joins in place runs
+  // from the origin with the same JIT history as that friend's rebuild.
+  system.GetJitInterface().ClearSafe();
+  u64 nand_bytes = 0;
+  for (const Orca::Net::NandEntry& e : match.origin_nand)
+    nand_bytes += e.data.size();
+  NOTICE_LOG_FMT(ROLLBACK, "Drop-in: origin at frame {}: RAM {:016x}, NAND {} KB ({:.0f} ms)", frame,
+                 match.origin_hash, nand_bytes / 1024, MsSince(start));
+  return true;
+}
+
+// The host goes back to its own origin and leaves the main menu with `fresh_pending`'s exit for
+// the match's character select (ORCA.md "Drop-in"). The history starts again there, so whoever
+// joins next replays only this match's frames. Solo with no session only. Returns the origin's
+// frame, where the state now starts.
+std::optional<int> FreshStart(Core::System& system, Match& match)
+{
+  const u8 exit = std::exchange(match.fresh_pending, 0);
+  if (!OriginReady(match) || match.session || match.joining || match.replaying || match.download ||
+      match.job || !match.port || !Orca::Net::ValidMenuExit(exit))
+  {
+    WARN_LOG_FMT(ROLLBACK, "Drop-in: a fresh start was due at frame {}, but this game isn't solo "
+                           "with an origin; skipped",
+                 match.running + 1);
+    return std::nullopt;
+  }
+  const auto start = Clock::now();
+  const int from = match.running + 1;
+  const int frame = match.origin_frame;
+  switch (RestoreLocal(system, match, match.origin, match.origin_nand, frame))
+  {
+  case Restore::Done:
+    break;
+  case Restore::Failed:
+    ERROR_LOG_FMT(ROLLBACK, "Drop-in: no session NAND for a fresh start at frame {}", from);
+    return std::nullopt;
+  case Restore::Broken:
+    StopEmulation(system, "Couldn't restore this game's local boot");
+    Orca::Status::Error("internal", "Couldn't restore this game's local boot");
+    End("fresh start");
+    return std::nullopt;
+  }
+  system.GetJitInterface().ClearSafe();
+  // A keyframe of the game left behind serves nobody now.
+  if (match.keyframe && match.store)
+    match.store->Delete(match.keyframe->id);
+  match.keyframe.reset();
+  match.keyframe_wanted = !match.waiting.empty();
+  match.header_waited = 0;
+  match.running = frame - 1;
+  match.replay = {};
+  match.replay.origin_hash = match.origin_hash;
+  match.replay.first_frame = frame;
+  // The exit is the first frame's typed event; FreshMove applies it at that frame's hook, here and
+  // in every replay of it.
+  match.replay.frames.resize(1);
+  match.replay.frames[0].menu_exit = exit;
+  match.log.clear();
+  match.log_base = frame;
+  match.queued_local.clear();
+  // This player's own name, controls and queue identity apply from the origin.
+  match.port_names.clear();
+  RefreshOwnValues(match, frame);
+  match.stats_frame = -1;
+  Match::Fresh fresh;
+  fresh.exit = exit;
+  fresh.queue = InQueueRoom();
+  fresh.room = Orca::Online::Code();
+  fresh.started = start;
+  match.fresh = fresh;
+  if (fresh.queue)
+  {
+    match.fresh_queue_armed = false;
+    match.fresh_room = fresh.room;
+  }
+  Orca::UX::Queue::DisarmOwnPick();
+  // ORCA_TEST_FAST_UNTIL aged the host before its first fresh start only.
+  match.fast_spent = true;
+  if (std::exchange(match.fast, false))
+    Core::SetIsThrottlerTempDisabled(false);
+  // Unthrottled, unseen and muted until the character select is up (StepTail).
+  match.port->SetCatchingUp(true);
+  Orca::Events::NoteResync();
+  Orca::UX::Queue::ResetTimeouts();
+  Orca::UX::Tracker().Reset();
+  Orca::UX::Rules::MemoryReplaced();
+  NOTICE_LOG_FMT(ROLLBACK, "Drop-in: fresh start at frame {}: back to the origin (frame {}) in {:.0f} "
+                           "ms, leaving the main menu with exit code {}{}",
+                 from, frame, MsSince(start), exit,
+                 fresh.queue ? fmt::format(" for {} room {}", Orca::Online::RoomQueue(), fresh.room) :
+                               std::string());
+  return frame;
+}
+
+// Restores only a snapshot and NAND captured by this process at its own origin.
 // Peer data is a bounded input replay; it never enters Dolphin's state loader.
 Load LoadKeyframe(Core::System& system, Match& match, int* frame_out)
 {
@@ -1417,8 +1837,21 @@ Load LoadKeyframe(Core::System& system, Match& match, int* frame_out)
     match.join_error = "Couldn't download your friend's replay";
     return Load::Failed;
   }
-  if (match.origin.state.empty() || download->replay.origin_hash != match.replay.origin_hash)
+  if (!OriginReady(match) || match.origin.state.empty())
   {
+    match.join_error_code = "internal";
+    match.join_error = "This game has no local origin to rebuild your friend's game from";
+    return Load::Failed;
+  }
+  // Both machines boot the same way to the same origin: another frame or another RAM there is
+  // another game (or another build of it).
+  if (download->replay.origin_hash != match.origin_hash ||
+      download->replay.first_frame != match.origin_frame)
+  {
+    WARN_LOG_FMT(ROLLBACK, "Drop-in: the host's origin is frame {} ({:016x}), this game's frame {} "
+                           "({:016x})",
+                 download->replay.first_frame, download->replay.origin_hash, match.origin_frame,
+                 match.origin_hash);
     match.join_error_code = "room_mismatch";
     match.join_error = "Your friend's game data differs from yours";
     return Load::Failed;
@@ -1444,24 +1877,19 @@ Load LoadKeyframe(Core::System& system, Match& match, int* frame_out)
     return Load::Failed;
   }
   match.before_join = std::move(before);
-  match.port.reset();
-  match.port = std::make_unique<RingPort>(system, MAX_ROLLBACK);
-  if (!Orca::Net::ReplaceNandTree(nand->HostRoot(), match.origin_nand))
-  {
-    StopEmulation(system, "Couldn't restore this game's local save folder");
-    End("replay origin");
-    return Load::Broken;
-  }
-  nand->ReloadFst();
-  if (!match.port->LoadImage(match.origin, 0))
+  if (RestoreLocal(system, match, match.origin, match.origin_nand, match.origin_frame) !=
+      Restore::Done)
   {
     StopEmulation(system, "Couldn't restore this game's local boot");
     End("replay origin");
     return Load::Broken;
   }
   system.GetJitInterface().ClearSafe();
+  // A fresh start of this game's own is over: the friend's game replaces it.
+  match.fresh.reset();
+  Orca::UX::Queue::DisarmOwnPick();
   match.replay = std::move(download->replay);
-  match.running = -1;
+  match.running = match.origin_frame - 1;
   match.join_in_play = false;
   match.loaded_time = Clock::now();
   match.replay_heartbeat = {};
@@ -1471,7 +1899,7 @@ Load LoadKeyframe(Core::System& system, Match& match, int* frame_out)
   Orca::UX::Tracker().Reset();
   Orca::Events::NoteResync();
   Orca::UX::Rules::MemoryReplaced();
-  *frame_out = 0;
+  *frame_out = match.origin_frame;
   return Load::Done;
 }
 
@@ -1515,17 +1943,11 @@ void FinishReplay(Match& match)
 bool RestoreBeforeJoin(Core::System& system, Match& match)
 {
   auto before = std::move(match.before_join);
-  auto* nand = HostNand(system);
-  if (!before || !nand || !Core::WiiRootIsTemporary())
+  if (!before || RestoreLocal(system, match, std::move(before->image), before->nand,
+                              before->frame) != Restore::Done)
+  {
     return false;
-  nand->CloseHostFiles();
-  match.port.reset();
-  match.port = std::make_unique<RingPort>(system, MAX_ROLLBACK);
-  if (!Orca::Net::ReplaceNandTree(nand->HostRoot(), before->nand))
-    return false;
-  nand->ReloadFst();
-  if (!match.port->LoadImage(std::move(before->image), before->frame))
-    return false;
+  }
   // As after loading the origin: a rebuild cancelled before its jit_clear_frame leaves blocks
   // compiled from the boot's code.
   system.GetJitInterface().ClearSafe();
@@ -1606,13 +2028,33 @@ ReplayStep AdvanceReplay(Core::System& system, Match& match, const FrameHook& on
   // (Rollback.cpp, JitClearDue), and the replay's frames count from that boot's first boundary. A
   // joiner long past that frame never gets JitClearDue again, so the rebuild clears here, at the
   // same frame. A launch joiner's JitClearDue fires at this boundary too; a second clear is free.
+  // An origin at the built main menu is past that frame (DecideOrigin), so only a replay from
+  // frame 0 (a game without one) gets here.
   if (const Orca::Profile* profile = Orca::ActiveProfile();
       profile && profile->jit_clear_frame && frame == static_cast<int>(*profile->jit_clear_frame))
   {
     system.GetJitInterface().ClearSafe();
     NOTICE_LOG_FMT(ROLLBACK, "Drop-in: JIT cleared at replay frame {}", frame);
   }
-  Orca::Net::ReplayFrame& record = frame < target ? match.replay.frames[frame] : match.replay.boundary;
+  Orca::Net::ReplayFrame* const at = frame < target ? match.replay.At(frame) : nullptr;
+  // The decoder hands over every frame from the origin to the target; a gap is a bug, never a
+  // frame to play with the boundary's events.
+  if (frame < target && !at)
+  {
+    ERROR_LOG_FMT(ROLLBACK, "Drop-in: the replay has no frame {} (frames {}-{})", frame,
+                  match.replay.first_frame, target);
+    if (!RestoreBeforeJoin(system, match))
+    {
+      StopEmulation(system, "Couldn't return to your own game");
+      End("replay gap");
+      return ReplayStep::Failed;
+    }
+    match.join_error_code = "room_mismatch";
+    match.join_error = "Your friend's replay didn't reproduce the same game";
+    FailJoin(system, match);
+    return ReplayStep::Failed;
+  }
+  Orca::Net::ReplayFrame& record = at ? *at : match.replay.boundary;
   {
     Orca::Net::ReplayScope scope(&record, true, true);
     on_frame(frame, true, *record.ports, false);
@@ -1621,8 +2063,12 @@ ReplayStep AdvanceReplay(Core::System& system, Match& match, const FrameHook& on
   {
     match.port->SetPads(frame, record.pads);
     match.running = frame;
+    const int first = match.replay.first_frame;
     if (frame % 60 == 0)
-      Orca::Status::State(fmt::format("joining {}", 50 + (target ? frame * 40 / target : 40)));
+    {
+      Orca::Status::State(fmt::format(
+          "joining {}", 50 + (target > first ? (frame - first) * 40 / (target - first) : 40)));
+    }
     return ReplayStep::Running;
   }
   auto& memory = system.GetMemory();
@@ -1802,7 +2248,10 @@ void HostInPlay(Match& match, const std::string& code)
   Orca::Online::ShutdownInBackground();
   Orca::Online::StartRoom(code, false);
   Orca::UX::Search::Matched(true);
-  // The header and rule locks follow at the next alone boundary, once the welcome names the queue.
+  // Once the welcome names the queue, this game fresh-starts into the room's character select
+  // (DecideFreshStart); the header and rule locks follow at the next alone boundary after it. Once
+  // per room.
+  match.fresh_queue_armed = code != match.fresh_room;
   NOTICE_LOG_FMT(ROLLBACK, "Matchmaking: hosting room {} from frame {}", code, match.running + 1);
 }
 
@@ -1813,6 +2262,9 @@ void TakeCommands(Core::System& system, Match& match)
 {
   // A command sent before the app's "caps" line stays queued in Online until it arrives.
   if (!Orca::Status::Cap("join") && !Orca::Status::Cap("leave") && !Orca::Status::Cap("host"))
+    return;
+  // Likewise before the origin (the boot plays nobody's inputs) and through a fresh start's tail.
+  if (CanonicalBoot(match) || InTail(match))
     return;
   if (match.session &&
       (match.session->Resimulating() || match.session->CurrentFrame() != match.running + 1))
@@ -1920,33 +2372,23 @@ bool MaybeRestoreQueueImage(Core::System& system, Match& match)
   }
   std::unique_ptr<Match::QueueImage> image = std::move(match.queue_image);
   const auto start = Clock::now();
-  IOS::HLE::FS::HostFileSystem* nand = HostNand(system);
-  if (!nand || !Core::WiiRootIsTemporary())
+  const int frame = image->frame;
+  switch (RestoreLocal(system, match, std::move(image->image), image->nand, frame))
   {
+  case Restore::Done:
+    break;
+  case Restore::Failed:
     ERROR_LOG_FMT(ROLLBACK, "Queue: no session NAND to put this player's own game back into");
     return false;
-  }
-  nand->CloseHostFiles();
-  // New ring before the NAND changes: the old snapshots belong to the room's game.
-  match.port.reset();
-  match.port = std::make_unique<RingPort>(system, MAX_ROLLBACK);
-  if (!Orca::Net::ReplaceNandTree(nand->HostRoot(), image->nand))
-  {
-    StopEmulation(system, "Couldn't go back to your own game: its save folder couldn't be "
-                          "replaced");
-    Orca::Status::Error("internal", "Couldn't go back to your own game");
-    End("queue image");
-    return false;
-  }
-  nand->ReloadFst();
-  const int frame = image->frame;
-  if (!match.port->LoadImage(std::move(image->image), frame))
-  {
+  case Restore::Broken:
     StopEmulation(system, "Couldn't go back to your own game");
     Orca::Status::Error("internal", "Couldn't go back to your own game");
     End("queue image");
     return false;
   }
+  // The room's fresh start, if any, was for the game left behind.
+  match.fresh.reset();
+  Orca::UX::Queue::DisarmOwnPick();
   Orca::Events::NoteResync();
   // The header the frame hook read was the room's game's; this game's own is read at the next hook.
   Orca::UX::Rules::MemoryReplaced();
@@ -2304,6 +2746,9 @@ void RefreshOwnValues(Match& match, int frame)
 // Controllers plugged in at `frame` (the session's plan, or solo just this player).
 std::vector<Orca::Events::PortInfo> PortsAt(Match& match, int frame)
 {
+  // The canonical boot: port 1, with no values, on every machine.
+  if (CanonicalBoot(match))
+    return {Orca::Events::PortInfo{0, "", false, {}, {}}};
   // A host names its own port, with its own controls, only while solo: in a session a friend may
   // already have run this frame. A joiner takes all values from its host. Solo frames are never
   // re-run, and a friend who joins later gets these entries with the keyframe.
@@ -2754,6 +3199,7 @@ std::optional<int> Boundary(Core::System& system,
     match.job.reset();
     match.download.reset();
     match = {};
+    Orca::UX::Queue::DisarmOwnPick();
   }
   if (match.finished)
     return std::nullopt;
@@ -2795,8 +3241,7 @@ std::optional<int> Boundary(Core::System& system,
         End("no keyframe store");
         return std::nullopt;
       }
-      // Until the keyframe is in, run this boot unthrottled and unseen up to boot_nand_frame, so
-      // its NAND files needn't travel.
+      // Until the keyframe is in, run this boot unthrottled and unseen to its origin.
       match.boot_time = Clock::now();
       Orca::Status::State("joining 0");
       match.port = std::make_unique<RingPort>(system, MAX_ROLLBACK);
@@ -2809,20 +3254,39 @@ std::optional<int> Boundary(Core::System& system,
       NOTICE_LOG_FMT(ROLLBACK, "Drop-in: playing solo on port 1; room {}", Orca::Online::StatusLine());
     }
     system.GetJitInterface().ClearSafe();
-    IOS::HLE::FS::HostFileSystem* nand = HostNand(system);
-    if (nand)
-      nand->CloseHostFiles();
-    const bool origin_ok = nand && Core::WiiRootIsTemporary() &&
-                           Orca::Net::ReadNandTree(nand->HostRoot(), &match.origin_nand);
-    if (nand)
-      nand->ReopenHostFiles();
-    if (!origin_ok || !SnapshotRing::Capture(system, &match.origin, true))
+    // A game whose main menu this can't read has its origin at its first boundary instead, and no
+    // fresh starts.
+    if (!Orca::UX::FreshMove::Supported())
     {
-      StopEmulation(system, "Couldn't prepare this game's local replay origin");
-      End("replay origin");
-      return std::nullopt;
+      NOTICE_LOG_FMT(ROLLBACK, "Drop-in: this game's main menu isn't read: its origin is its first "
+                               "frame, with no fresh starts");
+      if (!CaptureOrigin(system, match, 0))
+        return std::nullopt;
     }
-    match.replay.origin_hash = RamChecksum(match.origin.mem1, match.origin.mem2);
+  }
+
+  // Every boot plays the canonical boot to its origin, the first boundary whose main menu has been
+  // built for ORIGIN_SETTLE_FRAMES frames, captured before that boundary's hook.
+  if (CanonicalBoot(match))
+  {
+    const int frame = match.running + 1;
+    const Orca::Profile* profile = Orca::ActiveProfile();
+    switch (DecideOrigin(frame, match.menu_built_streak,
+                         profile ? profile->jit_clear_frame : std::nullopt))
+    {
+    case OriginStep::Wait:
+      break;
+    case OriginStep::Capture:
+      if (!CaptureOrigin(system, match, frame))
+        return std::nullopt;
+      break;
+    case OriginStep::Fail:
+      match.origin_failed = true;
+      ERROR_LOG_FMT(ROLLBACK, "Drop-in: no built main menu by frame {}: this game has no origin, so "
+                              "it can't take or join players",
+                    frame);
+      break;
+    }
   }
 
   Orca::Net::ReplayRecordingScope recording(&match.replay);
@@ -2846,15 +3310,37 @@ std::optional<int> Boundary(Core::System& system,
     }
   }
 
+  // A fresh start due (HostEvents): back to the origin and out of the main menu, before this
+  // boundary's hook, which then runs the origin's frame.
+  if (match.fresh_pending)
+  {
+    if (const std::optional<int> origin = FreshStart(system, match))
+    {
+      rewound_to = origin;
+    }
+    else if (!match.finished)
+    {
+      // Not tried again every boundary: whoever waits now (a friend, or the queue room's
+      // opponent) joins in place instead, from this game's origin.
+      match.friends_in_place = !match.waiting.empty();
+      if (std::exchange(match.fresh_queue_armed, false))
+        match.fresh_room = Orca::Online::Code();
+    }
+    if (match.finished)
+      return std::nullopt;
+  }
+
   // Once a queue room is over, restore this player's own game first, so this boundary's hook
   // already sees its own character select.
   if (MaybeRestoreQueueImage(system, match))
     rewound_to = match.running + 1;
 
-  // The header this game's room calls for, written only where HeaderFreeAt allows.
+  // The header this game's room calls for, written only where HeaderFreeAt allows (never in the
+  // canonical boot).
   UpdateWanted(match);
   DropStaleKeyframe(match);
   Orca::UX::Rules::SetHeaderFree(
+      !CanonicalBoot(match) &&
       HeaderFreeAt(match.running + 1, SoloQuiet(match),
                    match.keyframe ? std::optional(match.keyframe->frame) : std::nullopt));
 
@@ -2862,7 +3348,9 @@ std::optional<int> Boundary(Core::System& system,
   if (!replay_boundary)
   {
     const int frame = match.running + 1;
-    const bool resimulating = match.session && match.session->Resimulating();
+    // A fresh start's tail runs as a joiner's rebuild of the same frames would: a re-run that
+    // plays the replay's typed events (the main menu exit) and announces nothing.
+    const bool resimulating = (match.session && match.session->Resimulating()) || InTail(match);
     const std::vector<Orca::Events::PortInfo> ports = PortsAt(match, frame);
     auto* record = Orca::Net::ReplayRecordingScope::Frame(frame);
     if (record)
@@ -2870,21 +3358,28 @@ std::optional<int> Boundary(Core::System& system,
       auto canonical = ports;
       for (auto& port : canonical)
         port.remote = false;
-      if (frame > 0 && match.replay.frames[frame - 1].ports &&
-          *match.replay.frames[frame - 1].ports == canonical)
-        record->ports = match.replay.frames[frame - 1].ports;
+      const Orca::Net::ReplayFrame* previous = match.replay.At(frame - 1);
+      if (previous && previous->ports && *previous->ports == canonical)
+        record->ports = previous->ports;
       else
         record->ports = std::make_shared<const std::vector<Orca::Events::PortInfo>>(std::move(canonical));
     }
     Orca::Net::ReplayScope replay_scope(record, resimulating);
+    // Nothing is this player's alone before its origin: the boot is everyone's.
     on_frame(frame, resimulating, ports,
-             !resimulating &&
+             !resimulating && !CanonicalBoot(match) &&
                  AloneAt(frame, SoloIdle(match), Orca::Online::DropInPending(),
                          match.keyframe ? std::optional(match.keyframe->frame) : std::nullopt));
     if (!resimulating && ports != match.told_ports)
     {
       match.told_ports = ports;
       Orca::Events::NotifyPlugIn(frame, ports);
+    }
+    // Before the origin: frames in a row with the main menu built (DecideOrigin).
+    if (CanonicalBoot(match))
+    {
+      match.menu_built_streak =
+          Orca::UX::FreshMove::LastSeen().menu_built ? match.menu_built_streak + 1 : 0;
     }
   }
 
@@ -2935,9 +3430,33 @@ std::optional<int> Boundary(Core::System& system,
     if (match.finished)
       return std::nullopt;
   }
+  else if (match.joining && !match.session && CanonicalBoot(match))
+  {
+    // A launch joiner first boots on its own to its origin, unseen and unthrottled, taking the
+    // host's offer meanwhile; the join goes on from there (JoinHost).
+    if (PumpJoin(match, &match.join_status) == JoinPump::Failed)
+      FailJoin(system, match);
+    if (match.joining)
+    {
+      RunSolo(match, local_pad);
+      return std::nullopt;
+    }
+    // Failed (with "caps join" this player now plays its own boot on port 1), or stopping.
+    if (match.finished || Stopping(system))
+      return std::nullopt;
+  }
   else if (match.joining && !match.session)
   {
-    rewound_to = JoinHost(system, match);
+    if (match.origin_failed)
+    {
+      match.join_error_code = "internal";
+      match.join_error = "This game can't rebuild your friend's game";
+      FailJoin(system, match);
+    }
+    else
+    {
+      rewound_to = JoinHost(system, match);
+    }
     // Failed (with "caps join" this player now plays solo), or stopping.
     if (!rewound_to && (match.joining || match.finished || Stopping(system)))
       return std::nullopt;
@@ -2967,7 +3486,9 @@ std::optional<int> Boundary(Core::System& system,
     if (!match.session)
     {
       RunSolo(match, local_pad);
-      PublishStats(match);
+      // A fresh start's tail runs unthrottled: its frames aren't this machine's frame rate.
+      if (!InTail(match))
+        PublishStats(match);
       return rewound_to;
     }
   }
@@ -3556,6 +4077,50 @@ KeptPickStep DecideKeptPick(const KeptPickInputs& in)
   if (!in.stands || in.queue_or_search)
     return KeptPickStep::Drop;
   return in.alone ? KeptPickStep::Arm : KeptPickStep::Wait;
+}
+
+Orca::Net::Pads CanonicalBootPads()
+{
+  Orca::Net::Pads pads;
+  pads.fill(Orca::Net::UNPLUGGED_PAD);
+  pads[0] = Orca::Net::Pad{};
+  return pads;
+}
+
+OriginStep DecideOrigin(int frame, int menu_built_streak, std::optional<u32> jit_clear_frame)
+{
+  if (menu_built_streak >= ORIGIN_SETTLE_FRAMES &&
+      (!jit_clear_frame || frame > static_cast<int>(*jit_clear_frame)))
+  {
+    return OriginStep::Capture;
+  }
+  return frame >= ORIGIN_DEADLINE ? OriginStep::Fail : OriginStep::Wait;
+}
+
+FreshStep DecideFreshStart(const FreshInputs& in)
+{
+  if (!in.enabled || in.joining || in.session || in.seated_or_plugging)
+    return FreshStep::None;
+  // A queue room's host: once its welcome names the queue. No keyframe before.
+  if (in.queue_armed)
+  {
+    if (!in.origin_ready || in.busy || !in.in_queue_room)
+      return FreshStep::Hold;
+    return FreshStep::Now;
+  }
+  // A queue room that had its fresh start (or never needed one) takes its opponent in place.
+  if (in.in_queue_room || !in.waiting || in.in_place)
+    return FreshStep::None;
+  if (!in.origin_ready || in.busy || in.single_player)
+    return FreshStep::Hold;
+  return in.history_frames > in.fresh_after ? FreshStep::Now : FreshStep::None;
+}
+
+u8 FriendsFreshExit(std::optional<bool> css_pick_ranked)
+{
+  if (!css_pick_ranked)
+    return Orca::Net::MENU_EXIT_FRIENDS;
+  return *css_pick_ranked ? Orca::Net::MENU_EXIT_RANKED : Orca::Net::MENU_EXIT_CASUAL;
 }
 
 HeaderWait StepHeaderWait(int* waited, bool in_place, bool someone_waiting, bool queue_room)

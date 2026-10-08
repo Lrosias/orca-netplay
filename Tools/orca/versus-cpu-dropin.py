@@ -14,6 +14,11 @@
 #    for port 2 on its player-type button (OnlineSeats::PressesJoin).
 # 4. The friend leaves. Each side's session must end with matched checksums and no desync.
 # Fails on a desync, a timeout or an "orca error".
+#
+# Since 0.3.34 a friend arriving more than 10 s after the host's last start would fresh-start it to
+# With Friends' select (ORCA.md "Fresh starts"), so both Orcas run with
+# ORCA_TEST_FRESH_AFTER=100000000 unless ORCA_TEST_FRESH or ORCA_TEST_FRESH_AFTER is set. A local
+# rooms stack: ORCA_SITE.
 import os
 import queue
 import random
@@ -88,6 +93,14 @@ class Orca:
         }
         if PPLUS:
             env["ORCA_PROFILE"] = "PPLUS32"
+        # A local rooms stack (ORCA_SITE) and the fresh start's knobs (ORCA.md "Fresh starts"). By
+        # default the friend joins in place: a fresh start would leave the host's Versus select,
+        # CPUs and all, for With Friends'.
+        if not os.environ.get("ORCA_TEST_FRESH") and not os.environ.get("ORCA_TEST_FRESH_AFTER"):
+            env["ORCA_TEST_FRESH_AFTER"] = "100000000"
+        for key in ("ORCA_SITE", "ORCA_TEST_FRESH", "ORCA_TEST_FRESH_AFTER"):
+            if os.environ.get(key):
+                env[key] = os.environ[key]
         env.update(env_extra)
         args = ["nice", "-n", "10", BIN, "-p", "headless", "-u", user, "-v", "Null",
                 "-C", "Dolphin.DSP.Backend=No Audio Output",

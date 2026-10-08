@@ -731,6 +731,139 @@ TEST(OrcaQueue, PortOnesColourIsAnyColour)
   EXPECT_EQ(s.locked & 2, 2);
 }
 
+namespace
+{
+// Port 1 on the room's character select after a fresh start: the token in its hand, below the grid.
+CssPort FreshPort1()
+{
+  CssPort p;
+  p.readable = true;
+  p.human = true;
+  p.hand_target = Rules::CSS_HAND_NOTHING;
+  p.hand_x = -2.0f;
+  p.hand_y = -18.0f;
+  return p;
+}
+
+Identity Mario(int costume = 2)
+{
+  Identity pick;
+  pick.character = 0x05;
+  pick.costume = costume;
+  pick.x = -12.0f;
+  pick.y = 9.5f;
+  return pick;
+}
+}  // namespace
+
+TEST(OrcaQueue, PortOnesOwnPickIsPutBackByItsOwnInputs)
+{
+  const Identity pick = Mario();
+  OwnSteer steer;
+  CssPort one = FreshPort1();
+  // The select's first frames: centred, nothing pressed.
+  for (int f = 0; f < STEER_SETTLE_FRAMES; ++f)
+  {
+    const OwnStep step = StepOwnPick(one, pick, &steer);
+    EXPECT_FALSE(step.done);
+    EXPECT_EQ(step, OwnStep{}) << f;
+  }
+  // Then the hand heads for the pick: up and left, full tilt.
+  OwnStep step = StepOwnPick(one, pick, &steer);
+  EXPECT_FALSE(step.done);
+  EXPECT_LT(step.stick_x, CX - 20);
+  EXPECT_GT(step.stick_y, CY + 40);
+  EXPECT_EQ(step.buttons, 0);
+  // Over the pick, still sliding: no A.
+  one.hand_target = Rules::CSS_HAND_GRID_HOLDING;
+  one.character = 0x05;
+  one.hand_x = -12.4f;
+  one.hand_y = 9.3f;
+  step = StepOwnPick(one, pick, &steer);
+  EXPECT_EQ(step.buttons, 0);
+  EXPECT_EQ(step.stick_x, CX);
+  // Still: A on every fourth frame, released between.
+  int presses = 0;
+  for (int i = 0; i < 8; ++i)
+  {
+    step = StepOwnPick(one, pick, &steer);
+    EXPECT_FALSE(step.done);
+    EXPECT_EQ(step.buttons & ~A, 0);
+    presses += (step.buttons & A) != 0;
+  }
+  EXPECT_EQ(presses, 2);
+  // Down on another character: B on the edges.
+  CssPort wrong = one;
+  wrong.placed = true;
+  wrong.character = 0x06;
+  presses = 0;
+  for (int i = 0; i < 4; ++i)
+  {
+    step = StepOwnPick(wrong, pick, &steer);
+    EXPECT_EQ(step.buttons & ~B, 0);
+    presses += step.buttons != 0;
+  }
+  EXPECT_EQ(presses, 1);
+  // Down on the pick in another colour: X; in its colour: done.
+  one.placed = true;
+  one.costume = 0;
+  presses = 0;
+  for (int i = 0; i < 4; ++i)
+  {
+    step = StepOwnPick(one, pick, &steer);
+    EXPECT_FALSE(step.done);
+    EXPECT_EQ(step.buttons & ~X, 0);
+    presses += step.buttons != 0;
+  }
+  EXPECT_EQ(presses, 1);
+  one.costume = 2;
+  EXPECT_TRUE(StepOwnPick(one, pick, &steer).done);
+}
+
+TEST(OrcaQueue, PortOnesOwnPickGivesUpAndNeedsAPick)
+{
+  // No pick: nothing to steer.
+  OwnSteer none;
+  EXPECT_TRUE(StepOwnPick(FreshPort1(), Identity{}, &none).done);
+  // The hand never gets there: done at the limit.
+  OwnSteer steer;
+  int frames = 0;
+  while (!StepOwnPick(FreshPort1(), Mario(), &steer).done)
+    ASSERT_LE(++frames, STEER_LIMIT_FRAMES);
+  EXPECT_EQ(frames, STEER_LIMIT_FRAMES);
+  // The colour never turns: done after COSTUME_LIMIT_FRAMES of X.
+  OwnSteer colour;
+  colour.frames = STEER_SETTLE_FRAMES;
+  CssPort one = FreshPort1();
+  one.placed = true;
+  one.character = 0x05;
+  one.costume = 5;
+  int x = 0;
+  while (!StepOwnPick(one, Mario(), &colour).done)
+    ASSERT_LE(++x, COSTUME_LIMIT_FRAMES);
+  EXPECT_EQ(x, COSTUME_LIMIT_FRAMES);
+  // Random takes any colour.
+  Identity random;
+  random.character = RANDOM_CHARACTER;
+  random.costume = 3;
+  one.character = RANDOM_CHARACTER;
+  OwnSteer r;
+  r.frames = STEER_SETTLE_FRAMES;
+  EXPECT_TRUE(StepOwnPick(one, random, &r).done);
+}
+
+TEST(OrcaQueue, PortOnesOwnPickSteersOnlyOnTheRoomsFirstCharacterSelect)
+{
+  ArmOwnPick(Mario());
+  EXPECT_TRUE(OwnPickArmed());
+  EXPECT_FALSE(OwnPickPad().has_value());
+  DisarmOwnPick();
+  EXPECT_FALSE(OwnPickArmed());
+  // No pick: never armed.
+  ArmOwnPick(Identity{});
+  EXPECT_FALSE(OwnPickArmed());
+}
+
 TEST(OrcaQueue, SteeringAimsAtThePick)
 {
   const auto [cx, cy] = SteerToward(1, 1, 1.05f, 1.05f);

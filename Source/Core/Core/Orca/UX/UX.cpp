@@ -121,6 +121,9 @@ void Init()
     // A friend who joins while the host is in the menus moves both to the With Friends character
     // select.
     FriendsMove::Frame(guard, frame, resimulating, ports);
+    // A fresh start's way out of the main menu, recorded on the replay's first frame; and what the
+    // session reads to find its origin and the end of a fresh start (Rollback/OnlineMatch.cpp).
+    FreshMove::Frame(guard, frame);
     // Tracks a ranked set in the match block.
     RankedSet::Frame(guard, frame, resimulating);
     // Read only. Reports each game's result in a matchmade room once its frames are final.

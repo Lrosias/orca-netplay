@@ -65,6 +65,10 @@ bool Active();
 std::optional<GCPadStatus> InputOverride(int port);
 // Tells the harness a session rolled back to the start of `frame` at this boundary.
 void RewindTo(int frame);
+// Tells the harness this boundary's rewind (RewindTo) put back this game's own earlier state as a
+// new timeline (a fresh start, a join's restore of the origin, a way back to the player's own
+// game): the frames from it run for the first time, though their numbers ran before.
+void Restart();
 void OnFrameBoundary(const Core::CPUThreadGuard& guard);
 // The last first-pass frame the harness reached, or -1. Safe from any thread.
 int ShownFrame();

@@ -234,4 +234,40 @@ Outputs Decide(const Inputs& in);
 bool Frame(const Core::CPUThreadGuard& guard, int frame, bool resimulating,
            const std::vector<Events::PortInfo>& ports);
 }  // namespace FriendsMove
+
+// ---- A fresh start (Rollback/OnlineMatch.cpp, ORCA.md "Drop-in") ----
+// Every Orca boots the same way up to its origin: the first frame its main menu has been built for
+// MENU_SETTLE_FRAMES frames, with nobody's controller in it. Before a match, the host goes back to
+// that origin and leaves the main menu for the match's character select the way the player's own
+// press would: the exit code (Orca::Net::MENU_EXIT_*: With Friends, Casual or Ranked) is a typed
+// event on the replay's first frame, written like FriendsMove's move. A joiner replays the same
+// event from its own origin, so the match's history starts there on both machines.
+namespace FreshMove
+{
+// What one frame shows, for the session's origin and the fresh start's tail.
+struct Seen
+{
+  // The main menu runs with its pages built and no exit chosen (it can be left).
+  bool menu_built = false;
+  // A character select is up: its task and panels can be read.
+  bool css = false;
+  bool operator==(const Seen&) const = default;
+};
+Seen Read(const GuestMemory& memory);
+
+// Leaves a built main menu with `exit` (25, 30 or 31): the code, then STEP_EXIT. Writes nothing
+// anywhere else or for any other code, so a re-run of the same frame writes nothing more. Returns
+// whether it wrote.
+bool Apply(GuestMemory& memory, u32 exit);
+
+// Frame hook, first runs and re-runs: applies the replay's recorded exit on its first frame, then
+// reads the frame for LastSeen.
+void Frame(const Core::CPUThreadGuard& guard, int frame);
+
+// What the last call of the frame hook read (nothing for other games). CPU thread.
+Seen LastSeen();
+
+// Whether this game's main menu can be read and left: Brawl rev 2, and Project+.
+bool Supported();
+}  // namespace FreshMove
 }  // namespace Orca::UX

@@ -50,21 +50,46 @@ struct ReplayHeader
   bool operator==(const ReplayHeader&) const = default;
 };
 
+// The main menu exits a fresh start may record (UX/OnlineMenu.h FreshMove): With Friends, Casual,
+// Ranked. Only ever on a replay's first frame.
+constexpr u8 MENU_EXIT_FRIENDS = 25;
+constexpr u8 MENU_EXIT_CASUAL = 30;
+constexpr u8 MENU_EXIT_RANKED = 31;
+inline bool ValidMenuExit(u32 exit)
+{
+  return exit == MENU_EXIT_FRIENDS || exit == MENU_EXIT_CASUAL || exit == MENU_EXIT_RANKED;
+}
+
 struct ReplayFrame
 {
   Pads pads{};
   std::shared_ptr<const std::vector<Events::PortInfo>> ports;
   std::optional<ReplayHeader> header;
   bool clear_ready = false;
+  // A fresh start's way out of the built main menu (MENU_EXIT_*), or 0.
+  u8 menu_exit = 0;
 };
 
 struct ReplayArchive
 {
   u64 origin_hash = 0;
   u64 target_hash = 0;
+  // The origin's frame: frames[i] is frame first_frame + i. -1 while there is no origin yet, so
+  // nothing is recorded.
+  int first_frame = -1;
   std::vector<ReplayFrame> frames;
   // The host's pre-frame hook has already run at the boundary being offered.
   ReplayFrame boundary;
+  // The frame after the last one held.
+  int EndFrame() const { return first_frame + static_cast<int>(frames.size()); }
+  // The frame's entry, or null outside [first_frame, EndFrame()).
+  ReplayFrame* At(int frame)
+  {
+    if (first_frame < 0 || frame < first_frame || frame >= EndFrame())
+      return nullptr;
+    return &frames[static_cast<size_t>(frame - first_frame)];
+  }
+  const ReplayFrame* At(int frame) const { return const_cast<ReplayArchive*>(this)->At(frame); }
 };
 
 // CPU-thread-only context for the existing trusted UI handlers. Exogenous changes are recorded
@@ -103,13 +128,17 @@ class ReplayRecordingScope
 public:
   explicit ReplayRecordingScope(ReplayArchive* archive) : m_previous(s_archive) { s_archive = archive; }
   ~ReplayRecordingScope() { s_archive = m_previous; }
+  // The entry for `frame`, grown as needed. Null with no archive, before its origin
+  // (first_frame), or past MAX_REPLAY_FRAMES.
   static ReplayFrame* Frame(int frame)
   {
-    if (!s_archive || frame < 0 || static_cast<size_t>(frame) > MAX_REPLAY_FRAMES)
+    if (!s_archive || s_archive->first_frame < 0 || frame < s_archive->first_frame ||
+        static_cast<size_t>(frame) > MAX_REPLAY_FRAMES)
       return nullptr;
-    if (s_archive->frames.size() <= static_cast<size_t>(frame))
-      s_archive->frames.resize(static_cast<size_t>(frame) + 1);
-    return &s_archive->frames[frame];
+    const size_t index = static_cast<size_t>(frame - s_archive->first_frame);
+    if (s_archive->frames.size() <= index)
+      s_archive->frames.resize(index + 1);
+    return &s_archive->frames[index];
   }
   static void RecordPads(int frame, const Pads& pads)
   {

@@ -1746,6 +1746,89 @@ TEST(OrcaOnlineMenuDropIn, NoMoveForQueueRoomsVersusOrAFriendWhoLeft)
 
 // ---- The friends lobby and the queue (ORCA.md "Drop-in", "Online menu") ----
 
+namespace
+{
+// The main menu with its process step and its "pages built" byte (FriendsMove::MENU_BUILT).
+FakeMemory MainMenu(bool built, u32 step = FriendsMove::STEP_RUNNING, u32 exit_code = 0)
+{
+  FakeMemory m = Scene("muMenuMain", exit_code);
+  m.Fill(0x80910000, FriendsMove::MENU_BUILT + 4);
+  m.Write32(0x80910000, 0x80920000);
+  m.bytes[0x80910000 + FriendsMove::MENU_BUILT] = built ? 1 : 0;
+  m.Write32(0x80900288, step);
+  m.writes = 0;
+  return m;
+}
+
+// A character select whose task (scene +0x400) and panels (+0x44) can be read.
+FakeMemory CharacterSelect(bool readable)
+{
+  FakeMemory m = Scene("scSelctCharacter", 30);
+  m.Fill(0x80910000, 0x404);
+  m.Write32(0x80910000, 0x80920000);
+  if (readable)
+  {
+    m.Fill(0x80930000, 0x50);
+    m.Write32(0x80910400, 0x80930000);
+  }
+  m.writes = 0;
+  return m;
+}
+}  // namespace
+
+TEST(OrcaOnlineMenuFresh, ReadsTheBuiltMainMenuAndTheCharacterSelect)
+{
+  using FreshMove::Read;
+  EXPECT_TRUE(Read(MainMenu(true)).menu_built);
+  EXPECT_FALSE(Read(MainMenu(true)).css);
+  // Still loading, leaving, or an exit already chosen: not a menu to leave.
+  EXPECT_FALSE(Read(MainMenu(false)).menu_built);
+  EXPECT_FALSE(Read(MainMenu(true, FriendsMove::STEP_EXIT)).menu_built);
+  EXPECT_FALSE(Read(MainMenu(true, FriendsMove::STEP_RUNNING, 30)).menu_built);
+  EXPECT_FALSE(Read(Scene("scMemoryChange", 30)).menu_built);
+  EXPECT_TRUE(Read(CharacterSelect(true)).css);
+  EXPECT_FALSE(Read(CharacterSelect(false)).css);
+  EXPECT_FALSE(Read(CharacterSelect(true)).menu_built);
+  EXPECT_EQ(Read(FakeMemory{}), FreshMove::Seen{});
+  // Reading never writes.
+  FakeMemory m = MainMenu(true);
+  (void)Read(m);
+  EXPECT_EQ(m.writes, 0);
+}
+
+TEST(OrcaOnlineMenuFresh, AFreshStartLeavesOnlyABuiltMainMenuWithItsExit)
+{
+  for (const u32 exit : {25u, 30u, 31u})
+  {
+    SCOPED_TRACE(exit);
+    FakeMemory m = MainMenu(true);
+    ASSERT_TRUE(FreshMove::Apply(m, exit));
+    // The menu's own exit: the code, then the step.
+    EXPECT_EQ(m.Read32(0x80900284), exit);
+    EXPECT_EQ(m.Read32(0x80900288), FriendsMove::STEP_EXIT);
+    EXPECT_EQ(ReadMenuState(m).exit_code, exit);
+    // The same frame again (a re-run) writes nothing more.
+    const int writes = m.writes;
+    EXPECT_FALSE(FreshMove::Apply(m, exit));
+    EXPECT_EQ(m.writes, writes);
+  }
+  // Only the exits a fresh start takes.
+  for (const u32 exit : {0u, 24u, 26u, 27u, 29u, 32u})
+  {
+    FakeMemory m = MainMenu(true);
+    EXPECT_FALSE(FreshMove::Apply(m, exit)) << exit;
+    EXPECT_EQ(m.writes, 0);
+  }
+  // Only a built main menu with no exit chosen, never anywhere else.
+  for (FakeMemory m : {MainMenu(false), MainMenu(true, FriendsMove::STEP_EXIT),
+                       MainMenu(true, FriendsMove::STEP_RUNNING, 25), CharacterSelect(true),
+                       Scene("scMemoryChange", 30)})
+  {
+    EXPECT_FALSE(FreshMove::Apply(m, 30));
+    EXPECT_EQ(m.writes, 0);
+  }
+}
+
 TEST(OrcaOnlineMenuLobby, TheMenusAreTheMainMenuAndACharacterSelect)
 {
   EXPECT_TRUE(MenusScene("muMenuMain", "sqMenuMain"));

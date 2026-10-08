@@ -343,6 +343,7 @@ const std::vector<InputRule>& Input()
 int s_frame = 0;       // the frame being run, or whose end we are at; rewinds on a load
 std::atomic<int> s_shown_frame{-1};  // for ShownFrame()
 int s_rewind_to = -1;  // set by RewindTo for this boundary
+bool s_restart = false;  // set by Restart for this boundary
 int s_online_stop_at = -1;  // online: the first-pass frame at which emulation stops
 int s_max_frame = -1;  // highest frame reached on a first pass
 bool s_stop_queued = false;
@@ -1043,6 +1044,11 @@ void RewindTo(int frame)
   s_rewind_to = frame;
 }
 
+void Restart()
+{
+  s_restart = true;
+}
+
 bool Active()
 {
   return s_scenes || s_synctest_k > 0 || s_exit_after > 0 || !Input().empty() ||
@@ -1554,7 +1560,8 @@ void OnFrameBoundary(const Core::CPUThreadGuard& guard)
   }
 
   // A session rolled back here: the state is now the start of s_rewind_to.
-  if (s_rewind_to >= 0)
+  const bool rewound = s_rewind_to >= 0;
+  if (rewound)
   {
     s_frame = s_rewind_to;
     RestoreScene(s_rewind_to);
@@ -1564,6 +1571,13 @@ void OnFrameBoundary(const Core::CPUThreadGuard& guard)
   if (Diag::g_jit_code_log)
     Diag::JitCodeSetFrame(s_frame);
   s_max_frame = std::max(s_max_frame, frame_here);
+  // A new timeline from the rewind on (Restart): its frames are first passes, so scenes, results
+  // and the first-pass hooks follow it rather than the frame numbers the old one reached.
+  if (std::exchange(s_restart, false) && rewound)
+  {
+    s_max_frame = s_frame - 1;
+    s_scene_history.clear();
+  }
   // The next frame is a re-run if it has run before. Sessions decide this themselves.
   if (!s_loopback && !RingPort::Active())
     SetResimulating(s_frame <= s_max_frame && !s_render_reruns);

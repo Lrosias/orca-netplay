@@ -567,7 +567,169 @@ Masks Gate(const View& v, const State& s)
   return masks;
 }
 
+// ---- The host's own pick after a fresh start ----
+
+OwnStep StepOwnPick(const CssPort& port, const Identity& pick, OwnSteer* st)
+{
+  OwnStep out;
+  const int t = st->frames++;
+  const float prev_x = st->has_prev ? st->prev_x : port.hand_x;
+  const float prev_y = st->has_prev ? st->prev_y : port.hand_y;
+  st->has_prev = true;
+  st->prev_x = port.hand_x;
+  st->prev_y = port.hand_y;
+  if (!pick.HasPick() || t >= STEER_LIMIT_FRAMES)
+  {
+    out.done = true;
+    return out;
+  }
+  // Press every fourth frame, released between, as the joiner's steering does.
+  const bool edge = (t & 3) == 0;
+  // The select's first frames: the hand may still be coming in.
+  if (t < STEER_SETTLE_FRAMES)
+    return out;
+  if (port.placed)
+  {
+    if (port.character != pick.character)
+    {
+      st->costume_from = -1;
+      out.buttons = edge ? BUTTON_B : 0;
+      return out;
+    }
+    if (port.costume == pick.costume || pick.character == RANDOM_CHARACTER)
+    {
+      out.done = true;
+      return out;
+    }
+    if (st->costume_from < 0)
+      st->costume_from = t;
+    if (t - st->costume_from >= COSTUME_LIMIT_FRAMES)
+    {
+      out.done = true;
+      return out;
+    }
+    out.buttons = edge ? PAD_BUTTON_X : 0;
+    return out;
+  }
+  if (port.hand_target == Rules::CSS_HAND_GRID_HOLDING && port.character == pick.character)
+  {
+    // Over the pick: A once the hand has nearly stopped (the character read lags the hand).
+    out.buttons = edge && HandStill(port.hand_x, port.hand_y, prev_x, prev_y) ? PAD_BUTTON_A : 0;
+    return out;
+  }
+  const auto [x, y] = SteerToward(port.hand_x, port.hand_y, pick.x, pick.y);
+  out.stick_x = x;
+  out.stick_y = y;
+  return out;
+}
+
+namespace
+{
+struct OwnPickLocal
+{
+  bool armed = false;
+  Identity pick;
+  OwnSteer steer;
+  // The first first-run frame seen while armed (-1: none yet).
+  int first = -1;
+  std::optional<GCPadStatus> pad;
+};
+OwnPickLocal& Own()
+{
+  static OwnPickLocal own;
+  return own;
+}
+
+// First runs only: one frame of the host's own pick.
+void SteerOwnPickFrame(const View& v, int frame)
+{
+  OwnPickLocal& o = Own();
+  o.pad.reset();
+  if (!o.armed)
+    return;
+  if (o.first < 0 || frame < o.first)
+    o.first = frame;
+  if (!(v.queue2 && !v.solo && v.css && v.game1 && v.ports[0].readable))
+  {
+    if (frame - o.first >= STEER_LIMIT_FRAMES)
+    {
+      NOTICE_LOG_FMT(ROLLBACK, "Queue: frame {}: port 1's own pick never met the room's character "
+                               "select; the player picks by hand",
+                     frame);
+      o.armed = false;
+    }
+    return;
+  }
+  const OwnStep step = StepOwnPick(v.ports[0], o.pick, &o.steer);
+  if (step.done)
+  {
+    const CssPort& one = v.ports[0];
+    NOTICE_LOG_FMT(ROLLBACK, "Queue: frame {}: port 1's own pick is {} (character {:#x} costume {}, "
+                             "{} frames)",
+                   frame,
+                   one.placed && one.character == o.pick.character ? "back in" :
+                                                                     "left to the player",
+                   one.character, one.costume, o.steer.frames);
+    o.armed = false;
+    return;
+  }
+  GCPadStatus pad;
+  pad.button = step.buttons;
+  pad.stickX = step.stick_x;
+  pad.stickY = step.stick_y;
+  pad.substickX = GCPadStatus::C_STICK_CENTER_X;
+  pad.substickY = GCPadStatus::C_STICK_CENTER_Y;
+  pad.triggerLeft = 0;
+  pad.triggerRight = 0;
+  pad.isConnected = true;
+  o.pad = pad;
+}
+}  // namespace
+
+void ArmOwnPick(const Identity& pick)
+{
+  OwnPickLocal& o = Own();
+  o = {};
+  o.armed = pick.HasPick();
+  o.pick = pick;
+  if (o.armed)
+  {
+    NOTICE_LOG_FMT(ROLLBACK, "Queue: port 1's own pick (character {:#x} costume {}) goes back on "
+                             "the room's character select",
+                   pick.character, pick.costume);
+  }
+}
+
+void DisarmOwnPick()
+{
+  Own() = {};
+}
+
+bool OwnPickArmed()
+{
+  return Own().armed;
+}
+
+std::optional<GCPadStatus> OwnPickPad()
+{
+  return Own().armed ? Own().pad : std::nullopt;
+}
+
 // ---- Memory ----
+
+bool CssTaskReadable(const GuestMemory& m)
+{
+  if (ReadSceneName(m) != "scSelctCharacter" || !Pointer(m, SCENE_MANAGER))
+    return false;
+  const u32 manager = m.Read32(SCENE_MANAGER);
+  if (!Pointer(m, manager + MANAGER_SCENE))
+    return false;
+  const u32 scene = m.Read32(manager + MANAGER_SCENE);
+  if (!Pointer(m, scene + SCENE_SELCHAR_TASK))
+    return false;
+  const u32 task = m.Read32(scene + SCENE_SELCHAR_TASK);
+  return Pointer(m, task + TASK_AREAS + 4);
+}
 
 View ReadView(const GuestMemory& m, const std::vector<Events::PortInfo>& ports)
 {
@@ -955,6 +1117,14 @@ bool SoloReady()
   return s_solo_ready;
 }
 
+Identity OwnIdentity()
+{
+  std::lock_guard lk(s_mutex);
+  Identity id = s_pick;
+  id.rating = s_rating;
+  return id;
+}
+
 bool OnSoloCss()
 {
   return s_on_solo_css;
@@ -1045,7 +1215,10 @@ void Frame(const Core::CPUThreadGuard& guard, int frame, bool resimulating,
   }
   const View v = ReadView(m, ports);
   if (!resimulating)
+  {
     s_on_queue_css = v.queue2 && v.css;
+    SteerOwnPickFrame(v, frame);
+  }
   const State before = ReadState(m);
   const State after = Advance(v, before, frame);
   if (after != before)

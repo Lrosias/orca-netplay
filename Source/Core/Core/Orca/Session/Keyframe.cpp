@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <string_view>
 #include <thread>
@@ -34,7 +35,8 @@ namespace Orca::Net
 {
 namespace
 {
-// ORP1 contains controller inputs and typed UI events; legacy machine images are rejected.
+// ORP1 contains controller inputs and typed UI events; legacy machine images are rejected. Builds
+// with another layout of it have another UX compat version, so they never meet.
 constexpr char MAGIC[4] = {'O', 'R', 'P', '1'};
 constexpr int WINDOW_LOG = 26;
 constexpr int LEVEL = 3;
@@ -166,10 +168,52 @@ std::string LastOsError()
 }
 }  // namespace
 
+namespace
+{
+// Whether the file at `path` already holds exactly `data`.
+bool SameFile(const std::string& path, const std::vector<u8>& data)
+{
+  if (!File::IsFile(path) || File::GetSize(path) != data.size())
+    return false;
+  File::IOFile file(path, "rb");
+  std::vector<u8> have(data.size());
+  return file && file.ReadBytes(have.data(), have.size()) && have == data;
+}
+
+// Removes what `entries` doesn't hold under `tree`, and anything held there as the other kind (a
+// file where a folder belongs). A name differing only in case is removed too, before the right one
+// is written, so a case-insensitive disk ends with the replacement's spelling.
+bool RemoveExtras(const File::FSTEntry& tree, const std::string& prefix,
+                  const std::map<std::string, bool>& wanted)
+{
+  for (const File::FSTEntry& child : tree.children)
+  {
+    const std::string path = prefix.empty() ? child.virtualName : prefix + "/" + child.virtualName;
+    const auto it = wanted.find(path);
+    if (it != wanted.end() && it->second == child.isDirectory)
+    {
+      if (child.isDirectory && !RemoveExtras(child, path, wanted))
+        return false;
+      continue;
+    }
+    const bool removed = child.isDirectory ? File::DeleteDirRecursively(child.physicalName) :
+                                             File::Delete(child.physicalName);
+    if (!removed)
+    {
+      ERROR_LOG_FMT(ROLLBACK, "Drop-in: couldn't remove {}: {}", child.physicalName,
+                    LastOsError());
+      return false;
+    }
+  }
+  return true;
+}
+}  // namespace
+
 bool ReplaceNandTree(const std::string& root, const std::vector<NandEntry>& entries)
 {
   if (root.empty())
     return false;
+  std::map<std::string, bool> wanted;
   for (const NandEntry& entry : entries)
   {
     if (!SafeRelative(entry.path))
@@ -177,17 +221,17 @@ bool ReplaceNandTree(const std::string& root, const std::vector<NandEntry>& entr
       ERROR_LOG_FMT(ROLLBACK, "Drop-in: the keyframe's NAND has an unsafe path");
       return false;
     }
-  }
-  if (File::IsDirectory(root) && !File::DeleteDirRecursively(root))
-  {
-    ERROR_LOG_FMT(ROLLBACK, "Drop-in: couldn't delete the NAND at {}: {}", root, LastOsError());
-    return false;
+    wanted[entry.path] = entry.directory;
   }
   if (!File::CreateFullPath(root + "/"))
   {
     ERROR_LOG_FMT(ROLLBACK, "Drop-in: couldn't create {}: {}", root, LastOsError());
     return false;
   }
+  // Only what differs is written. A restore usually changes a few save files of a tree that holds
+  // Brawl's 39 MB of boot files, and on Windows every file written is scanned again.
+  if (!RemoveExtras(File::ScanDirectoryTree(root, true), "", wanted))
+    return false;
   for (const NandEntry& entry : entries)
   {
     const std::string path = root + "/" + entry.path;
@@ -200,6 +244,8 @@ bool ReplaceNandTree(const std::string& root, const std::vector<NandEntry>& entr
       }
       continue;
     }
+    if (SameFile(path, entry.data))
+      continue;
     File::CreateFullPath(path);
     File::IOFile file(path, "wb");
     if (!file || !file.WriteBytes(entry.data.data(), entry.data.size()))
@@ -247,6 +293,8 @@ bool WriteReplayFrame(Writer& w, const ReplayFrame& frame)
   if (frame.header && (frame.header->mode > 2 || frame.header->ruleset > 2 ||
                        frame.header->coin > 1 || (frame.header->flags & ~3u)))
     return false;
+  if (frame.menu_exit != 0 && !ValidMenuExit(frame.menu_exit))
+    return false;
   w.Bytes(frame.pads.data(), sizeof(frame.pads));
   w.U32(frame.ports ? static_cast<u32>(frame.ports->size()) : 0);
   if (frame.ports)
@@ -270,6 +318,7 @@ bool WriteReplayFrame(Writer& w, const ReplayFrame& frame)
     w.U32(frame.header->room);
   }
   w.U32(frame.clear_ready);
+  w.U32(frame.menu_exit);
   return true;
 }
 
@@ -312,42 +361,57 @@ bool ReadReplayFrame(Reader& r, ReplayFrame* frame)
   if (!r.U32(&clear) || clear > 1)
     return false;
   frame->clear_ready = clear != 0;
+  u32 menu_exit;
+  if (!r.U32(&menu_exit) || (menu_exit != 0 && !ValidMenuExit(menu_exit)))
+    return false;
+  frame->menu_exit = static_cast<u8>(menu_exit);
   return true;
 }
+
+// The smallest a frame's record can be: pads, a port count, the header and clear-ready flags, the
+// menu exit.
+constexpr size_t MIN_FRAME_BYTES = sizeof(Pads) + 4 * 4;
+// Magic, the frame count, the first frame, the origin and target hashes.
+constexpr size_t PREAMBLE_BYTES = 4 + 4 + 4 + 8 + 8;
 }  // namespace
 
 std::vector<u8> PackKeyframe(int frame, const ReplayArchive& replay)
 {
   try
   {
-    if (frame < 0 || static_cast<size_t>(frame) > MAX_REPLAY_FRAMES ||
-        replay.frames.size() < static_cast<size_t>(frame))
+    // The replay holds frames [first_frame, frame); only its first frame may leave the main menu.
+    const int first = replay.first_frame;
+    if (first < 0 || frame < first || static_cast<size_t>(frame) > MAX_REPLAY_FRAMES ||
+        replay.frames.size() < static_cast<size_t>(frame - first))
       return {};
+    const size_t count = static_cast<size_t>(frame - first);
     Writer w;
     w.Bytes(MAGIC, sizeof(MAGIC));
     w.U32(static_cast<u32>(frame));
+    w.U32(static_cast<u32>(first));
     w.U64(replay.origin_hash);
     w.U64(replay.target_hash);
-    size_t budget = MAX_RAW - (static_cast<size_t>(frame) + 1) * sizeof(ReplayFrame);
+    size_t budget = MAX_RAW - (count + 1) * sizeof(ReplayFrame);
     const ReplayFrame* previous = nullptr;
-    for (int i = 0; i < frame; ++i)
+    for (size_t i = 0; i < count; ++i)
     {
-      if (!WriteReplayFrame(w, replay.frames[i]))
+      if ((i > 0 && replay.frames[i].menu_exit != 0) || !WriteReplayFrame(w, replay.frames[i]))
         return {};
       if (!ChargeMetadata(replay.frames[i], previous, &budget))
         return {};
       previous = &replay.frames[i];
-  }
-  if (!WriteReplayFrame(w, replay.boundary) || !ChargeMetadata(replay.boundary, previous, &budget))
-    return {};
-  if (w.out.size() > MAX_RAW)
-    return {};
-  std::vector<u8> out(ZSTD_compressBound(w.out.size()));
-  const size_t size = ZSTD_compress(out.data(), out.size(), w.out.data(), w.out.size(), LEVEL);
-  if (ZSTD_isError(size))
-    return {};
-  out.resize(size);
-  return out;
+    }
+    if ((count > 0 && replay.boundary.menu_exit != 0) || !WriteReplayFrame(w, replay.boundary) ||
+        !ChargeMetadata(replay.boundary, previous, &budget))
+      return {};
+    if (w.out.size() > MAX_RAW)
+      return {};
+    std::vector<u8> out(ZSTD_compressBound(w.out.size()));
+    const size_t size = ZSTD_compress(out.data(), out.size(), w.out.data(), w.out.size(), LEVEL);
+    if (ZSTD_isError(size))
+      return {};
+    out.resize(size);
+    return out;
   }
   catch (const std::exception&)
   {
@@ -374,20 +438,23 @@ bool UnpackKeyframe(const std::vector<u8>& blob, int* frame, ReplayArchive* repl
       return false;
     Reader r(raw);
     char magic[4];
-    u32 count;
+    u32 end, first;
     ReplayArchive decoded;
-    if (!r.Bytes(magic, sizeof(magic)) || std::memcmp(magic, MAGIC, sizeof(MAGIC)) != 0 ||
-        !r.U32(&count) || count > MAX_REPLAY_FRAMES || !r.U64(&decoded.origin_hash) ||
-        !r.U64(&decoded.target_hash))
+    if (raw.size() < PREAMBLE_BYTES || !r.Bytes(magic, sizeof(magic)) ||
+        std::memcmp(magic, MAGIC, sizeof(MAGIC)) != 0 || !r.U32(&end) ||
+        end > MAX_REPLAY_FRAMES || !r.U32(&first) || first > end ||
+        !r.U64(&decoded.origin_hash) || !r.U64(&decoded.target_hash))
       return false;
-    if (static_cast<u64>(count + 1) * 44 > raw.size() - 24)
+    const u32 count = end - first;
+    if (static_cast<u64>(count + 1) * MIN_FRAME_BYTES > raw.size() - PREAMBLE_BYTES)
       return false;
+    decoded.first_frame = static_cast<int>(first);
     decoded.frames.reserve(count);
     size_t budget = MAX_RAW - (static_cast<size_t>(count) + 1) * sizeof(ReplayFrame);
     for (u32 i = 0; i < count; ++i)
     {
       ReplayFrame next;
-      if (!ReadReplayFrame(r, &next))
+      if (!ReadReplayFrame(r, &next) || (i > 0 && next.menu_exit != 0))
         return false;
       if (!ChargeMetadata(next, decoded.frames.empty() ? nullptr : &decoded.frames.back(), &budget))
         return false;
@@ -395,11 +462,11 @@ bool UnpackKeyframe(const std::vector<u8>& blob, int* frame, ReplayArchive* repl
         next.ports = decoded.frames.back().ports;
       decoded.frames.push_back(std::move(next));
     }
-    if (!ReadReplayFrame(r, &decoded.boundary) ||
+    if (!ReadReplayFrame(r, &decoded.boundary) || (count > 0 && decoded.boundary.menu_exit != 0) ||
         !ChargeMetadata(decoded.boundary, decoded.frames.empty() ? nullptr : &decoded.frames.back(), &budget) ||
         !r.AtEnd())
       return false;
-    *frame = static_cast<int>(count);
+    *frame = static_cast<int>(end);
     *replay = std::move(decoded);
     return true;
   }
