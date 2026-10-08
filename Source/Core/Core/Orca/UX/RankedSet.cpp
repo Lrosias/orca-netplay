@@ -172,7 +172,13 @@ SetState Step(SetState s, Ruleset ruleset, const Facts& f, u32 frame)
       s.fight_flags =
           static_cast<u8>((s.fight_flags & ~SetBlock::FIGHT_BETWEEN) | SetBlock::FIGHT_SUDDEN);
     }
-    if (f.live.valid)
+    if (f.live.valid && ruleset != Ruleset::Brawl)
+    {
+      // Project+ only needs to know the fighters are in: the game began (its game-start). Its own
+      // codeset settles time-outs, so nothing else is counted.
+      s.fight_flags |= SetBlock::FIGHT_SEEN;
+    }
+    else if (f.live.valid)
     {
       // Fighters reappearing in the same scene means Brawl started a sudden death.
       if (s.fight_flags & SetBlock::FIGHT_GONE)
@@ -198,7 +204,7 @@ SetState Step(SetState s, Ruleset ruleset, const Facts& f, u32 frame)
         }
       }
     }
-    else if (f.live_read && (s.fight_flags & SetBlock::FIGHT_SEEN))
+    else if (ruleset == Ruleset::Brawl && f.live_read && (s.fight_flags & SetBlock::FIGHT_SEEN))
     {
       s.fight_flags |= SetBlock::FIGHT_GONE;
     }
@@ -419,13 +425,20 @@ void Frame(const Core::CPUThreadGuard& guard, int frame, bool resimulating)
     s_dots.store(0, std::memory_order_relaxed);
     return;
   }
-  // Only Brawl's verdict needs the live fight state.
-  const Facts facts = ReadFacts(memory, header->ruleset == Ruleset::Brawl);
+  // Brawl's verdict needs the live fight state, and in both games the fighters being in is when a
+  // game began (FIGHT_SEEN: the room's game-start, after the loading image).
+  const Facts facts = ReadFacts(memory, true);
   const SetState before = SetBlock::ReadSet(memory);
   const SetState after = Step(before, header->ruleset, facts, static_cast<u32>(frame));
   if (after != before)
   {
     SetBlock::WriteSet(memory, after);
+    if ((after.fight_flags & SetBlock::FIGHT_SEEN) &&
+        !(before.fight_flags & SetBlock::FIGHT_SEEN) && !resimulating)
+    {
+      NOTICE_LOG_FMT(ROLLBACK, "Ranked set: game {}'s fighters are in at frame {} (fight from {})",
+                     after.GameNumber(), frame, after.fight_start);
+    }
     if (after.games != before.games && !resimulating)
     {
       const GameRecord& r = after.records[std::min(after.games, u8(SetBlock::MAX_RECORDS)) - 1];

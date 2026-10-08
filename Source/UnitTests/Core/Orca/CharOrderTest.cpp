@@ -56,10 +56,10 @@ const SetView kGame2{Ruleset::PPlus, 2, 0, Order::WinnerFirst};
 // Brawl, game 2, port 2 won game 1, in the Free order (the loser asked first, the winner free).
 const SetView kBrawl2{Ruleset::Brawl, 2, 1, Order::Free};
 
-State St(int game, Step step, int first, u32 since, int elapsed, int locked = 0)
+State St(int game, Step step, int first, u32 since, int elapsed, int locked = 0, int held = 0)
 {
-  return State{static_cast<u8>(game), step,  static_cast<u8>(first), static_cast<u8>(locked),
-               since,                 static_cast<u16>(elapsed)};
+  return State{static_cast<u8>(game),       step, static_cast<u8>(first), static_cast<u8>(locked),
+               since, static_cast<u16>(elapsed), static_cast<u8>(held)};
 }
 
 CssView Css(bool placed0 = true, bool placed1 = true)
@@ -89,6 +89,7 @@ CssView Hold(CssView css, int port, u16 buttons)
 }
 
 constexpr u16 START = PAD_BUTTON_START, A = PAD_BUTTON_A, B = PAD_BUTTON_B;
+constexpr u16 L = PAD_TRIGGER_L, R = PAD_TRIGGER_R;
 
 // Runs the machine as the hook does: every boundary twice (a first run and its re-run from the
 // snapshot that holds the first run's write), which must agree.
@@ -318,6 +319,72 @@ TEST(OrcaCharOrder, DonePressesStartForTheLoserEveryOtherFrame)
   EXPECT_EQ(out.button, PAD_BUTTON_START);
 }
 
+TEST(OrcaCharOrder, LAndRAsEachPlayerLocksInAreHeldAsTheSelectEnds)
+{
+  // Both games read L and R held as the character select ends (Brawl: Samus or Zelda with L or R
+  // plays Zero Suit Samus or Sheik). Each player's are kept as they lock in and held for them
+  // then; their own controllers stay off after their turn.
+  State s = Twice(kGame2, Css(), State{}, 100);
+  // The winner holds L as it locks in, then lets go; L or R on the loser's turn change nothing.
+  s = Twice(kGame2, Press(Css(), 0, START | L), s, 110);
+  EXPECT_EQ(s, (St(2, Step::Second, 0, 110, 0, 0, 0b0001)));
+  s = Twice(kGame2, Css(), s, 120);
+  s = Twice(kGame2, Hold(Css(), 0, R), s, 130);
+  EXPECT_EQ(s.held, 0b0001);
+  EXPECT_EQ(Gate(kGame2, Css(), s)[0], ALL);
+  // The loser holds R as it locks in.
+  s = Twice(kGame2, Press(Css(), 1, START | R), s, 140);
+  EXPECT_EQ(s, (St(2, Step::Done, 0, 140, 0, 0, 0b1001)));
+  for (const int elapsed : {4, 5})
+  {
+    const auto g = Gate(kGame2, Css(), St(2, Step::Done, 0, 140, elapsed, 0, 0b1001));
+    EXPECT_EQ(g[0], (Mask{ALL.buttons, true, true, L}));
+    EXPECT_EQ(g[1].buttons, ALL.buttons);
+    EXPECT_EQ(g[1].press, static_cast<u16>(R | (elapsed % 2 == 0 ? START : 0)));
+  }
+  // What the game reads: the winner let go of L long ago and mashes A, and gets L, fully down;
+  // the loser gets R and Orca's Start.
+  GCPadStatus pad{};
+  pad.isConnected = true;
+  pad.button = PAD_BUTTON_A;
+  const auto even = Gate(kGame2, Css(), St(2, Step::Done, 0, 140, 4, 0, 0b1001));
+  GCPadStatus out = Rollback::InputGate::Apply(pad, even[0]);
+  EXPECT_EQ(out.button, L);
+  EXPECT_EQ(out.triggerLeft, 0xFF);
+  out = Rollback::InputGate::Apply(pad, even[1]);
+  EXPECT_EQ(out.button, R | START);
+  EXPECT_EQ(out.triggerRight, 0xFF);
+  // Nothing held at the lock-ins: nothing pressed.
+  State t = Twice(kGame2, Css(), State{}, 0);
+  t = Twice(kGame2, Press(Css(), 0, START), t, 10);
+  t = Twice(kGame2, Press(Css(), 1, START), t, 20);
+  EXPECT_EQ(t.held, 0);
+  EXPECT_EQ(Gate(kGame2, Css(), t)[0], ALL);
+}
+
+TEST(OrcaCharOrder, LAndRAreKeptAtATimeOutAndAFreeWinnersEarlyLockIn)
+{
+  // Time running out keeps what is held then.
+  State s = Twice(kGame2, Css(), State{}, 0);
+  s = Twice(kGame2, Hold(Css(), 0, R), s, PICK_FRAMES);
+  EXPECT_EQ(s, (St(2, Step::Second, 0, PICK_FRAMES, 0, 0, 0b0010)));
+  // Free: the winner (port 2) locking in on the loser's turn keeps its own then.
+  State f = Twice(kBrawl2, Css(), State{}, 10);
+  f = Twice(kBrawl2, Press(Css(), 1, START | L), f, 20);
+  EXPECT_EQ(f, (St(2, Step::First, 0, 10, 10, 2, 0b0100)));
+  // Locked in is locked in: Start again, without L or with R, keeps what it locked in with (a
+  // Zelda can't turn into Sheik after the "You're locked in" line).
+  f = Twice(kBrawl2, Press(Css(), 1, START), f, 24);
+  EXPECT_EQ(f, (St(2, Step::First, 0, 10, 14, 2, 0b0100)));
+  f = Twice(kBrawl2, Press(Css(), 1, START | R), f, 26);
+  EXPECT_EQ(f, (St(2, Step::First, 0, 10, 16, 2, 0b0100)));
+  f = Twice(kBrawl2, Press(Css(), 0, START), f, 30);
+  EXPECT_EQ(f, (St(2, Step::Done, 0, 30, 0, 2, 0b0100)));
+  const auto g = Gate(kBrawl2, Css(), f);
+  EXPECT_EQ(g[1].press, START | L);
+  EXPECT_EQ(g[0], ALL);
+}
+
 TEST(OrcaCharOrder, GateIgnoresAStateTheMachineWouldClear)
 {
   // A state from another game, another winner, or with no set: no masks.
@@ -370,6 +437,10 @@ TEST(OrcaCharOrder, StateBytesRoundTripAndWriteOnlyWhatDiffers)
   t.elapsed = 0x0507;
   EXPECT_EQ(WriteState(m, t), 1);
   EXPECT_EQ(ReadState(m), t);
+  t.held = 0b1001;
+  EXPECT_EQ(WriteState(m, t), 1);
+  EXPECT_EQ(ReadState(m), t);
+  EXPECT_EQ(m.Read8(kArea + 0xE), 0b1001);
   EXPECT_EQ(m.Read32(kArea), kMagic);
   // A step byte out of range reads as nothing.
   m.Write8(kArea + 5, 9);

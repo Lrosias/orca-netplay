@@ -89,6 +89,8 @@ void Shaders(std::size_t compiled, std::size_t total);
 int ExitCode();
 // The game reached its first frame. Called every frame boundary; cheap after the first.
 void GameStarted();
+// Called once, on the CPU thread, at the first GameStarted. Set it before the boot.
+void SetFirstFrameListener(void (*listener)());
 // Where lines go (default stdout). In embed mode stdout is redirected to stderr, so stray log lines
 // can't corrupt the protocol stream.
 void SetOutput(std::FILE* out);

@@ -350,10 +350,21 @@ constexpr std::chrono::seconds RANKED_STALL_LIMIT{15};
 // Set over: holding Z this long on the results screen leaves the room.
 constexpr std::chrono::milliseconds SET_OVER_Z_HOLD{1500};
 
-// The input delay the player chose ("delay N" with "caps delay"), or nullopt for the adaptive one.
+// Orca's input delay when the page chooses none (no "caps delay", no "delay N" yet, or an old
+// page's "delay auto"): a fixed three frames, the page's own default. Never the session's adaptive
+// delay: players want a delay that never moves with the link; lag shows as rollbacks or stalls.
+constexpr int DEFAULT_DELAY = 3;
+
+// The input delay this player plays at: the page's "delay N" (with "caps delay"), else
+// DEFAULT_DELAY. Always fixed.
 std::optional<int> ChosenDelay()
 {
-  return Orca::Status::Cap("delay") ? Orca::Online::ChosenDelay() : std::nullopt;
+  if (Orca::Status::Cap("delay"))
+  {
+    if (const std::optional<int> chosen = Orca::Online::ChosenDelay())
+      return chosen;
+  }
+  return DEFAULT_DELAY;
 }
 
 // A round-trip sample the session has not seen yet (the room numbers its samples).
@@ -1700,7 +1711,8 @@ std::optional<int> JoinHost(Core::System& system, Match& match)
 // "leave": a joiner asks its host to unplug it at an agreed frame; a host opens a new room.
 void Leave(Match& match)
 {
-  // Leaving a ranked set forfeits it, and the screen says so (UX/SetEnd.h).
+  // Leaving a ranked set forfeits it once its first game began (before that the room voids it), and
+  // the screen says which (UX/SetEnd.h).
   if (Orca::Online::RoomQueue() == "ranked" && Orca::Online::MatchLive())
     Orca::UX::SetEnd::Current().SelfLeft(false, Orca::UX::SetEnd::NowMs());
   Orca::UX::Search::End();
@@ -2497,8 +2509,9 @@ void ConfirmResults(Match& match)
   }
   // The casual ready timer ran out (UX/Queue.h), at the same final frame on both machines.
   Orca::UX::Queue::ConfirmTimeout(confirmed, match.local_seat);
-  // Ranked: a player who didn't pick a character in time before the first game leaves the room,
-  // which forfeits; the other waits for the verdict.
+  // Ranked: a player who didn't pick a character in time before the first game leaves the room; the
+  // set ends before its first game, so the room voids it and rates nobody. The other waits for the
+  // verdict.
   if (const auto no_show = Orca::UX::Rules::ConfirmNoShow(confirmed))
   {
     const bool mine = *no_show == match.local_seat;
@@ -2515,7 +2528,28 @@ void ConfirmResults(Match& match)
       Core::DisplayMessage("Your opponent didn't pick a character in time", 6000);
     }
   }
-  for (const Orca::UX::GameResult& r : Orca::UX::Tracker().Confirm(confirmed, plug))
+  std::vector<int> starts;
+  const std::vector<Orca::UX::GameResult> results =
+      Orca::UX::Tracker().Confirm(confirmed, plug, &starts);
+  // A joiner that asked to leave stays plugged in until its host's roster names the unplug frame,
+  // so a fight's first frame can turn final in between. The leave press decides: the screen said
+  // then whether the set counts (Leave), and the room hears no game began after it.
+  if (match.joining && match.leave_requested)
+    starts.clear();
+  // A ranked game began (its fighters in, after the stage's loading image), at the same final frame
+  // on both machines: the room learns the set reached it, so a leave from here on loses the set.
+  // Sent ahead of results read from the same frames; the room keeps only this player's first
+  // game-start of the set and needs no order between them.
+  for (const int start : starts)
+  {
+    NOTICE_LOG_FMT(ROLLBACK, "Matchmaking: a ranked game began (the fight from frame {})", start);
+    Orca::Online::ReportGameStart(start);
+  }
+  // On screen, a leave from here on loses the set (UX/SetEnd.h); a set that ended a game reached it
+  // too. Only a ranked set's model takes it.
+  if (!starts.empty() || !results.empty())
+    Orca::UX::SetEnd::Current().GameBegan(Orca::UX::SetEnd::NowMs());
+  for (const Orca::UX::GameResult& r : results)
   {
     Orca::Net::GameReport report;
     report.kind = r.kind == Orca::UX::GameResult::Kind::Win  ? Orca::Net::GameReport::Kind::Win :
@@ -2940,7 +2974,8 @@ std::optional<int> Boundary(Core::System& system,
   if (!match.session)
     return std::nullopt;
 
-  // Round trips feed the adaptive input delay unless one was chosen; each player's is its own.
+  // Round trips go to the session's stats (the delay is always fixed: ChosenDelay); each player's
+  // delay is its own.
   if (const auto round_trip_ms = NewRoundTrip(&match.round_trip_sequence))
     match.session->OnRoundTrip(*round_trip_ms);
   match.session->SetFixedDelay(ChosenDelay());

@@ -94,7 +94,9 @@ enum class Outcome
 struct Notice
 {
   std::string title;  // "bo disconnected", "bo forfeited", "You left"
-  std::string line;   // "They forfeit in 0:09", "You win the set", "This set counts as a loss"
+  // "They forfeit in 0:09" ("No contest in 0:09" before the set's first game), "You win the set",
+  // "This set counts as a loss" ("This set doesn't count")
+  std::string line;
   int seconds = -1;   // the countdown's seconds left; -1: no countdown
   float fraction = 0;  // fraction of the countdown left
   Widgets::Tone tone{};  // Neutral
@@ -161,7 +163,13 @@ public:
   void CasualGame(Outcome out, int mine, int theirs, double now);
   // The app's `queue rating <n>`: the new rating after the site rated the set.
   void QueueRating(int rating, double now);
-  // Mid-set, the opponent left the room. They forfeit LEAVE_FORFEIT_MS later unless they come back.
+  // The ranked set reached its first game: one of its fights began (its fighters in) on final
+  // frames, or a game of it ended. Until then a leave, a stall or a no-show voids the set and rates
+  // nobody (the room's rule, YouGame docs/ORCA_ONLINE_UX.md "3B leaving mid-game"); from then on
+  // the one who goes forfeits it.
+  void GameBegan(double now);
+  // Mid-set, the opponent left the room. They forfeit LEAVE_FORFEIT_MS later unless they come back
+  // (before the set's first game: no contest then).
   void OpponentLeft(double now);
   void OpponentBack(double now);
   // The session has been waiting `stalled_ms` for the opponent's inputs.
@@ -172,7 +180,8 @@ public:
   void OpponentDropped(double now);
   // Casual: the opponent left and the app searches again.
   void CasualOpponentLeft(double now);
-  // This player left a ranked set, or picked no character in time (`no_show`).
+  // This player left a ranked set, or picked no character in time (`no_show`): a loss once the set
+  // reached its first game (GameBegan), else it doesn't count.
   void SelfLeft(bool no_show, double now);
   // No verdict will come: the countdown goes.
   void NoVerdict(double now);
@@ -204,6 +213,8 @@ private:
   std::string m_opponent;
   bool m_ranked_live = false;  // a ranked set is in progress (no verdict yet)
   bool m_casual_live = false;
+  // The ranked set reached its first game (GameBegan): a leave from here on is a forfeit.
+  bool m_game_began = false;
 
   // The opponent gone mid-set: since when, and why.
   std::optional<double> m_left_at;   // the room's leave
@@ -226,6 +237,7 @@ private:
   std::string m_note_title, m_note_line;
   Widgets::Tone m_note_tone{};
   double m_note_at = -1;
+  double m_self_left_at = -1;     // the note is SelfLeft's
   bool m_note_after_set = false;  // the note is the after-set "<name> left"
 
   // After the set: the room stays open, with the leave hint on the results screen.

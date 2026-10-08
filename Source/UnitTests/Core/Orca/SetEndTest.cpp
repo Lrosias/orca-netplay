@@ -153,6 +153,7 @@ TEST(OrcaSetEndCountdown, ALeaveCountsTheRoomsGraceThenTheForfeitWinsTheSet)
 {
   Model m;
   m.MatchBegan(true, "bo", 0);
+  m.GameBegan(500);
   m.OpponentLeft(1000);
   View v = m.At(1000);
   ASSERT_TRUE(v.notice);
@@ -245,6 +246,48 @@ TEST(OrcaSetEndCountdown, ALeaveDuringAStallCountsFromTheLeave)
   n.MatchBegan(true, "bo", 0);
   n.OpponentDropped(1000);
   EXPECT_EQ(n.At(1000).notice->seconds, 0);
+}
+
+// Before the set's first game began (its fighters in on final frames, or a game ended), the room
+// voids a leave or a stall instead of forfeiting it (YouGame docs/ORCA_ONLINE_UX.md "3B leaving
+// mid-game"): the same countdown, to no contest.
+TEST(OrcaSetEndCountdown, BeforeTheFirstGameTheCountdownIsToNoContest)
+{
+  Model m;
+  m.MatchBegan(true, "bo", 0);
+  m.OpponentLeft(1000);
+  View v = m.At(1000);
+  ASSERT_TRUE(v.notice);
+  EXPECT_EQ(v.notice->title, "bo disconnected");
+  EXPECT_EQ(v.notice->line, "No contest in 0:15");
+  EXPECT_EQ(v.notice->seconds, 15);
+  EXPECT_EQ(v.notice->tone, Tone::Warning);
+  EXPECT_EQ(m.At(16000).notice->line, "No contest now");
+  // The room's verdict: void, "No contest · This set doesn't count".
+  m.SetVerdict(Outcome::Void, false, 0, 0, -1, -1, 1532, 16100);
+  v = m.At(16100);
+  ASSERT_TRUE(v.notice);
+  EXPECT_EQ(v.notice->title, "No contest");
+  EXPECT_EQ(v.notice->line, "This set doesn't count");
+  EXPECT_FALSE(v.panel);
+
+  // A stall alone, the same.
+  Model n;
+  n.MatchBegan(true, "bo", 0);
+  n.Stall(static_cast<int>(Model::STALL_NOTICE_MS), 10000);
+  ASSERT_TRUE(n.At(10000).notice);
+  EXPECT_EQ(n.At(10000).notice->line, "No contest in 0:09");
+  // The game begins on final frames during the countdown: from then on it is a forfeit.
+  n.GameBegan(11000);
+  EXPECT_EQ(n.At(11000).notice->line, "They forfeit in 0:08");
+
+  // A new set starts unbegun.
+  Model r;
+  r.MatchBegan(true, "bo", 0);
+  r.GameBegan(100);
+  r.MatchBegan(true, "cy", 200);
+  r.OpponentLeft(300);
+  EXPECT_EQ(r.At(300).notice->line, "No contest in 0:15");
 }
 
 TEST(OrcaSetEndCountdown, BackInTheRoomTakesTheNoticeAway)
@@ -385,6 +428,7 @@ TEST(OrcaSetEndNotice, LeavingARankedSetSaysItCountsAsALoss)
 {
   Model m;
   m.MatchBegan(true, "bo", 0);
+  m.GameBegan(500);
   m.SelfLeft(false, 1000);
   View v = m.At(1000);
   ASSERT_TRUE(v.notice);
@@ -394,12 +438,41 @@ TEST(OrcaSetEndNotice, LeavingARankedSetSaysItCountsAsALoss)
   EXPECT_TRUE(m.At(1000 + Model::NOTICE_MS - 1).notice);
   EXPECT_FALSE(m.At(1000 + Model::NOTICE_MS).notice);
 
+  // A second leave inside the notice keeps it.
+  m.SelfLeft(true, 1100);
+  EXPECT_EQ(m.At(1100).notice->title, "You left");
+}
+
+// Before the set's first game began the room voids a leave, and rates nobody: a no-show always (the
+// pick runs out on game 1's character select), or a leave or a crash during the stage's loading
+// image (YouGame docs/ORCA_ONLINE_UX.md "3B leaving mid-game").
+TEST(OrcaSetEndNotice, LeavingBeforeTheFirstGameSaysItDoesNotCount)
+{
+  Model m;
+  m.MatchBegan(true, "bo", 0);
+  m.SelfLeft(false, 1000);
+  View v = m.At(1000);
+  ASSERT_TRUE(v.notice);
+  EXPECT_EQ(v.notice->title, "You left");
+  EXPECT_EQ(v.notice->line, "This set doesn't count");
+  EXPECT_EQ(v.notice->tone, Tone::Neutral);
+  EXPECT_FALSE(m.At(1000 + Model::NOTICE_MS).notice);
+
   Model n;
   n.MatchBegan(true, "bo", 0);
   n.SelfLeft(true, 0);
   n.SelfLeft(false, 100);  // the leave that follows keeps the no-show's words
   EXPECT_EQ(n.At(100).notice->title, "Time's up");
-  EXPECT_EQ(n.At(100).notice->line, "You didn't pick in time · This set counts as a loss");
+  EXPECT_EQ(n.At(100).notice->line, "You didn't pick in time · This set doesn't count");
+  EXPECT_EQ(n.At(100).notice->tone, Tone::Neutral);
+
+  // A game that ended (GameBegan from a result) counts as begun: a later no-show is a loss.
+  Model o;
+  o.MatchBegan(true, "bo", 0);
+  o.GameBegan(50);
+  o.SelfLeft(true, 100);
+  EXPECT_EQ(o.At(100).notice->line, "You didn't pick in time · This set counts as a loss");
+  EXPECT_EQ(o.At(100).notice->tone, Tone::Loss);
 }
 
 TEST(OrcaSetEndNotice, CasualGamesAndTheOpponentLeaving)

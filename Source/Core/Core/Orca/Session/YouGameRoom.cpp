@@ -697,6 +697,15 @@ bool TicketAllowsDirect(const picojson::object& reply)
   return it == reply.end() || !it->second.is<bool>() || it->second.get<bool>();
 }
 
+std::string GameStartMessage(const std::string& queue, const std::string& match, bool decided,
+                             int start)
+{
+  if (queue != "ranked" || match.empty() || decided || start < 0)
+    return "";
+  return fmt::format("{{\"t\":\"game-start\",\"matchId\":{},\"id\":\"g{}\"}}", JsonString(match),
+                     start);
+}
+
 bool DecodeDirectPacket(const std::string& payload, int slot, Packet* packet)
 {
   Packet decoded;
@@ -821,6 +830,8 @@ struct YouGameRoom::Impl
   {
     GameReport report;
     Clock::time_point at;
+    // A ranked game's start (report.start), not a result.
+    bool game_start = false;
   };
   std::deque<HeldReport> reports;
   bool desync_pending = false;
@@ -865,6 +876,8 @@ struct YouGameRoom::Impl
   std::map<std::string, SetEnd> set_ends;
   // Reports that came from the match block; only the block ends their set.
   std::set<std::string> block_ids;
+  // Ranked games whose game-start went to this match (their fights' first frames).
+  std::set<int> starts_sent;
 
   // Direct links to the other Orcas, unless ORCA_DIRECT=0. The pointer never changes after
   // construction; the link thread starts with the welcome.
@@ -2082,6 +2095,18 @@ struct YouGameRoom::Impl
     SendRaw(text);
   }
 
+  // A ranked game began: the room's match hears it once (GameStartMessage), so a leave from here on
+  // loses the set. A refusal comes back as a command-error, which changes nothing.
+  void SendGameStart(int start, const std::string& match, const std::string& room_queue,
+                     bool decided)
+  {
+    const std::string text = GameStartMessage(room_queue, match, decided, start);
+    if (text.empty() || !starts_sent.insert(start).second)
+      return;
+    NOTICE_LOG_FMT(NETPLAY, "Orca room: {}", text);
+    SendRaw(text);
+  }
+
   // The set's (or a casual game's) end, once.
   void SendFinish(const std::string& match, const std::string& winner, const std::string& why)
   {
@@ -2102,7 +2127,7 @@ struct YouGameRoom::Impl
   {
     std::string current_match, room_queue;
     bool desync, done, stall;
-    std::vector<GameReport> ready;
+    std::vector<HeldReport> ready;
     {
       std::lock_guard lock(mutex);
       current_match = match_id;
@@ -2122,12 +2147,12 @@ struct YouGameRoom::Impl
         {
           if (now - reports.front().at < REPORT_HOLD)
             break;
-          WARN_LOG_FMT(NETPLAY, "Orca room: a game's report found no room match in {} s: dropped",
-                       REPORT_HOLD.count());
+          WARN_LOG_FMT(NETPLAY, "Orca room: a game's {} found no room match in {} s: dropped",
+                       reports.front().game_start ? "start" : "report", REPORT_HOLD.count());
           reports.pop_front();
           continue;
         }
-        ready.push_back(std::move(reports.front().report));
+        ready.push_back(std::move(reports.front()));
         reports.pop_front();
       }
     }
@@ -2154,8 +2179,13 @@ struct YouGameRoom::Impl
     // A ranked set already decided takes no more games.
     if (room_queue == "ranked" && (finish_sent || done))
       return;
-    for (const GameReport& report : ready)
-      SendReport(report, current_match, room_queue);
+    for (const HeldReport& held : ready)
+    {
+      if (held.game_start)
+        SendGameStart(held.report.start, current_match, room_queue, finish_sent || done);
+      else
+        SendReport(held.report, current_match, room_queue);
+    }
   }
 
   // The local player's view of a detail the room echoed (port order): their own port first.
@@ -2409,6 +2439,7 @@ struct YouGameRoom::Impl
     game_numbers.clear();
     set_ends.clear();
     block_ids.clear();
+    starts_sent.clear();
     match_participants.clear();
     LobbyFields(m);
     match_participants = lobby_participants;
@@ -3355,6 +3386,15 @@ void YouGameRoom::ReportGame(GameReport report)
   std::lock_guard lock(m_impl->mutex);
   if (m_impl->reports.size() < 16)
     m_impl->reports.push_back({std::move(report), Clock::now()});
+}
+
+void YouGameRoom::ReportGameStart(int start)
+{
+  GameReport report;
+  report.start = start;
+  std::lock_guard lock(m_impl->mutex);
+  if (m_impl->reports.size() < 16)
+    m_impl->reports.push_back({std::move(report), Clock::now(), true});
 }
 
 void YouGameRoom::ReportDesync()

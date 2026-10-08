@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -62,4 +63,17 @@ private:
 
 // Opens the disc and verifies it, printing the lines above to `out`. Returns the exit code.
 int Run(const std::string& path, std::FILE* out);
+
+// The verifier's IOS checks signatures in a NAND of its own, so the player's is never written: a
+// folder in the system's temp folder, named for the verifying process
+// ("orca-verify-nand-<pid>-<n>"). A verify that is killed (the app's SIGTERM, TerminateProcess on
+// Windows) never removes its folder, so each verify first removes those whose process is gone.
+inline constexpr std::string_view NAND_PREFIX = "orca-verify-nand-";
+// Makes this process's NAND folder after clearing the stale ones. "" when it can't.
+std::string MakeNand();
+// Removes each NAND_PREFIX folder directly in `dir` whose process `alive` says is gone. A name
+// without a pid, a file and a symlink stay. Returns how many it removed.
+std::size_t ClearStaleNands(const std::string& dir, const std::function<bool(u64 pid)>& alive);
+// Whether a process with this id is running. One this user may not look at counts as running.
+bool ProcessAlive(u64 pid);
 }  // namespace Orca::DiscVerify

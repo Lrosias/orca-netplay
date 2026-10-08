@@ -393,10 +393,65 @@ TEST(OrcaRankedSet, ProjectPlusKeepsItsOwnTimeOutRules)
   EXPECT_EQ(s.records[0].how, How::Results);
   EXPECT_EQ(s.records[0].winner, 0);
   EXPECT_FALSE(s.tiebreak);
+  // The live fight is read only to see the fighters in (the game began): no ledge grabs or time-up
+  // snapshot are counted.
+  EXPECT_EQ(s.records[0].ledge, (std::array<u8, 2>{0, 0}));
   // A tie (overtime should have prevented it) is recorded without a tiebreak game.
   s = Play({}, Ruleset::PPlus, 1000, Result(0, 0, 1, 1));
   EXPECT_EQ(s.records[0].how, How::Tie);
   EXPECT_FALSE(s.tiebreak);
+}
+
+// A ranked game begins once its fighters are in (FIGHT_SEEN), not at the fight scene's first frame:
+// the stage's loading image comes first (Brawl to frame ~169, Project+ to 27), and a crash or a
+// stall there leaves the set void (YouGame docs/ORCA_ONLINE_UX.md "3B leaving mid-game").
+TEST(OrcaRankedSet, AGameBeginsWhenItsFightersAreIn)
+{
+  for (const Ruleset ruleset : {Ruleset::Brawl, Ruleset::PPlus})
+  {
+    SCOPED_TRACE(static_cast<int>(ruleset));
+    SetState s;
+    s = RankedSet::Step(s, ruleset, At(Scene::Between), 99);
+    // The loading image: the fight is followed from its first frame, but nobody is in yet, read or
+    // not.
+    RankedSet::Facts loading = At(Scene::Fight);
+    s = RankedSet::Step(s, ruleset, loading, 100);
+    loading.live_read = true;
+    for (u32 f = 101; f < 270; ++f)
+      s = RankedSet::Step(s, ruleset, loading, f);
+    EXPECT_TRUE(s.fight);
+    EXPECT_EQ(s.fight_start, 100u);
+    EXPECT_FALSE(s.fight_flags & SetBlock::FIGHT_SEEN);
+    // The fighters are in: the game began, still named by the fight's first frame.
+    RankedSet::Facts in = At(Scene::Fight);
+    in.live = LiveAt(false, 3, 3, 0, 0, true, false);
+    in.live_read = true;
+    s = RankedSet::Step(s, ruleset, in, 270);
+    EXPECT_TRUE(s.fight_flags & SetBlock::FIGHT_SEEN);
+    EXPECT_EQ(s.fight_start, 100u);
+    // They vanish (Brawl's sudden death) and come back: the same game, still begun.
+    s = RankedSet::Step(s, ruleset, loading, 271);
+    EXPECT_TRUE(s.fight_flags & SetBlock::FIGHT_SEEN);
+    s = RankedSet::Step(s, ruleset, in, 272);
+    EXPECT_TRUE(s.fight_flags & SetBlock::FIGHT_SEEN);
+    EXPECT_EQ(s.fight_start, 100u);
+    if (ruleset == Ruleset::Brawl)
+    {
+      EXPECT_TRUE(s.fight_flags & SetBlock::FIGHT_SUDDEN);
+      EXPECT_EQ(s.ledge[0], 1);
+    }
+    else
+    {
+      // Project+ counts nothing else from the live fight: its own codeset settles time-outs.
+      EXPECT_EQ(s.fight_flags, SetBlock::FIGHT_SEEN);
+      EXPECT_EQ(s.ledge, (std::array<u8, 2>{0, 0}));
+    }
+    // A fight left without its results screen: the next one starts unbegun.
+    s = RankedSet::Step(s, ruleset, At(Scene::Other), 300);
+    s = RankedSet::Step(s, ruleset, At(Scene::Fight), 400);
+    EXPECT_EQ(s.fight_start, 400u);
+    EXPECT_FALSE(s.fight_flags & SetBlock::FIGHT_SEEN);
+  }
 }
 
 TEST(OrcaRankedSet, ScoreLine)
@@ -519,4 +574,219 @@ TEST(OrcaRankedSet, TrackerReportsTheBlocksGames)
   EXPECT_EQ(out[0].kind, GameResult::Kind::Draw);
   EXPECT_EQ(out[0].start, 1000);
   EXPECT_EQ(out[0].how, static_cast<int>(How::Tie));
+}
+
+// A ranked game began (ORCA.md "Matchmaking and results"): once the first frame with its fighters
+// in is final, the tracker names it by the fight's first frame, the id the game's report carries,
+// so the room's game-start goes once per game.
+TEST(OrcaRankedSet, TrackerSaysWhenEachGameBegan)
+{
+  ResultsTracker t;
+  SetState s;
+  int frame = 0;
+  std::vector<int> starts;
+  std::vector<GameResult> games;
+  // Each frame: the set block's step, its reading, and every frame up to 3 back confirmed. A fight
+  // has its fighters in unless `loading`.
+  const auto run = [&](Scene scene, int frames, const ResultBlock& result = Result(0, 1),
+                       bool loading = false) {
+    for (int i = 0; i < frames; ++i, ++frame)
+    {
+      RankedSet::Facts f = At(scene);
+      f.block = result;
+      f.decision = static_cast<u8>(result.decision);
+      if (scene == Scene::Fight)
+      {
+        f.live_read = true;
+        if (!loading)
+          f.live = LiveAt(false, 3, 3, 0, 0);
+      }
+      s = RankedSet::Step(s, Ruleset::Brawl, f, static_cast<u32>(frame));
+      Reading r;
+      r.scene = scene;
+      r.set = s;
+      t.Store(frame, r, 0);
+      for (GameResult& g : t.Confirm(frame - 3, 10, &starts))
+        games.push_back(std::move(g));
+    }
+  };
+  // The character select, then game 1's fight from frame 23: its loading image, then the fighters
+  // in at frame 193.
+  run(Scene::Other, 20);
+  run(Scene::Between, 3);
+  run(Scene::Fight, 170, Result(0, 1), true);
+  EXPECT_TRUE(starts.empty());
+  run(Scene::Fight, 3);
+  // Frame 193 is read but not final yet.
+  EXPECT_TRUE(starts.empty());
+  run(Scene::Fight, 1);
+  EXPECT_EQ(starts, std::vector<int>{23});
+  // A whole fight with a sudden death in it is still one game (a tie: Brawl plays a tiebreak).
+  run(Scene::Fight, 200);
+  run(Scene::Between, 5);
+  run(Scene::Fight, 30);
+  run(Scene::Between, 5);
+  run(Scene::Results, 20, Result(0, 1));
+  EXPECT_EQ(starts, std::vector<int>{23});
+  ASSERT_EQ(games.size(), 1u);
+  EXPECT_EQ(games[0].kind, GameResult::Kind::Draw);
+  // The report's id is the start's.
+  EXPECT_EQ(games[0].start, 23);
+  // A fight left during its loading image (a crash or a quit at load) never began.
+  run(Scene::Other, 40);
+  run(Scene::Between, 3);
+  run(Scene::Fight, 160, Result(0, 1), true);
+  run(Scene::Other, 10);
+  EXPECT_EQ(starts, std::vector<int>{23});
+  EXPECT_EQ(games.size(), 1u);
+  // Game 2 begins; leaving it for the menus without its results screen records no game, but it
+  // had begun.
+  run(Scene::Between, 3);
+  const int second = frame;
+  run(Scene::Fight, 60);
+  run(Scene::Other, 10);
+  EXPECT_EQ(starts, (std::vector<int>{23, second}));
+  EXPECT_EQ(games.size(), 1u);
+  // Games 3 and 4 to the set's end; nothing begins after it.
+  std::vector<int> want{23, second};
+  for (int i = 0; i < 2; ++i)
+  {
+    run(Scene::Other, 20);
+    run(Scene::Between, 3);
+    want.push_back(frame);
+    run(Scene::Fight, 60);
+    run(Scene::Between, 3);
+    run(Scene::Results, 10, Result(0, 1));
+  }
+  ASSERT_EQ(s.done, 1);
+  run(Scene::Other, 20);
+  run(Scene::Between, 3);
+  run(Scene::Fight, 60);
+  run(Scene::Other, 10);
+  EXPECT_EQ(starts, want);
+  ASSERT_EQ(games.size(), 3u);
+  EXPECT_EQ(games[1].start, want[2]);
+  EXPECT_EQ(games[2].start, want[3]);
+  EXPECT_EQ(games[2].set_done, 1);
+}
+
+TEST(OrcaRankedSet, AGameBeginsOnlyOnFinalFramesAfterThePlugFrame)
+{
+  const auto fight_from = [](int start, bool in = true) {
+    Reading r;
+    r.scene = Scene::Fight;
+    r.set = SetState{};
+    r.set->fight = true;
+    r.set->fight_start = static_cast<u32>(start);
+    r.set->fight_flags = in ? SetBlock::FIGHT_SEEN : 0;
+    return r;
+  };
+  Reading select;
+  select.set = SetState{};
+  // On guessed inputs the fight began at frame 10; the real inputs put it at 13. Only the re-run's
+  // start is ever named.
+  {
+    ResultsTracker t;
+    std::vector<int> starts;
+    for (int f = 0; f < 10; ++f)
+      t.Store(f, select, 0);
+    EXPECT_TRUE(t.Confirm(9, -1, &starts).empty());
+    for (int f = 10; f < 20; ++f)
+      t.Store(f, fight_from(10), 0);
+    t.Confirm(9, -1, &starts);
+    EXPECT_TRUE(starts.empty());
+    for (int f = 10; f < 20; ++f)
+      t.Store(f, f < 13 ? select : fight_from(13), 0);
+    t.Confirm(19, -1, &starts);
+    EXPECT_EQ(starts, std::vector<int>{13});
+    // A final frame is never read again, and the same fight is not named twice.
+    t.Store(15, fight_from(10), 0);
+    for (int f = 20; f < 30; ++f)
+      t.Store(f, fight_from(13), 0);
+    t.Confirm(29, -1, &starts);
+    EXPECT_EQ(starts, std::vector<int>{13});
+  }
+  // As the reports: a fight begun before the opponent plugged in (500), or right at the frame after
+  // it, never counts; one begun later does.
+  {
+    ResultsTracker t;
+    std::vector<int> starts;
+    int f = 600;
+    for (const int start : {400, 501, 502})
+    {
+      t.Store(f++, select, 0);
+      t.Store(f++, fight_from(start), 0);
+    }
+    t.Confirm(f, 500, &starts);
+    EXPECT_EQ(starts, std::vector<int>{502});
+  }
+  // A keyframe loaded mid-fight (a resync): the fight began before this player's plug frame, so it
+  // is not named again.
+  {
+    ResultsTracker t;
+    std::vector<int> starts;
+    for (int f = 30; f < 40; ++f)
+      t.Store(f, fight_from(30), 0);
+    t.Confirm(39, -1, &starts);
+    EXPECT_EQ(starts, std::vector<int>{30});
+    for (int f = 50; f < 60; ++f)
+      t.Store(f, fight_from(30), 1);
+    t.Confirm(59, 50, &starts);
+    EXPECT_EQ(starts, std::vector<int>{30});
+  }
+  // A fight still loading (fighters not in) is named only once they come in, by its first frame;
+  // one whose fighters only came in on guessed inputs is not named.
+  {
+    ResultsTracker t;
+    std::vector<int> starts;
+    for (int f = 0; f < 10; ++f)
+      t.Store(f, select, 0);
+    for (int f = 10; f < 40; ++f)
+      t.Store(f, fight_from(10, f >= 35), 0);
+    t.Confirm(34, -1, &starts);
+    EXPECT_TRUE(starts.empty());
+    t.Confirm(39, -1, &starts);
+    EXPECT_EQ(starts, std::vector<int>{10});
+    ResultsTracker u;
+    std::vector<int> none;
+    for (int f = 10; f < 40; ++f)
+      u.Store(f, fight_from(10, f >= 35), 0);
+    for (int f = 35; f < 40; ++f)
+      u.Store(f, fight_from(10, false), 0);
+    u.Confirm(39, -1, &none);
+    EXPECT_TRUE(none.empty());
+  }
+  // Confirming in steps or at once names the same starts.
+  {
+    ResultsTracker a, b;
+    std::vector<int> in_steps, at_once;
+    for (int f = 0; f < 200; ++f)
+    {
+      const Reading r = f < 20 || (f >= 90 && f < 120) ? select : fight_from(f < 90 ? 20 : 120);
+      a.Store(f, r, 0);
+      b.Store(f, r, 0);
+      if (f % 7 == 0)
+        a.Confirm(f - 3, -1, &in_steps);
+    }
+    a.Confirm(1000, -1, &in_steps);
+    b.Confirm(1000, -1, &at_once);
+    EXPECT_EQ(in_steps, (std::vector<int>{20, 120}));
+    EXPECT_EQ(in_steps, at_once);
+  }
+  // A join rebuilt from an input replay (Rebase) mid-fight: that fight began before this machine
+  // was there, whatever the plug frame; the next one is named.
+  {
+    ResultsTracker t;
+    std::vector<int> starts;
+    for (int f = 100; f < 200; ++f)
+      t.Rebase(f, fight_from(50), 0);
+    for (int f = 200; f < 210; ++f)
+      t.Store(f, fight_from(50), 0);
+    t.Confirm(209, -1, &starts);
+    EXPECT_TRUE(starts.empty());
+    for (int f = 210; f < 220; ++f)
+      t.Store(f, f < 215 ? select : fight_from(215), 0);
+    t.Confirm(219, -1, &starts);
+    EXPECT_EQ(starts, std::vector<int>{215});
+  }
 }

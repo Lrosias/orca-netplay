@@ -1,14 +1,24 @@
 // Copyright 2026 YouGame
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <filesystem>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <vector>
 
+#include <fmt/format.h>
 #include <gtest/gtest.h>
+
+#ifdef _WIN32
+#include <Windows.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "Common/FileUtil.h"
 #include "Core/Orca/DiscVerify.h"
@@ -262,4 +272,69 @@ TEST(OrcaDiscVerify, BlankGameCubeImageIsDamaged)
   const size_t last = text.rfind('\n', text.size() - 2);
   ASSERT_NE(last, std::string::npos) << text;
   EXPECT_TRUE(text.substr(last + 1).starts_with("orca verify damaged ")) << text;
+}
+
+// A verify that was killed leaves its NAND folder; the next one removes it, and only it: not a
+// verify that is still running, not a name without a pid, not a file, not a symlink, not another
+// program's temp folder.
+TEST(OrcaDiscVerify, ClearsTheNandsOfKilledVerifies)
+{
+  const std::string dir = File::CreateTempDir();
+  ASSERT_FALSE(dir.empty());
+  for (const char* name : {"orca-verify-nand-111-a", "orca-verify-nand-222-b",
+                           "orca-verify-nand-x-c", "orca-verify-nand-333", "DolphinWii.abc123"})
+  {
+    ASSERT_TRUE(File::CreateDir(dir + "/" + name)) << name;
+  }
+  ASSERT_TRUE(File::CreateDir(dir + "/orca-verify-nand-111-a/sys"));
+  ASSERT_TRUE(File::WriteStringToFile(dir + "/orca-verify-nand-111-a/sys/x", "nand"));
+  ASSERT_TRUE(File::WriteStringToFile(dir + "/orca-verify-nand-444-file", "not a folder"));
+  std::filesystem::path target = std::filesystem::path(dir) / "DolphinWii.abc123";
+  std::error_code ec;
+  std::filesystem::create_directory_symlink(
+      target, std::filesystem::path(dir) / "orca-verify-nand-555-link", ec);
+  const bool linked = !ec;
+
+  std::vector<u64> asked;
+  const auto alive = [&asked](u64 pid) {
+    asked.push_back(pid);
+    return pid == 222;
+  };
+  EXPECT_EQ(Orca::DiscVerify::ClearStaleNands(dir, alive), 1u);
+
+  EXPECT_FALSE(File::Exists(dir + "/orca-verify-nand-111-a"));
+  EXPECT_TRUE(File::IsDirectory(dir + "/orca-verify-nand-222-b"));
+  EXPECT_TRUE(File::IsDirectory(dir + "/orca-verify-nand-x-c"));
+  EXPECT_TRUE(File::IsDirectory(dir + "/orca-verify-nand-333"));
+  EXPECT_TRUE(File::Exists(dir + "/orca-verify-nand-444-file"));
+  EXPECT_TRUE(File::IsDirectory(dir + "/DolphinWii.abc123"));
+  if (linked)
+    EXPECT_TRUE(
+        std::filesystem::is_symlink(std::filesystem::path(dir) / "orca-verify-nand-555-link"));
+  std::sort(asked.begin(), asked.end());
+  EXPECT_EQ(asked, (std::vector<u64>{111, 222}));
+  File::DeleteDirRecursively(dir);
+}
+
+TEST(OrcaDiscVerify, ThisProcessIsAliveAndANandIsItsOwn)
+{
+#ifdef _WIN32
+  const u64 pid = GetCurrentProcessId();
+#else
+  const u64 pid = static_cast<u64>(getpid());
+#endif
+  EXPECT_TRUE(Orca::DiscVerify::ProcessAlive(pid));
+  EXPECT_FALSE(Orca::DiscVerify::ProcessAlive(0));
+
+  const std::string nand = Orca::DiscVerify::MakeNand();
+  ASSERT_FALSE(nand.empty());
+  EXPECT_TRUE(File::IsDirectory(nand));
+  const std::string name = std::filesystem::path(nand).filename().string();
+  EXPECT_TRUE(name.starts_with(fmt::format("orca-verify-nand-{}-", pid))) << name;
+  // A second verify while this one runs leaves this one's folder.
+  const std::string second = Orca::DiscVerify::MakeNand();
+  EXPECT_TRUE(File::IsDirectory(nand));
+  EXPECT_NE(second, nand);
+  File::DeleteDirRecursively(second);
+  File::DeleteDirRecursively(nand);
 }

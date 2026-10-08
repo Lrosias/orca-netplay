@@ -138,8 +138,12 @@ public:
   // solo), so everything stored is dropped.
   void Store(int frame, const Reading& reading, u64 resyncs);
   // Frames through `confirmed` are final (real inputs, no re-run pending). Returns the games they
-  // finish, in order.
-  std::vector<GameResult> Confirm(int confirmed, int plug_frame);
+  // finish, in order. `starts`, if given, receives the ranked set games they begin (a fight's
+  // fighters in, SET_FIGHT_FLAGS' FIGHT_SEEN): each fight's first frame (SET_FIGHT_START), the id
+  // its game's report will carry, once, and only for a fight begun after `plug_frame` as the
+  // reports.
+  std::vector<GameResult> Confirm(int confirmed, int plug_frame,
+                                  std::vector<int>* starts = nullptr);
   void Reset();
   // Baseline a reconstructed frame without reporting games that happened before joining.
   void Rebase(int frame, const Reading& reading, u64 resyncs);
@@ -161,6 +165,9 @@ private:
   // Ranked set games seen so far. The first final reading after a reset only initializes the count.
   bool m_have_set = false;
   int m_set_games = 0;
+  // The last ranked fight seen begun, fighters in (its first frame), so each is counted once.
+  bool m_have_fight = false;
+  int m_fight_start = -1;
 };
 
 // The process-wide tracker (CPU thread only).

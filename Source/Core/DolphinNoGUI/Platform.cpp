@@ -441,7 +441,8 @@ void Platform::ProcessEmbedCommands()
     }
     else if (cmd == "delay")
     {
-      // This player's input delay: "auto" or a fixed 1 to max_delay frames. Applies while the
+      // This player's input delay: a fixed 1 to max_delay frames, or "auto" for Orca's own default
+      // (a fixed 3, Rollback/OnlineMatch.cpp DEFAULT_DELAY; never adaptive). Applies while the
       // app's caps include "delay"; mid-match, from the next frame.
       std::string value;
       in >> value;

@@ -36,7 +36,9 @@
 #include "Core/DolphinAnalytics.h"
 #include "Core/HW/VideoInterface.h"
 #include "Core/Host.h"
+#include "Core/Orca/BootLogs.h"
 #include "Core/Orca/Branding.h"
+#include "Core/Orca/CrashNote.h"
 #include "Core/Orca/Disc.h"
 #include "Core/Orca/DiscVerify.h"
 #include "Core/Orca/Launch.h"
@@ -74,6 +76,35 @@ static void signal_handler(int)
   s_platform->RequestShutdown();
 }
 
+// An alert's text on stderr, with Orca branding. Never throws: alerts come from the CPU thread
+// inside JIT code (an invalid access), where a C++ exception can't unwind, and fmt::print throws
+// when stderr takes fewer bytes than it was given (Orca/CrashNote.h). Only Windows builds have
+// exceptions; elsewhere fmt's failure would abort.
+static void PrintAlert(const char* text) noexcept
+{
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+  try
+  {
+    Orca::CrashNote::WriteLine(stderr, Orca::BrandText(text));
+  }
+  catch (...)
+  {
+    Orca::CrashNote::WriteLine(stderr, text);
+  }
+#else
+  Orca::CrashNote::WriteLine(stderr, Orca::BrandText(text));
+#endif
+}
+
+// At the game's first frame, embedded: the boot logs the app turned on go off (Orca/BootLogs.h).
+// On the CPU thread, so std::fprintf: a throw from there can't unwind (Orca/CrashNote.h).
+static void EndBootLogs()
+{
+  const std::string ended = Orca::BootLogs::EndAtFirstFrame();
+  if (!ended.empty())
+    std::fprintf(stderr, "Orca: boot logs off at the first frame: %s\n", ended.c_str());
+}
+
 #ifdef _WIN32
 // Like the default handler (a message box), but with Orca branding.
 static bool MsgAlertHandler(const char* caption, const char* text, bool yes_no,
@@ -82,7 +113,7 @@ static bool MsgAlertHandler(const char* caption, const char* text, bool yes_no,
   // When embedded or verifying, log the alert instead of popping a message box.
   if (s_embedded || !s_verify_disc.empty())
   {
-    fmt::print(stderr, "{}\n", Orca::BrandText(text));
+    PrintAlert(text);
     return false;
   }
   UINT window_style = MB_ICONINFORMATION;
@@ -99,7 +130,7 @@ static bool MsgAlertHandler(const char* caption, const char* text, bool yes_no,
 // Like the default handler (print to stderr), but with Orca branding.
 static bool MsgAlertHandler(const char*, const char* text, bool, Common::MsgType)
 {
-  fmt::print(stderr, "{}\n", Orca::BrandText(text));
+  PrintAlert(text);
   // Answer no to any question, like the default handler.
   return false;
 }
@@ -365,7 +396,8 @@ static int Run(const int argc, char* argv[], const Embed::Options& embed)
   {
     UICommon::SetUserDirectory(user_directory);
     // The verifier's IOS checks signatures in a NAND of its own, so the player's is never written.
-    const std::string nand = File::CreateTempDir();
+    // Clears those of verifies that were killed first (DiscVerify.h).
+    const std::string nand = Orca::DiscVerify::MakeNand();
     if (!nand.empty())
       File::SetUserPath(D_WIIROOT_IDX, nand);
     const int code = Orca::DiscVerify::Run(s_verify_disc, stdout);
@@ -611,6 +643,8 @@ static int Run(const int argc, char* argv[], const Embed::Options& embed)
 
 int main(const int raw_argc, char* raw_argv[])
 {
+  // Windows: a C++ exception names itself on stderr as it is thrown, so a run it ends says why.
+  Orca::CrashNote::InstallThrowReporter();
   // Remove --embed, --parent, --rect and --verify before the regular parser sees the arguments.
   std::vector<char*> arg_list(raw_argv, raw_argv + raw_argc);
   std::string embed_error;
@@ -639,6 +673,8 @@ int main(const int raw_argc, char* raw_argv[])
     Orca::Status::SetErrorListener([](std::string_view, std::string_view sentence) {
       Embed::Out(fmt::format("error {}", sentence));
     });
+    // The app's boot logs have told the boot's story once the game draws (Orca/BootLogs.h).
+    Orca::Status::SetFirstFrameListener(EndBootLogs);
   }
   const int argc = static_cast<int>(arg_list.size());
   arg_list.push_back(nullptr);

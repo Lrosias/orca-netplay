@@ -200,6 +200,8 @@ void ResultsTracker::Reset()
   m_after_fight = false;
   m_have_set = false;
   m_set_games = 0;
+  m_have_fight = false;
+  m_fight_start = -1;
 }
 
 std::optional<Reading::Scene> ResultsTracker::FinalScene() const
@@ -244,10 +246,17 @@ void ResultsTracker::Rebase(int frame, const Reading& reading, u64 resyncs)
   {
     m_have_set = true;
     m_set_games = reading.set->games;
+    // A fight already begun (fighters in) at the rebuilt frame was not this machine's to begin.
+    if (reading.set->fight && (reading.set->fight_flags & SetBlock::FIGHT_SEEN))
+    {
+      m_have_fight = true;
+      m_fight_start = static_cast<int>(reading.set->fight_start & 0x7FFFFFFF);
+    }
   }
 }
 
-std::vector<GameResult> ResultsTracker::Confirm(int confirmed, int plug_frame)
+std::vector<GameResult> ResultsTracker::Confirm(int confirmed, int plug_frame,
+                                                std::vector<int>* starts)
 {
   using Scene = Reading::Scene;
   std::vector<GameResult> out;
@@ -270,6 +279,21 @@ std::vector<GameResult> ResultsTracker::Confirm(int confirmed, int plug_frame)
       // whose fight began after the opponent's plug frame, and none from before the first final
       // reading.
       const SetBlock::SetState& set = *r.set;
+      // A game began once its fighters are in (FIGHT_SEEN, after the stage's loading image: a
+      // crash or a stall while it loads leaves the set void). The fight's first frame names it, as
+      // FromRecord's start does. A sudden death keeps the fight and its first frame, so it is the
+      // same game.
+      if (set.fight && (set.fight_flags & SetBlock::FIGHT_SEEN))
+      {
+        const int start = static_cast<int>(set.fight_start & 0x7FFFFFFF);
+        if (!m_have_fight || start != m_fight_start)
+        {
+          m_have_fight = true;
+          m_fight_start = start;
+          if (starts && start - 1 > plug_frame)
+            starts->push_back(start);
+        }
+      }
       if (!m_have_set || set.games < m_set_games)
       {
         m_have_set = true;

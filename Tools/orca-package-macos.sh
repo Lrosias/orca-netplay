@@ -31,6 +31,18 @@ fail() {
 
 [ "$(uname -s)" = Darwin ] || fail "macOS only"
 
+# No build-machine paths in the binary: __FILE__ (asserts, logs) and debug info name the sources from
+# the checkout ("./Source/..."), not from the builder's home folder (0.3.30's executable had 400-odd).
+# The flags are a plain string on the compilers' command lines, so the paths can't hold a space.
+case "$ROOT$BUILD_DIR" in
+*[[:space:]]*) fail "the checkout or build path has a space; build from one without" ;;
+esac
+PREFIX_MAP="-ffile-prefix-map=$ROOT=. -fdebug-prefix-map=$ROOT=."
+case "$BUILD_DIR/" in
+"$ROOT"/*) ;;
+*) PREFIX_MAP="$PREFIX_MAP -ffile-prefix-map=$BUILD_DIR=build -fdebug-prefix-map=$BUILD_DIR=build" ;;
+esac
+
 RELEASE=0
 INTERNAL=0
 case "${ORCA_INTERNAL:-}" in
@@ -100,7 +112,9 @@ cmake -S "$ROOT" -B "$BUILD_DIR" -G Ninja \
   -DUSE_SYSTEM_LIBS=OFF -DUSE_SYSTEM_ICONV=ON -DENCODE_FRAMEDUMPS=OFF -DENABLE_LLVM=OFF \
   -DENABLE_ANALYTICS=OFF -DENABLE_AUTOUPDATE=OFF -DUSE_DISCORD_PRESENCE=OFF \
   -DUSE_RETRO_ACHIEVEMENTS=OFF -DUSE_MGBA=OFF -DUSE_UPNP=OFF -DENABLE_VULKAN=OFF \
-  -DENABLE_CLI_TOOL=OFF -DENABLE_TESTS=OFF -DUSE_SANITIZERS=OFF >/dev/null
+  -DENABLE_CLI_TOOL=OFF -DENABLE_TESTS=OFF -DUSE_SANITIZERS=OFF \
+  -DCMAKE_C_FLAGS="$PREFIX_MAP" -DCMAKE_CXX_FLAGS="$PREFIX_MAP" \
+  -DCMAKE_OBJC_FLAGS="$PREFIX_MAP" -DCMAKE_OBJCXX_FLAGS="$PREFIX_MAP" >/dev/null
 cmake --build "$BUILD_DIR" --target dolphin-nogui
 
 if [ "$RELEASE" = 1 ]; then
@@ -110,6 +124,14 @@ if [ "$RELEASE" = 1 ]; then
 fi
 
 [ -x "$EXE" ] || fail "no $EXE"
+# strings on its own, so a strings that fails can't read as "no leaks".
+STRINGS_OUT="$(mktemp)"
+strings -a "$EXE" > "$STRINGS_OUT" || { rm -f "$STRINGS_OUT"; fail "strings could not read $EXE"; }
+[ -s "$STRINGS_OUT" ] || { rm -f "$STRINGS_OUT"; fail "strings found nothing in $EXE"; }
+LEAKS="$(grep -F -e "$ROOT/" -e "$BUILD_DIR/" -e "${HOME:-$ROOT}/" "$STRINGS_OUT" | sort -u | head -n 5 || true)"
+rm -f "$STRINGS_OUT"
+[ -z "$LEAKS" ] || fail "the executable still names build-machine paths, e.g.:
+$LEAKS"
 [ -d "$APP/Contents/Resources/Sys" ] && [ ! -L "$APP/Contents/Resources/Sys" ] ||
   fail "Sys is missing or a link in $APP"
 

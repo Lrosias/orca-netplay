@@ -34,6 +34,12 @@ class CPUThreadGuard;
 // Locking in needs Start, not A: tokens stay placed from one game's character select to the next,
 // and A on another character would otherwise lock in the old pick.
 //
+// L and R held as a player locks in (or as their time runs out) are kept, and held for them while
+// the character select ends: both games read them then (Brawl: Samus or Zelda with L or R plays
+// Zero Suit Samus or Sheik; Project+: L makes Nana lead the Ice Climbers, R picks a hidden
+// costume). The choice is made with the pick, so the second picker never counterpicks a Samus
+// that turns into Zero Suit Samus afterwards.
+//
 // Everything is a pure function of emulated memory and the frame number, so both machines and
 // every resimulation agree. State lives in the match block at kArea, written only by the frame
 // hook, and the input gate's masks are computed from that memory (Rollback/InputGate.h).
@@ -124,6 +130,7 @@ struct State
   u8 locked = 0;     // Free: bit p set once port p locked in
   u32 since = 0;     // frame the step began
   u16 elapsed = 0;   // frames into the step at the last frame (read by the input gate)
+  u8 held = 0;       // L and R as each port's turn ended: bit 2p port p's L, bit 2p + 1 its R
   bool operator==(const State&) const = default;
 };
 
@@ -131,7 +138,7 @@ struct State
 constexpr int PICK_FRAMES = 45 * 60;
 
 // 16 bytes right after the 512-byte match block: +0 kMagic, +4 game, +5 step, +6 first,
-// +7 locked, +8 since, +0xC elapsed, +0xE 0. Anything without the magic reads as Idle.
+// +7 locked, +8 since, +0xC elapsed, +0xE held, +0xF 0. Anything without the magic reads as Idle.
 constexpr u32 kArea = FreeSpace::kMatchBlock.end;
 constexpr u32 kAreaSize = 0x10;
 constexpr u32 kMagic = 0x5947434F;  // "YGCO"

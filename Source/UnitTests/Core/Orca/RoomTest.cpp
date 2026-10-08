@@ -272,6 +272,36 @@ TEST(OrcaRoom, RejectsMalformedPackets)
   EXPECT_TRUE(DecodePacket(EncodePacket(big), &got));
 }
 
+// A ranked game's start for the room (rooms/src/game-lobby.ts gameStart, ORCA.md "Matchmaking and
+// results"): exactly the room's message, only in a ranked queue room with its match current and the
+// set still open.
+TEST(OrcaRoom, GameStartIsTheRoomsMessage)
+{
+  const std::string match = "6f1c2b9e-0d3a-4c55-9a7e-1b2c3d4e5f60";
+  const std::string text = GameStartMessage("ranked", match, false, 4210);
+  EXPECT_EQ(text, "{\"t\":\"game-start\",\"matchId\":\"6f1c2b9e-0d3a-4c55-9a7e-1b2c3d4e5f60\","
+                  "\"id\":\"g4210\"}");
+  picojson::value v;
+  ASSERT_TRUE(picojson::parse(v, text).empty());
+  ASSERT_TRUE(v.is<picojson::object>());
+  const picojson::object& o = v.get<picojson::object>();
+  EXPECT_EQ(o.size(), 3u);
+  EXPECT_EQ(o.at("t").get<std::string>(), "game-start");
+  EXPECT_EQ(o.at("matchId").get<std::string>(), match);
+  // The room's game id rule: 1-64 letters, digits, _ or -.
+  EXPECT_EQ(o.at("id").get<std::string>(), "g4210");
+  // A match id is a JSON string whatever it holds.
+  ASSERT_TRUE(picojson::parse(v, GameStartMessage("ranked", "a\"b", false, 1)).empty());
+  EXPECT_EQ(v.get<picojson::object>().at("matchId").get<std::string>(), "a\"b");
+  // None outside a ranked queue room, without a room match, once the set is decided, or without a
+  // fight frame.
+  EXPECT_EQ(GameStartMessage("casual", match, false, 4210), "");
+  EXPECT_EQ(GameStartMessage("private", match, false, 4210), "");
+  EXPECT_EQ(GameStartMessage("ranked", "", false, 4210), "");
+  EXPECT_EQ(GameStartMessage("ranked", match, true, 4210), "");
+  EXPECT_EQ(GameStartMessage("ranked", match, false, -1), "");
+}
+
 TEST(OrcaRoom, CoalescingKeepsEarlierInputsAndChecksum)
 {
   std::optional<Packet> pending;

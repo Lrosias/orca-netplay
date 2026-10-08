@@ -3,11 +3,24 @@
 
 #include "Core/Orca/DiscVerify.h"
 
+#include <cerrno>
+#include <charconv>
+#include <climits>
 #include <cstring>
+#include <filesystem>
 #include <memory>
+#include <system_error>
 
 #include <fmt/format.h>
 
+#ifdef _WIN32
+#include <Windows.h>
+#else
+#include <signal.h>
+#include <unistd.h>
+#endif
+
+#include "Common/StringUtil.h"
 #include "DiscIO/Volume.h"
 
 namespace Orca::DiscVerify
@@ -192,5 +205,90 @@ int Run(const std::string& path, std::FILE* out)
   for (const std::string& line : ResultLines(problems))
     print(line);
   return ExitCode(CountDamage(problems));
+}
+
+bool ProcessAlive(u64 pid)
+{
+#ifdef _WIN32
+  if (pid == 0 || pid > MAXDWORD)
+    return false;
+  const HANDLE process =
+      OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
+  if (!process)
+    return GetLastError() == ERROR_ACCESS_DENIED;
+  DWORD code = 0;
+  const bool alive = GetExitCodeProcess(process, &code) && code == STILL_ACTIVE;
+  CloseHandle(process);
+  return alive;
+#else
+  if (pid == 0 || pid > static_cast<u64>(INT_MAX))
+    return false;
+  return kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM;
+#endif
+}
+
+std::size_t ClearStaleNands(const std::string& dir, const std::function<bool(u64 pid)>& alive)
+{
+  // Error codes throughout: Mac and Linux builds have no exceptions, and a throw would abort.
+  std::vector<std::filesystem::path> stale;
+  std::error_code ec;
+  for (std::filesystem::directory_iterator it(StringToPath(dir), ec), end; !ec && it != end;
+       it.increment(ec))
+  {
+    const std::string name = PathToString(it->path().filename());
+    if (!name.starts_with(NAND_PREFIX))
+      continue;
+    // "<pid>-<n>": the pid, then a dash.
+    const char* const first = name.data() + NAND_PREFIX.size();
+    const char* const last = name.data() + name.size();
+    u64 pid = 0;
+    const auto [stop, error] = std::from_chars(first, last, pid);
+    if (error != std::errc{} || stop == first || stop == last || *stop != '-')
+      continue;
+    std::error_code type_ec;
+    if (it->is_symlink(type_ec) || !it->is_directory(type_ec) || alive(pid))
+      continue;
+    stale.push_back(it->path());
+  }
+  std::size_t removed = 0;
+  for (const std::filesystem::path& path : stale)
+  {
+    std::error_code remove_ec;
+    std::filesystem::remove_all(path, remove_ec);
+    if (!remove_ec)
+      ++removed;
+  }
+  return removed;
+}
+
+std::string MakeNand()
+{
+  std::error_code ec;
+  const std::filesystem::path temp = std::filesystem::temp_directory_path(ec);
+  if (ec)
+    return {};
+  ClearStaleNands(PathToString(temp), ProcessAlive);
+#ifdef _WIN32
+  const u64 pid = GetCurrentProcessId();
+#else
+  const u64 pid = static_cast<u64>(getpid());
+#endif
+  const auto stamp = static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count());
+  for (u64 n = 0; n < 8; ++n)
+  {
+    const std::filesystem::path nand = temp / fmt::format("{}{}-{:x}", NAND_PREFIX, pid, stamp + n);
+    if (std::filesystem::create_directory(nand, ec))
+    {
+#ifdef _WIN32
+      // Dolphin's paths use forward slashes (File::SetUserPath, File::CreateTempDir).
+      return ReplaceAll(PathToString(nand), "\\", "/");
+#else
+      return PathToString(nand);
+#endif
+    }
+    if (ec)
+      return {};
+  }
+  return {};
 }
 }  // namespace Orca::DiscVerify

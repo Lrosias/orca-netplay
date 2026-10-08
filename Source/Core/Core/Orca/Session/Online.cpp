@@ -287,6 +287,12 @@ void ReportGame(const Net::GameReport& report)
     room->ReportGame(report);
 }
 
+void ReportGameStart(int start)
+{
+  if (const auto room = Room())
+    room->ReportGameStart(start);
+}
+
 void ReportDesync()
 {
   if (const auto room = Room())

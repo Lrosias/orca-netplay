@@ -185,6 +185,7 @@ void Model::ResetLocked()
   m_opponent.clear();
   m_ranked_live = false;
   m_casual_live = false;
+  m_game_began = false;
   m_left_at.reset();
   m_stall_at.reset();
   m_dropped = false;
@@ -203,6 +204,7 @@ void Model::ResetLocked()
   m_note_line.clear();
   m_note_tone = Widgets::Tone::Neutral;
   m_note_at = -1;
+  m_self_left_at = -1;
   m_note_after_set = false;
   m_set_over = false;
   m_set_over_leaving = false;
@@ -342,14 +344,24 @@ void Model::QueueRating(int rating, double now)
   NOTICE_LOG_FMT(ROLLBACK, "Set end: the page's rating {} (was {})", rating, m_rating.Before());
 }
 
+void Model::GameBegan(double now)
+{
+  std::lock_guard lk(m_lock);
+  (void)now;
+  if (!m_ranked_live || m_game_began)
+    return;
+  m_game_began = true;
+  NOTICE_LOG_FMT(ROLLBACK, "Set end: the set's first game began: leaving it from here on loses it");
+}
+
 void Model::OpponentLeft(double now)
 {
   std::lock_guard lk(m_lock);
   if (!m_ranked_live || m_left_at)
     return;
   m_left_at = now;
-  NOTICE_LOG_FMT(ROLLBACK, "Set end: {} left the room mid-set: their forfeit in {:.0f} s", Name(),
-                 LEAVE_FORFEIT_MS / 1000);
+  NOTICE_LOG_FMT(ROLLBACK, "Set end: {} left the room mid-set: {} in {:.0f} s", Name(),
+                 m_game_began ? "their forfeit" : "no contest", LEAVE_FORFEIT_MS / 1000);
 }
 
 void Model::OpponentBack(double now)
@@ -370,10 +382,11 @@ void Model::Stall(int stalled_ms, double now)
   if (!m_ranked_live || m_dropped || m_stall_at || stalled_ms < STALL_NOTICE_MS)
     return;
   m_stall_at = now - stalled_ms;
-  NOTICE_LOG_FMT(ROLLBACK, "Set end: {} stopped sending inputs {} ms ago: {}", Name(), stalled_ms,
-                 m_left_at ? "their forfeit is the leave's" :
-                                  fmt::format("their forfeit in {:.1f} s",
-                                              (STALL_FORFEIT_MS - stalled_ms) / 1000));
+  NOTICE_LOG_FMT(
+      ROLLBACK, "Set end: {} stopped sending inputs {} ms ago: {}", Name(), stalled_ms,
+      m_left_at ? fmt::format("{} is the leave's", m_game_began ? "their forfeit" : "no contest") :
+                  fmt::format("{} in {:.1f} s", m_game_began ? "their forfeit" : "no contest",
+                              (STALL_FORFEIT_MS - stalled_ms) / 1000));
 }
 
 void Model::StallOver(bool resumed, double now)
@@ -413,21 +426,24 @@ void Model::CasualOpponentLeft(double now)
 void Model::SelfLeft(bool no_show, double now)
 {
   std::lock_guard lk(m_lock);
-  if (m_note_at >= 0 && now - m_note_at < NOTICE_MS && m_note_tone == Widgets::Tone::Loss)
+  // Shown once: a no-show's "Time's up" stays when the leave that follows says it again.
+  if (m_self_left_at >= 0 && now - m_self_left_at < NOTICE_MS)
     return;
   m_ranked_live = false;
   m_left_at.reset();
   m_stall_at.reset();
   m_dropped = false;
   m_panel = false;
+  // The room voids a set left before its first game (a no-show always is) and rates nobody.
+  const char* const counts = m_game_began ? "This set counts as a loss" : "This set doesn't count";
   m_note_title = no_show ? "Time's up" : "You left";
-  m_note_line = no_show ? "You didn't pick in time · This set counts as a loss" :
-                          "This set counts as a loss";
-  m_note_tone = Widgets::Tone::Loss;
+  m_note_line = no_show ? fmt::format("You didn't pick in time · {}", counts) : std::string(counts);
+  m_note_tone = m_game_began ? Widgets::Tone::Loss : Widgets::Tone::Neutral;
   m_note_at = now;
+  m_self_left_at = now;
   m_note_after_set = false;
-  NOTICE_LOG_FMT(ROLLBACK, "Set end: this player left the set{}: a loss",
-                 no_show ? " (no pick)" : "");
+  NOTICE_LOG_FMT(ROLLBACK, "Set end: this player left the set{}: {}", no_show ? " (no pick)" : "",
+                 m_game_began ? "a loss" : "before its first game, no contest");
 }
 
 void Model::NoVerdict(double now)
@@ -526,9 +542,10 @@ std::optional<Notice> Model::NoticeAt(double now, bool* hides_waiting) const
       n.title = fmt::format("{} disconnected", Name());
       n.seconds = SecondsLeft(deadline, now);
       char clock[16];
-      n.line = n.seconds > 0 ?
-                   fmt::format("They forfeit in {}", Widgets::ClockText(n.seconds, clock)) :
-                   std::string("They forfeit now");
+      // Before the set's first game the room voids it instead: no contest.
+      const char* const what = m_game_began ? "They forfeit" : "No contest";
+      n.line = n.seconds > 0 ? fmt::format("{} in {}", what, Widgets::ClockText(n.seconds, clock)) :
+                               fmt::format("{} now", what);
       n.fraction = static_cast<float>(std::clamp((deadline - now) / total, 0.0, 1.0));
       n.tone = Widgets::Tone::Warning;
       const double shown_at = left ? *m_left_at : *m_stall_at + STALL_NOTICE_MS;
@@ -820,6 +837,8 @@ double DemoFrame(double now)
     s_loop = loop;
     s_step = 0;
     m.MatchBegan(s_demo != "casual", "bo", now);
+    // Each ranked screen shows a set that reached its first game.
+    m.GameBegan(now);
   }
   // Each step once per loop, at its time.
   const auto at = [&](int step, double when) {

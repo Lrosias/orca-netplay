@@ -76,7 +76,8 @@ int WriteSetRules(GuestMemory& memory, const SetBlock::SetState& set, u8 stocks 
 // Read-only. Invalid where the fight can't be read.
 Live ReadLiveFight(const GuestMemory& memory);
 
-// Read-only. Reads the live fight only when `live` is set.
+// Read-only. Reads the live fight only when `live` is set (the frame hook always sets it: Brawl's
+// verdict needs it, and in both games the fighters being in is when a game began).
 Facts ReadFacts(const GuestMemory& memory, bool live);
 
 // Frame hook entry. `resimulating` only quiets the log.

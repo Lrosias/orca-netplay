@@ -226,6 +226,9 @@ public:
   void SetOpponentPlugged(bool plugged);
   // Reports a game's result to the room's match once it has one (held 60 s at most).
   void ReportGame(GameReport report);
+  // A ranked set's game began (`start`: its fight's first frame): tells the room's match with a
+  // `game-start` (GameStartMessage), queued with the reports, once per game.
+  void ReportGameStart(int start);
   // The games desynced: report the match in progress void (a ranked set, or a casual game).
   void ReportDesync();
   // The opponent's inputs stopped mid ranked set: send a `finish` naming this player the winner,
@@ -276,6 +279,12 @@ private:
   bool m_ended = false;
 };
 
+// A ranked game's `game-start` for the room's match (exposed for tests):
+// {"t":"game-start","matchId":"<match>","id":"g<start>"}, the id the game's `game-report` carries.
+// Empty when none may go: a room other than a ranked queue's, no room match, the set already
+// decided (this side sent its finish, or the verdict came), or no fight frame.
+std::string GameStartMessage(const std::string& queue, const std::string& match, bool decided,
+                             int start);
 // Packets as room messages (exposed for tests).
 std::string EncodePacket(const Packet& packet);
 bool DecodePacket(const std::string& json, Packet* packet);

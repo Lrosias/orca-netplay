@@ -28,6 +28,7 @@ std::atomic<bool> s_started{false};
 std::FILE* s_out = nullptr;
 std::set<std::string, std::less<>> s_app_caps;
 void (*s_error_listener)(std::string_view, std::string_view) = nullptr;
+void (*s_first_frame_listener)() = nullptr;
 
 void Print(const std::string& line)
 {
@@ -203,7 +204,18 @@ int ExitCode()
 
 void GameStarted()
 {
-  s_started.store(true, std::memory_order_relaxed);
+  if (s_started.load(std::memory_order_relaxed) ||
+      s_started.exchange(true, std::memory_order_relaxed))
+  {
+    return;
+  }
+  if (s_first_frame_listener)
+    s_first_frame_listener();
+}
+
+void SetFirstFrameListener(void (*listener)())
+{
+  s_first_frame_listener = listener;
 }
 
 int Finish()

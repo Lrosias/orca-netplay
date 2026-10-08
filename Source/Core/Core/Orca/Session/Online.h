@@ -56,6 +56,9 @@ bool SetOver();
 void SetOpponentPlugged(bool plugged);
 // Reports a game's result for the room's match.
 void ReportGame(const Net::GameReport& report);
+// A ranked set's game began (its fight's first frame, the id its report will carry): tells a ranked
+// queue room's match, so leaving from then on loses the set.
+void ReportGameStart(int start);
 // The games desynced: the room's match in progress is void.
 void ReportDesync();
 // In a ranked set whose opponent stopped sending inputs (15 s stalled, or silent), this player

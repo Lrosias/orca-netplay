@@ -49,6 +49,7 @@ constexpr u32 AT_FIRST = 0x6;
 constexpr u32 AT_LOCKED = 0x7;
 constexpr u32 AT_SINCE = 0x8;
 constexpr u32 AT_ELAPSED = 0xC;
+constexpr u32 AT_HELD = 0xE;
 
 bool Pointer(const GuestMemory& m, u32 p)
 {
@@ -74,6 +75,20 @@ std::string Clock(int frames)
 {
   const int seconds = (std::max(frames, 0) + 59) / 60;
   return fmt::format("{}:{:02}", seconds / 60, seconds % 60);
+}
+
+// Port `port`'s L and R from its raw buttons, as State::held keeps them.
+u8 HeldBits(int port, u16 raw)
+{
+  const int bits = ((raw & PAD_TRIGGER_L) ? 1 : 0) | ((raw & PAD_TRIGGER_R) ? 2 : 0);
+  return static_cast<u8>(bits << (2 * port));
+}
+
+// The L and R kept for `port`, as PAD_* bits.
+u16 HeldButtons(const State& state, int port)
+{
+  const int bits = (state.held >> (2 * port)) & 3;
+  return static_cast<u16>(((bits & 1) ? PAD_TRIGGER_L : 0) | ((bits & 2) ? PAD_TRIGGER_R : 0));
 }
 
 // ORCA_TEST_CHAR_ORDER's set view, parsed once.
@@ -137,12 +152,20 @@ State Advance(const SetView& set, const CssView& css, const State& state, int fr
   const bool timed_out = elapsed >= static_cast<u32>(PICK_FRAMES);
   const int first = s.first & 1;
   const int second = 1 - first;
+  // L and R as a turn ends (CharOrder.h): the game reads them as the character select ends.
+  const auto keep = [&css, &s](int port) {
+    s.held = static_cast<u8>((s.held & ~(3 << (2 * port))) | HeldBits(port, css.ports[port].raw));
+  };
   bool next = timed_out;
   if (s.step == Step::First)
   {
-    // Free: the winner may lock in during the loser's turn.
-    if (set.order == Order::Free && locks_in(second))
+    // Free: the winner may lock in during the loser's turn, once: a later Start keeps the L and R
+    // it locked in with.
+    if (set.order == Order::Free && !(s.locked & (1 << second)) && locks_in(second))
+    {
       s.locked = static_cast<u8>(s.locked | (1 << second));
+      keep(second);
+    }
     next = next || locks_in(first);
   }
   else
@@ -151,6 +174,7 @@ State Advance(const SetView& set, const CssView& css, const State& state, int fr
   }
   if (next)
   {
+    keep(s.step == Step::First ? first : second);
     // Skip the second picker's turn if they already locked in.
     s.step = s.step == Step::First && !(s.locked & (1 << second)) ? Step::Second : Step::Done;
     s.since = now;
@@ -213,6 +237,9 @@ Masks Gate(const SetView& set, const CssView& css, const State& state)
   case Step::Done:
     masks[first] = done(first);
     masks[second] = done(second);
+    // Each player's L and R as they locked in, held for them while the character select ends.
+    masks[first].press |= HeldButtons(state, first);
+    masks[second].press |= HeldButtons(state, second);
     // Press Start for the second picker once both tokens are placed. A queue2 room handles this
     // itself (UX.cpp).
     if (even && css.ports[0].placed && css.ports[1].placed)
@@ -394,6 +421,7 @@ State ReadState(const GuestMemory& m)
   s.locked = m.Read8(kArea + AT_LOCKED) & 3;
   s.since = m.Read32(kArea + AT_SINCE);
   s.elapsed = m.Read16(kArea + AT_ELAPSED);
+  s.held = m.Read8(kArea + AT_HELD) & 0x0F;
   return s;
 }
 
@@ -421,8 +449,8 @@ int WriteState(GuestMemory& m, const State& s)
   put32(AT_SINCE, s.since);
   put8(AT_ELAPSED, static_cast<u8>(s.elapsed >> 8));
   put8(AT_ELAPSED + 1, static_cast<u8>(s.elapsed));
-  put8(AT_ELAPSED + 2, 0);
-  put8(AT_ELAPSED + 3, 0);
+  put8(AT_HELD, s.held);
+  put8(AT_HELD + 1, 0);
   return changed;
 }
 
