@@ -17,6 +17,8 @@
 //   orca result <json>      a matchmade room's verdict (with the app's "results")
 //   orca queue ready <casual|ranked> <char> <costume> | unready | skip | timeout me|them
 //   orca shaders <compiled> <total>   while the boot compiles shaders
+//   orca active <interval_s> <active_s> <inputs> <mode> <pads>   how much the player played, every
+//     60 s and when the game stops; embedded, never before "ready" (Orca/Activity.h)
 // Error codes: boot, cancelled, disc_missing, disc_unreadable, disc_revision, profile, settings,
 // room_mismatch, room_full, kicked, network, peer_left, desync, signed_out (the keyframe store
 // refused a signed-out player's game; the host says "friend-left signed_out"), internal. Only the

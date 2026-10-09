@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 
 #include "Common/Assert.h"
 #include "Common/CommonFuncs.h"
@@ -30,6 +31,41 @@ static bool GetFullscreenState(IDXGISwapChain* swap_chain)
 {
   BOOL fs = FALSE;
   return SUCCEEDED(swap_chain->GetFullscreenState(&fs, nullptr)) && fs;
+}
+
+// Orca: a short name for what a refused resize returns. No allocation: this runs on the CPU
+// thread, where a throw ends Orca without a word (Orca/CrashNote.h), and running out of memory is
+// one of the causes.
+static const char* ResizeErrorName(HRESULT hr)
+{
+  switch (hr)
+  {
+  case S_OK:
+    return "it succeeded";
+  case E_OUTOFMEMORY:
+    return "out of memory";
+  case E_INVALIDARG:
+    return "invalid argument";
+  case DXGI_ERROR_INVALID_CALL:
+    return "invalid call";
+  case DXGI_ERROR_DEVICE_REMOVED:
+    return "device removed";
+  case DXGI_ERROR_DEVICE_RESET:
+    return "device reset";
+  case DXGI_ERROR_DEVICE_HUNG:
+    return "device hung";
+  case DXGI_ERROR_DRIVER_INTERNAL_ERROR:
+    return "driver internal error";
+  default:
+    return "error";
+  }
+}
+
+// Orca: the device is gone and never comes back, so a picture never will either.
+static bool DeviceLost(HRESULT hr)
+{
+  return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ||
+         hr == DXGI_ERROR_DEVICE_HUNG || hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
 }
 
 namespace D3DCommon
@@ -180,14 +216,22 @@ bool SwapChain::CreateSwapChain(bool stereo, bool hdr)
     }
   }
 
+  m_buffers_error = S_OK;
   if (!CreateSwapChainBuffers())
   {
-    PanicAlertFmt("Failed to create swap chain buffers");
+    if (FAILED(m_buffers_error))
+      PanicAlertFmt("Failed to create swap chain buffers: {}", Common::HRWrap(m_buffers_error));
+    else
+      PanicAlertFmt("Failed to create swap chain buffers");
     DestroySwapChainBuffers();
     m_swap_chain.Reset();
     return false;
   }
 
+  // Orca: a new swap chain starts with buffers (ResizeSwapChain's notes count from here).
+  m_buffers_ok = true;
+  m_resize_error = S_OK;
+  m_frames_without_buffers = 0;
   return true;
 }
 
@@ -207,14 +251,14 @@ bool SwapChain::ResizeSwapChain()
   DestroySwapChainBuffers();
 
   // The swap chain fills up the size of the window if no size is specified
-  HRESULT hr = m_swap_chain->ResizeBuffers(SWAP_CHAIN_BUFFER_COUNT, 0, 0, DXGI_FORMAT_UNKNOWN,
-                                           GetSwapChainFlags());
+  const HRESULT resize_hr = m_swap_chain->ResizeBuffers(SWAP_CHAIN_BUFFER_COUNT, 0, 0,
+                                                        DXGI_FORMAT_UNKNOWN, GetSwapChainFlags());
 
-  if (FAILED(hr))
-    WARN_LOG_FMT(VIDEO, "ResizeBuffers() failed: {}", Common::HRWrap(hr));
+  if (FAILED(resize_hr))
+    WARN_LOG_FMT(VIDEO, "ResizeBuffers() failed: {}", Common::HRWrap(resize_hr));
 
   Microsoft::WRL::ComPtr<IDXGISwapChain4> swap_chain4;
-  hr = m_swap_chain.As(&swap_chain4);
+  HRESULT hr = m_swap_chain.As(&swap_chain4);
   if (SUCCEEDED(hr))
     hr = swap_chain4->SetColorSpace1(m_hdr ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 :
                                              DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
@@ -226,7 +270,42 @@ bool SwapChain::ResizeSwapChain()
     m_height = desc.BufferDesc.Height;
   }
 
-  return CreateSwapChainBuffers();
+  // Orca: a ResizeBuffers that fails after letting the old buffers go (it could not make the new
+  // ones: out of memory, a lost device, a window past 16384 px) leaves the swap chain with none,
+  // and GetBuffer fails with DXGI_ERROR_INVALID_CALL. Upstream asserts there, which ends a release
+  // build (Orca 0.3.30-0.3.34 on Windows, exit 0x80000003). The backends skip the picture and ask
+  // for the resize again instead (Gfx::BindBackbuffer); the game's log says why, once per change.
+  // stderr, not the VIDEO log: an embedded Orca's log has only NETPLAY and ROLLBACK.
+  const bool ok = CreateSwapChainBuffers();
+  if (ok)
+    m_frames_without_buffers = 0;
+  if (ok != m_buffers_ok || (!ok && resize_hr != m_resize_error))
+  {
+    RECT client = {};
+    GetClientRect(static_cast<HWND>(m_wsi.render_surface), &client);
+    if (ok)
+    {
+      std::fprintf(stderr, "Orca: the picture's swap chain works again at %ux%u\n", m_width,
+                   m_height);
+    }
+    else
+    {
+      std::fprintf(stderr,
+                   "Orca: the picture's swap chain has no buffers after a resize for a %ldx%ld "
+                   "window (ResizeBuffers 0x%08lX, %s)%s\n",
+                   client.right - client.left, client.bottom - client.top,
+                   static_cast<unsigned long>(resize_hr), ResizeErrorName(resize_hr),
+                   DeviceLost(resize_hr) ? "; the graphics device is lost, Orca stops" :
+                                           "; no picture until a resize works");
+    }
+    std::fflush(stderr);
+  }
+  m_buffers_ok = ok;
+  m_resize_error = ok ? S_OK : resize_hr;
+  // A lost device never draws again: end as before (the app reports the crash), now with the why.
+  if (!ok && DeviceLost(resize_hr))
+    Crash();
+  return ok;
 }
 
 void SwapChain::SetStereo(bool stereo)

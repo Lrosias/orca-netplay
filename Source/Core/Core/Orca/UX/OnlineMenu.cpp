@@ -382,6 +382,7 @@ std::pair<std::string, std::string> Lines()
 namespace
 {
 std::atomic<bool> s_drop_in_held{false};
+std::atomic<bool> s_training{false};
 
 // Versus sequences: a friend who joins there is already where friends play.
 bool IsVersusSequence(std::string_view sequence)
@@ -406,6 +407,11 @@ bool SequenceHoldsDropIn(std::string_view sequence)
 bool DropInHeld()
 {
   return s_drop_in_held.load();
+}
+
+bool InTraining()
+{
+  return s_training.load(std::memory_order_relaxed);
 }
 
 namespace FriendsMove
@@ -478,6 +484,7 @@ bool Frame(const Core::CPUThreadGuard& guard, int frame, bool resimulating,
     const bool test_hold = !s_test_hold_over && frame >= s_test_hold.first &&
                            frame < s_test_hold.second && TestKnobsAllowed();
     s_drop_in_held = SequenceHoldsDropIn(in.sequence) || test_hold;
+    s_training.store(in.sequence == "sqTraining", std::memory_order_relaxed);
   }
   in.present = B::Present(m) && m.Valid(B::FRIENDS) && m.Valid(B::FRIENDS_END - 1);
   if (!in.present || !Pointer(m, SCENE_MANAGER))

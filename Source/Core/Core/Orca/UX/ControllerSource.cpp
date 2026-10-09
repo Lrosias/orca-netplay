@@ -609,6 +609,18 @@ std::optional<GCPadStatus> LatestPad()
   return std::nullopt;
 }
 
+std::shared_ptr<const Snapshot> LatestSnapshot(double* age_ms)
+{
+  std::lock_guard lk(s_stream_lock);
+  if (!s_stream)
+    return nullptr;
+  const std::optional<Stream::Cached> cached = s_stream->Latest();
+  if (!cached)
+    return nullptr;
+  *age_ms = cached->age_ms;
+  return cached->snapshot;
+}
+
 void StartControllerStreamFromEnvironment()
 {
   const std::string bridge = Env("YOUGAME_BRIDGE"), token = Env("YOUGAME_TOKEN");

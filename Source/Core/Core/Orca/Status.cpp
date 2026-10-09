@@ -12,6 +12,7 @@
 
 #include <fmt/format.h>
 
+#include "Core/Orca/Activity.h"
 #include "Core/Orca/Music.h"
 #include "Core/Orca/Profile.h"
 #include "Core/Orca/UX/OnlineRules.h"
@@ -222,6 +223,8 @@ int Finish()
 {
   if (!SessionActive())
     return 0;
+  // The activity lines' last one, if the game ran and nothing printed it yet.
+  Activity::Finish();
   bool stuck;
   {
     std::lock_guard lock(s_mutex);

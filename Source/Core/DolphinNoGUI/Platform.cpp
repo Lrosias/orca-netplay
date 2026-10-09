@@ -19,6 +19,7 @@
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/IOS/IOS.h"
 #include "Core/IOS/STM/STM.h"
+#include "Core/Orca/Activity.h"
 #include "Core/Orca/Branding.h"
 #include "Core/Orca/Music.h"
 #include "Core/Orca/Profile.h"
@@ -214,6 +215,8 @@ void Platform::ProcessEmbedCommands()
       // Prints nothing outside a session.
       Orca::Status::PrintCaps();
       Embed::Out(*ready);
+      // The activity lines may start now (Orca/Activity.h, HoldUntilReady).
+      Orca::Activity::Ready();
     }
   }
 

@@ -161,13 +161,22 @@ void Gfx::DispatchComputeShader(const AbstractShader* shader, u32 groupsize_x, u
 bool Gfx::BindBackbuffer(const ClearColor& clear_color)
 {
   CheckForSwapChainChanges();
+  // Orca: no back buffer after a resize the driver refused (D3DCommon::SwapChain::ResizeSwapChain):
+  // no picture this frame, and the resize is asked for again now and then.
+  if (!m_swap_chain->GetFramebuffer())
+  {
+    if (m_swap_chain->ResizeRetryDue())
+      g_presenter->ResizeSurface();
+    return false;
+  }
   SetAndClearFramebuffer(m_swap_chain->GetFramebuffer(), clear_color);
   return true;
 }
 
 void Gfx::PresentBackbuffer()
 {
-  m_swap_chain->Present();
+  if (m_swap_chain->GetFramebuffer())
+    m_swap_chain->Present();
 }
 
 void Gfx::OnConfigChanged(u32 bits)

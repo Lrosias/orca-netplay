@@ -1100,8 +1100,8 @@ away.
 | `+0x290`-`+0x297` | A friend's move from the menus |
 
 Any new header (another mode, ruleset, coin or room) starts every track's state fresh. Compatibility:
-anything that changes what the game computes bumps `UX::kCompatVersion` (currently `ux=24`), which is
-in the compatibility key.
+anything that changes what the game computes bumps `UX::kCompatVersion` (currently `ux=25`, since
+0.3.34), which is in the compatibility key.
 
 ## Input gate
 
@@ -1818,7 +1818,47 @@ never pauses Orca: the page sends `blur`, the player's pad goes neutral, and the
 | `orca state <state>` / `orca error <code> <sentence>` | Session status (`Orca/Status.h`). Forward every line that starts with `orca `. |
 | `orca menu ...`, `orca result ...`, `orca queue ...` | See [Online menu](#online-menu) and [Matchmaking](#matchmaking-and-results). |
 | `orca controls <hex>` | The player's own controls: changed in the game, or loaded from Orca's file at boot. The page keeps them. |
+| `orca active <interval_s> <active_s> <inputs> <mode> <pads>` | How much the player played: every 60 s while the game runs, and once more when it stops ([Activity lines](#activity-lines)). |
 | `exit <code>` | Always last: 0 normal, 1 a reported error, 2 bad arguments. |
+
+### Activity lines
+
+`orca active 60 42 118 ranked 1`, every 60 s of wall-clock time on its own thread (stalls, loads and
+a paused game don't hold it up), and once more for the rest of the interval when the game stops,
+unless that rest is empty (under half a second, no input) (`Orca/Activity.h`). Since 0.3.35.
+
+- When it starts: embedded, at the first frame after `ready`. Until `ready` the app takes every line
+  from Orca for boot progress (`bootWatch.line()` in `desktop/src/orca.ts`), so a line printed by a
+  boot that hangs before its first picture would keep its boot watchdog from ever stopping it.
+  Without the app (a harness run), at the game's first frame.
+- An app without a handler for it (desktop on 2026-10-08): `parseOrcaLine` makes it a status line,
+  written to the run log and sent to the page as a `running` message that `OrcaEmbed` doesn't act
+  on. It changes neither the company, `orcaError` nor the `orca state left` hook.
+- For the app's handler: the last line comes after the game stopped, so after `orca state left` when
+  the app stopped it, and today's app no longer passes a stopped session's lines to the page (it
+  only logs them): read `orca active` before that check. Keep it out of `bootWatch.line()`.
+  `interval_s` is wall time, pauses and a sleeping Mac included: count `active_s`. Like the page's
+  own clock, the 30 s after an input run on when the game loses the input; the page only counts
+  them while it is visible.
+
+- `interval_s`: the seconds the line covers. `active_s`: those within 30 s after a real local input,
+  the page's own rule (`web/src/lib/play-activity.ts`), never more than `interval_s`. Both are
+  rounded to the nearest second.
+- `inputs`: real input edges in the interval, on every local controller together. A button pressed
+  or released, a trigger past half its travel (or its click) and back under a quarter, a stick out
+  past 48 of its 127 and back under 28: analog noise, drift, a stick held still and a gamepad's
+  stream of identical reports never count.
+- `mode`: `ranked` or `casual` in a queue room, `friends` with a friend plugged in, `training` in the
+  game's Training, else `solo`; the one with the most active time in the interval.
+- `pads`: local controllers with at least one edge in the interval. Several (couch play, the
+  keyboard pad) never multiply the seconds: one counts while any of them had an edge in the 30 s
+  before it.
+
+Only this machine's controllers count (every adapter port and gamepad in the app's stream, Dolphin's
+own port 1, a harness script), read at the boundary of each frame that runs for the first time in
+real time and only while the game has the input. Never a peer's input, a rollback re-run, a
+joiner's rebuild or catch-up, a fresh start's tail or replayed pads. Observation only: nothing it
+reads or keeps reaches emulation, the replay, checksums or the compatibility key.
 
 ### Focus
 
@@ -1854,3 +1894,13 @@ menu's side panel instead cuts `rect`, keeps `view` and sends `dim 50`.
 (`Tools/orca/iosurface-spike.c`) passed three 1920x1080 IOSurfaces to another process in about 13 ms
 of setup, with per-frame messages in a median 12 us. It would need Metal to present into an
 IOSurface ring and a small N-API module in the app.
+
+### Windows window resizes
+
+When the app resizes Orca's window and the graphics driver can't make the picture at the new size
+(D3D11 or D3D12 `ResizeBuffers` fails: out of memory, a window past 16384 px), Orca skips the picture
+instead of closing, and asks for the resize again on the next frame, then every 30 frames (a new
+size asks at once). The game, and an online match, carry on. stderr says so once per change
+(`Orca: the picture's swap chain has no buffers after a resize ...`, with the window's size and the
+error code) and again when the picture works. A lost graphics device still ends Orca, after saying
+so. Since 0.3.35; before, a refused resize ended Orca (exit `0x80000003`).

@@ -29,6 +29,7 @@
 #include "Core/HW/VideoInterface.h"
 #include "Core/IOS/FS/HostBackend/FS.h"
 #include "Core/IOS/IOS.h"
+#include "Core/Orca/Activity.h"
 #include "Core/Orca/JitWarm.h"
 #include "Core/Orca/Profile.h"
 #include "Core/Orca/Session/Events.h"
@@ -619,14 +620,24 @@ void OnFrameBoundary(const Core::CPUThreadGuard& guard)
       // app stream times its input only on frames that are neither re-runs nor catch-up.
       const RingPort* const ring = RingPort::Active();
       const bool first_run = ring ? !ring->Resimulating() : !IsResimulating();
+      // The activity lines (Orca/Activity.h) also see a script's or Dolphin's own pad; the
+      // app's controllers they read from its stream themselves.
       if (const auto scripted = Harness::InputOverride(local_seat))
+      {
+        if (!IsResimulating())
+          Orca::Activity::NoteLocalPad(
+              Orca::Activity::PAD_SCRIPT | static_cast<u32>(local_seat), *scripted);
         return Orca::Net::EncodePad(Orca::UX::FilterLocalPad(*scripted, first_run, true));
+      }
       const bool live = ControlReference::GetInputGate();
       if (const auto from_app = Orca::Events::LocalPad(!IsResimulating()))
         return Orca::Net::EncodePad(Orca::UX::FilterLocalPad(*from_app, first_run, live));
       g_controller_interface.SetCurrentInputChannel(ciface::InputChannel::SerialInterface);
       g_controller_interface.UpdateInput();
-      return Orca::Net::EncodePad(Orca::UX::FilterLocalPad(Pad::GetStatus(0), first_run, live));
+      const GCPadStatus pad = Pad::GetStatus(0);
+      if (!IsResimulating())
+        Orca::Activity::NoteLocalPad(Orca::Activity::PAD_DOLPHIN, pad);
+      return Orca::Net::EncodePad(Orca::UX::FilterLocalPad(pad, first_run, live));
     };
     const auto on_frame = [&guard](int frame, bool resimulating,
                                    const std::vector<Orca::Events::PortInfo>& ports, bool alone) {
@@ -659,6 +670,10 @@ void OnFrameBoundary(const Core::CPUThreadGuard& guard)
   // Skip host rendering for re-run frames. The emulated GPU still runs, so RAM and timing match.
   VideoCommon_SetSkipRender(IsResimulating() || Orca::TestSkipRender());
   s_frame_shown = !IsResimulating();
+  // The app's activity lines read this machine's controllers before a frame that runs for the
+  // first time in real time. Host-only: nothing it does reaches emulation.
+  if (Orca::SessionActive())
+    Orca::Activity::OnBoundary(!IsResimulating());
   s_frame_start_ticks = guard.GetSystem().GetCoreTiming().GetTicks();
   s_frame_start_wall = std::chrono::steady_clock::now();
 }

@@ -507,6 +507,8 @@ add_library(core
   NetPlayCommon.h
   NetPlayServer.cpp
   NetPlayServer.h
+  Orca/Activity.cpp
+  Orca/Activity.h
   Orca/BootLogs.cpp
   Orca/BootLogs.h
   Orca/Branding.cpp

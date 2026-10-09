@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -19,6 +20,8 @@
 // reading again.
 namespace Orca::UX
 {
+struct Snapshot;
+
 // The pad for this frame, or nullopt to fall back to Pad::GetStatus(0). CPU thread only.
 // Neutral while the window is unfocused. `for_frame` marks the per-frame read that feeds the
 // input-age stats.
@@ -33,6 +36,10 @@ void StartControllerStream(const std::string& bridge, const std::string& token);
 void StopControllerStream();
 // The newest snapshot's pad, ignoring window focus (tests and tools).
 std::optional<GCPadStatus> LatestPad();
+// The newest snapshot, every controller in it, ignoring window focus, and how long ago it came in
+// (`age_ms`, this machine's steady clock); null without one. For the activity lines
+// (Orca/Activity.h), never the game.
+std::shared_ptr<const Snapshot> LatestSnapshot(double* age_ms);
 
 // Latency stats. The p50..max fields time each new adapter report from USB receipt in the helper
 // to being cached here; they cross two wall clocks, so they are only good for short runs.
