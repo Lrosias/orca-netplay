@@ -35,9 +35,10 @@ namespace Orca::Net
 {
 namespace
 {
-// ORP1 contains controller inputs and typed UI events; legacy machine images are rejected. Builds
-// with another layout of it have another UX compat version, so they never meet.
-constexpr char MAGIC[4] = {'O', 'R', 'P', '1'};
+// ORP2 contains controller inputs and typed UI events; legacy machine images are rejected. Builds
+// with another layout of it have another UX compat version, so they never meet. ORP2 added each
+// frame's seed (ReplayFrame::seed).
+constexpr char MAGIC[4] = {'O', 'R', 'P', '2'};
 constexpr int WINDOW_LOG = 26;
 constexpr int LEVEL = 3;
 // Sanity limit per section (MEM2 is 64 MB; a Wii NAND is at most 512 MB).
@@ -319,6 +320,7 @@ bool WriteReplayFrame(Writer& w, const ReplayFrame& frame)
   }
   w.U32(frame.clear_ready);
   w.U32(frame.menu_exit);
+  w.U32(frame.seed);
   return true;
 }
 
@@ -365,12 +367,16 @@ bool ReadReplayFrame(Reader& r, ReplayFrame* frame)
   if (!r.U32(&menu_exit) || (menu_exit != 0 && !ValidMenuExit(menu_exit)))
     return false;
   frame->menu_exit = static_cast<u8>(menu_exit);
+  u32 seed;
+  if (!r.U32(&seed))
+    return false;
+  frame->seed = seed;
   return true;
 }
 
 // The smallest a frame's record can be: pads, a port count, the header and clear-ready flags, the
-// menu exit.
-constexpr size_t MIN_FRAME_BYTES = sizeof(Pads) + 4 * 4;
+// menu exit, the seed.
+constexpr size_t MIN_FRAME_BYTES = sizeof(Pads) + 5 * 4;
 // Magic, the frame count, the first frame, the origin and target hashes.
 constexpr size_t PREAMBLE_BYTES = 4 + 4 + 4 + 8 + 8;
 }  // namespace
@@ -395,13 +401,15 @@ std::vector<u8> PackKeyframe(int frame, const ReplayArchive& replay)
     const ReplayFrame* previous = nullptr;
     for (size_t i = 0; i < count; ++i)
     {
-      if ((i > 0 && replay.frames[i].menu_exit != 0) || !WriteReplayFrame(w, replay.frames[i]))
+      if ((i > 0 && (replay.frames[i].menu_exit != 0 || replay.frames[i].seed != 0)) ||
+          !WriteReplayFrame(w, replay.frames[i]))
         return {};
       if (!ChargeMetadata(replay.frames[i], previous, &budget))
         return {};
       previous = &replay.frames[i];
     }
-    if ((count > 0 && replay.boundary.menu_exit != 0) || !WriteReplayFrame(w, replay.boundary) ||
+    if ((count > 0 && (replay.boundary.menu_exit != 0 || replay.boundary.seed != 0)) ||
+        !WriteReplayFrame(w, replay.boundary) ||
         !ChargeMetadata(replay.boundary, previous, &budget))
       return {};
     if (w.out.size() > MAX_RAW)
@@ -454,7 +462,7 @@ bool UnpackKeyframe(const std::vector<u8>& blob, int* frame, ReplayArchive* repl
     for (u32 i = 0; i < count; ++i)
     {
       ReplayFrame next;
-      if (!ReadReplayFrame(r, &next) || (i > 0 && next.menu_exit != 0))
+      if (!ReadReplayFrame(r, &next) || (i > 0 && (next.menu_exit != 0 || next.seed != 0)))
         return false;
       if (!ChargeMetadata(next, decoded.frames.empty() ? nullptr : &decoded.frames.back(), &budget))
         return false;
@@ -462,8 +470,10 @@ bool UnpackKeyframe(const std::vector<u8>& blob, int* frame, ReplayArchive* repl
         next.ports = decoded.frames.back().ports;
       decoded.frames.push_back(std::move(next));
     }
-    if (!ReadReplayFrame(r, &decoded.boundary) || (count > 0 && decoded.boundary.menu_exit != 0) ||
-        !ChargeMetadata(decoded.boundary, decoded.frames.empty() ? nullptr : &decoded.frames.back(), &budget) ||
+    if (!ReadReplayFrame(r, &decoded.boundary) ||
+        (count > 0 && (decoded.boundary.menu_exit != 0 || decoded.boundary.seed != 0)) ||
+        !ChargeMetadata(decoded.boundary, decoded.frames.empty() ? nullptr : &decoded.frames.back(),
+                        &budget) ||
         !r.AtEnd())
       return false;
     *frame = static_cast<int>(end);

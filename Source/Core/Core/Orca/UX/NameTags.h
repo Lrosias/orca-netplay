@@ -25,7 +25,8 @@ class CPUThreadGuard;
 //     +0xE0 + i * 0x124. Name first, up to 5 UTF-16BE characters and a 0. Empty name = unused.
 //   - Tag controls: +0x0C rumble (1 on), +0x14 layout, 0x2D bytes, defaults at 0x80406938.
 //     GameCube 12 bytes (L, R, Z, D-pad up, side, down, A, B, C-stick, Y, X, then flags: tap jump
-//     0x80, set up 0x70), Wii Remote 8, with Nunchuk 12 (last: shake smash 0x80, tap jump 0x40,
+//     0x80, set up 0x70; the page's Save also sets 0x01, not tap jump, which profiles neither
+//     carry nor clear), Wii Remote 8, with Nunchuk 12 (last: shake smash 0x80, tap jump 0x40,
 //     not set up 0x03), Classic 13 (last: tap jump 0x80). Other bytes are actions (0 attack,
 //     1 special, 2 jump, 3 shield, 4 grab, 5 smash, 9 taunt, 0xA-0xC taunts, 0xE none).
 //   - On scMelee's first frame the game copies each port's tag layout into the per-port table
@@ -40,6 +41,11 @@ class CPUThreadGuard;
 // already holding that name, else the highest unused one, built as the game builds one. A duplicate
 // name gets its port number as the last character (SAND2). The player's controls are written into
 // it. A port with controls but no showable name gets "P<port>". A port with neither gets nothing.
+// The game's own name list types tags in full-width characters (U+FF21 for A) while Orca writes
+// ASCII, so names match as they read (width and case folded), and a tag the player typed in the
+// game wins over one Orca made of that name: a player who made their tag in Options > Controls
+// plays with it and gets no second tag of that name (before, Orca made one at the game's defaults,
+// put them in it, and never read their own).
 // A joined port with controls that wears a tag holding exactly what the game puts in a tag it makes
 // (rumble on, the default layout: a tag the player just made, or made again after a restart, since
 // tags made in the game last only until Orca closes) gets its controls written into that tag too.
@@ -111,8 +117,9 @@ bool ControlsValid(const std::vector<u8>& profile);
 
 // This player's own controls, read from their own save, to carry into an online game. Uses the tag
 // `port` wears on the character select, else the tag named by `last_worn` (kept by the caller),
-// else the tag matching `own_name`. Empty means the game's defaults. `read_tag`, if given, gets the
-// name of the tag read (empty when none).
+// else the tag that reads as `own_name` (one they typed in the game first). A `last_worn` that
+// reads as `own_name` is looked up as `own_name`. Empty means the game's defaults. `read_tag`, if
+// given, gets the name of the tag read (empty when none).
 std::vector<u8> ReadOwnControls(const GuestMemory& memory, int port, std::string_view own_name,
                                 std::u16string* last_worn, std::u16string* read_tag = nullptr);
 

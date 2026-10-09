@@ -68,6 +68,9 @@ struct ReplayFrame
   bool clear_ready = false;
   // A fresh start's way out of the built main menu (MENU_EXIT_*), or 0.
   u8 menu_exit = 0;
+  // The seed this history's game draws its random numbers from (UX/OnlineMenu.h
+  // FreshMove::ApplySeed), or 0 for the canonical boot's own. Only ever on a replay's first frame.
+  u32 seed = 0;
 };
 
 struct ReplayArchive

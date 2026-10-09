@@ -39,6 +39,35 @@ constexpr bool IsMusicVoice(u16 is_stream)
   return is_stream == 1;
 }
 
+// The stream voices, followed through their loops. At each loop of a song the game's stream player
+// turns the pair into normal voices (type 0) with the loop's start and end inside the ring buffer,
+// so the DSP takes the loop's ADPCM context at the jump, and makes them stream voices again a
+// moment later: 0.5-5 s at every loop (Brawl's menu song loops every 91 s). A voice that played as
+// a stream stays music while it plays inside the ring buffer it had then; a voice the game frees
+// and reuses for an effect plays from elsewhere. Host only, never saved: like the split itself, it
+// changes nothing the game sees.
+class StreamVoices
+{
+public:
+  static constexpr std::size_t KEPT = 8;
+
+  // Whether the voice whose parameter block is at `pb` plays music this frame. `loop` and `end`
+  // are its loop start and end, `current` where it plays now (DSP nibble or sample addresses).
+  bool IsMusic(u32 pb, u16 is_stream, u32 loop, u32 end, u32 current);
+  void Clear();
+
+private:
+  struct Ring
+  {
+    u32 pb = 0;
+    u32 low = 0;
+    u32 high = 0;
+    bool used = false;
+  };
+  std::array<Ring, KEPT> m_rings{};
+  std::size_t m_next = 0;
+};
+
 // One frame as the mixer writes it: (main * ramp) >> 15, clamped, big-endian right then left.
 // `music_*` is subtracted first; zero for the frame written to RAM.
 Frame MixFrame(std::span<const int, FRAME_SAMPLES> main_left,

@@ -263,8 +263,28 @@ Seen Read(const GuestMemory& memory);
 // whether it wrote.
 bool Apply(GuestMemory& memory, u32 exit);
 
-// Frame hook, first runs and re-runs: applies the replay's recorded exit on its first frame, then
-// reads the frame for LastSeen.
+// The game's two random number generators, mtRand objects (a vtable word, then a 31-bit LCG seed:
+// seed = (seed * 0x41C64E6D + 12345) & 0x7FFFFFFF). Brawl rev 2 and Project+ alike.
+// - RNG_DEFAULT, g_mtRandDefault: randi/randf, everything a fight draws.
+// - RNG_MENU: the menus' own. The character select draws every panel's RANDOM from it as it
+//   starts (0x806857F0: three draws per panel), and the pick under the token is that draw.
+// Orca pins the clock and boots the same scripted way every time, so both start every boot (and
+// every fresh start's origin) from the same numbers: without a seed, RANDOM resolved to the same
+// character in every match (ORCA.md "Random").
+constexpr u32 RNG_DEFAULT = 0x805A00B8;
+constexpr u32 RNG_MENU = 0x805A0420;
+constexpr u32 RNG_VTABLE = 0x8042AE50;  // mtRand's vtable, the first word of both
+constexpr u32 RNG_SEED = 0x04;          // the seed's offset in an mtRand
+// The seed word `seed` gives each generator: different for the two, never above 31 bits.
+u32 RngSeed(u32 seed, u32 rng);
+// Starts both generators from `seed` (a replay's first frame, ReplayFrame::seed): writes the two
+// seed words, and only where both generators are what this expects. 0 writes nothing (the
+// canonical boot's own numbers). The same seed on the same state writes the same words, so a
+// re-run of the frame ends as the first run did. Returns whether it wrote.
+bool ApplySeed(GuestMemory& memory, u32 seed);
+
+// Frame hook, first runs and re-runs: applies the replay's recorded exit and seed on its first
+// frame, then reads the frame for LastSeen.
 void Frame(const Core::CPUThreadGuard& guard, int frame);
 
 // What the last call of the frame hook read (nothing for other games). CPU thread.

@@ -586,6 +586,32 @@ bool Apply(GuestMemory& m, u32 exit)
   return true;
 }
 
+u32 RngSeed(u32 seed, u32 rng)
+{
+  // murmur3's finalizer over the seed and the generator's address.
+  u32 h = seed ^ (rng * 0x9E3779B9u);
+  h ^= h >> 16;
+  h *= 0x85EBCA6Bu;
+  h ^= h >> 13;
+  h *= 0xC2B2AE35u;
+  h ^= h >> 16;
+  return h & 0x7FFFFFFFu;
+}
+
+bool ApplySeed(GuestMemory& m, u32 seed)
+{
+  if (seed == 0)
+    return false;
+  for (const u32 rng : {RNG_DEFAULT, RNG_MENU})
+  {
+    if (!m.Valid(rng) || !m.Valid(rng + RNG_SEED + 3) || m.Read32(rng) != RNG_VTABLE)
+      return false;
+  }
+  for (const u32 rng : {RNG_DEFAULT, RNG_MENU})
+    m.Write32(rng + RNG_SEED, RngSeed(seed, rng));
+  return true;
+}
+
 void Frame(const Core::CPUThreadGuard& guard, int frame)
 {
   if (!BrawlExecutable())
@@ -594,8 +620,26 @@ void Frame(const Core::CPUThreadGuard& guard, int frame)
     return;
   }
   GuardMemory m(guard);
-  if (const Orca::Net::ReplayFrame* record = Orca::Net::ReplayScope::Current();
-      record && record->menu_exit != 0)
+  const Orca::Net::ReplayFrame* const record = Orca::Net::ReplayScope::Current();
+  // The history's seed first: before the exit, and before the frame draws anything.
+  if (record && record->seed != 0)
+  {
+    if (ApplySeed(m, record->seed))
+    {
+      NOTICE_LOG_FMT(ROLLBACK,
+                     "Online menu: frame {}: the game's random numbers start from this "
+                     "history's seed {:08x}",
+                     frame, record->seed);
+    }
+    else
+    {
+      WARN_LOG_FMT(ROLLBACK,
+                   "Online menu: frame {}: this history's seed found no random number "
+                   "generators to start",
+                   frame);
+    }
+  }
+  if (record && record->menu_exit != 0)
   {
     if (Apply(m, record->menu_exit))
     {

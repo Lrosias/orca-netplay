@@ -216,6 +216,40 @@ TEST(OrcaKeyframe, AReplayFromAFreshStartHoldsOnlyItsOwnFrames)
   EXPECT_EQ(decoded.boundary.menu_exit, MENU_EXIT_RANKED);
 }
 
+TEST(OrcaKeyframe, AHistorysSeedTravelsOnItsFirstFrameOnly)
+{
+  // A fresh start's first frame: the exit and the seed the host drew for this history.
+  auto original = Replay(40, 230);
+  original.frames[0].menu_exit = MENU_EXIT_RANKED;
+  original.frames[0].seed = 0x9E3779B9;
+  int frame = -1;
+  ReplayArchive decoded;
+  ASSERT_TRUE(UnpackKeyframe(PackKeyframe(270, original), &frame, &decoded));
+  EXPECT_EQ(decoded.frames[0].seed, 0x9E3779B9u);
+  EXPECT_EQ(decoded.frames[0].menu_exit, MENU_EXIT_RANKED);
+  for (size_t i = 1; i < decoded.frames.size(); ++i)
+    EXPECT_EQ(decoded.frames[i].seed, 0u) << i;
+  EXPECT_EQ(decoded.boundary.seed, 0u);
+  // A boot's own origin: a seed with no exit.
+  auto boot = Replay(5, 230);
+  boot.frames[0].seed = 1;
+  ASSERT_TRUE(UnpackKeyframe(PackKeyframe(235, boot), &frame, &decoded));
+  EXPECT_EQ(decoded.frames[0].seed, 1u);
+  EXPECT_EQ(decoded.frames[0].menu_exit, 0);
+  // A keyframe at the origin itself: the boundary is the first frame, so it may carry the seed.
+  auto at_origin = Replay(0, 230);
+  at_origin.boundary.seed = 77;
+  ASSERT_TRUE(UnpackKeyframe(PackKeyframe(230, at_origin), &frame, &decoded));
+  EXPECT_EQ(decoded.boundary.seed, 77u);
+  // Anywhere else, never: a later frame's, or a later boundary's.
+  auto late = Replay(10, 100);
+  late.frames[3].seed = 5;
+  EXPECT_TRUE(PackKeyframe(110, late).empty());
+  auto boundary = Replay(10, 100);
+  boundary.boundary.seed = 5;
+  EXPECT_TRUE(PackKeyframe(110, boundary).empty());
+}
+
 TEST(OrcaKeyframe, PackingRefusesAReplayThatDoesntFitItsOrigin)
 {
   // No origin yet, a frame before the origin, too few frames held.
@@ -257,15 +291,27 @@ TEST(OrcaKeyframe, UnpackingRefusesAMenuExitOffTheFirstFrame)
   int frame = -1;
   ReplayArchive decoded;
   ASSERT_TRUE(UnpackKeyframe(Compressed(original), &frame, &decoded));
+  // Each record ends with the menu exit, then the seed.
   // The first frame's exit is fine; the second's, or the boundary's, is refused.
   auto raw = original;
-  U32(raw, 28 + record - 4, MENU_EXIT_CASUAL);
+  U32(raw, 28 + record - 8, MENU_EXIT_CASUAL);
   EXPECT_TRUE(UnpackKeyframe(Compressed(raw), &frame, &decoded));
   EXPECT_EQ(decoded.frames[0].menu_exit, MENU_EXIT_CASUAL);
-  for (const size_t at : {28 + 2 * record - 4, 28 + 3 * record - 4})
+  for (const size_t at : {28 + 2 * record - 8, 28 + 3 * record - 8})
   {
     raw = original;
     U32(raw, at, MENU_EXIT_FRIENDS);
+    EXPECT_FALSE(UnpackKeyframe(Compressed(raw), &frame, &decoded)) << at;
+  }
+  // The same for the seed: any value on the first frame, none anywhere else.
+  raw = original;
+  U32(raw, 28 + record - 4, 0xFFFFFFFF);
+  EXPECT_TRUE(UnpackKeyframe(Compressed(raw), &frame, &decoded));
+  EXPECT_EQ(decoded.frames[0].seed, 0xFFFFFFFFu);
+  for (const size_t at : {28 + 2 * record - 4, 28 + 3 * record - 4})
+  {
+    raw = original;
+    U32(raw, at, 1);
     EXPECT_FALSE(UnpackKeyframe(Compressed(raw), &frame, &decoded)) << at;
   }
   // A first frame past the archive's frame.

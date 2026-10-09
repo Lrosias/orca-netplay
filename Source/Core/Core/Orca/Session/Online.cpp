@@ -631,7 +631,16 @@ void ReportPeerStalled(std::string_view sentence)
 void TestDropRoom()
 {
   if (const auto room = Room())
+  {
+    // ORCA_TEST_DROP_SILENT=1: the dropped room is kept, so its connection stays open
+    // (YouGameRoom's test drop) until the server replaces it with the player's next one.
+    if (Env("ORCA_TEST_DROP_SILENT") == "1")
+    {
+      static std::vector<std::shared_ptr<Net::YouGameRoom>> s_kept;
+      s_kept.push_back(room);
+    }
     room->TestDropConnection();
+  }
 }
 
 void TestDirect(const std::string& command)

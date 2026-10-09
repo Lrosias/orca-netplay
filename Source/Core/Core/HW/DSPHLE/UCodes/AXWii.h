@@ -5,6 +5,7 @@
 
 #include "Common/CommonTypes.h"
 #include "Core/HW/DSPHLE/UCodes/AX.h"
+#include "Core/Orca/Music.h"
 
 namespace DSP::HLE
 {
@@ -51,6 +52,8 @@ protected:
   bool m_music_split = false;
   int m_music_left[32 * 3]{};
   int m_music_right[32 * 3]{};
+  // Followed with the switch on too, so turning it off during a loop silences that loop.
+  Orca::Music::StreamVoices m_stream_voices;
 
   // Convert a mixer_control bitfield to our internal representation for that
   // value. Required because that bitfield has a different meaning in some

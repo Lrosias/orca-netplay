@@ -100,6 +100,49 @@ int FindTag(const GuestMemory& m, u32 tags, const std::u16string& name)
   return -1;
 }
 
+// A tag character as a name reads: the game's name list types full-width forms (U+FF01-U+FF5E, so
+// A is U+FF21; read from the tags it makes), Orca writes ASCII, and either case is the same name.
+char16_t Folded(char16_t c)
+{
+  if (c >= 0xFF01 && c <= 0xFF5E)
+    c = static_cast<char16_t>(c - 0xFF01 + 0x21);
+  else if (c == 0x3000)
+    c = u' ';
+  if (c >= u'a' && c <= u'z')
+    c = static_cast<char16_t>(c - u'a' + u'A');
+  return c;
+}
+
+bool SameName(std::u16string_view a, std::u16string_view b)
+{
+  return a.size() == b.size() &&
+         std::equal(a.begin(), a.end(), b.begin(),
+                    [](char16_t x, char16_t y) { return Folded(x) == Folded(y); });
+}
+
+// The tag that reads as `name` (a YouGame username as BrawlTag makes it): one the player typed in
+// the game's name list (the same letters in the game's characters, any case) before the one Orca
+// made, so a player who made their tag in Options > Controls plays with it and never gets a second
+// tag of the same name. -1 when none does.
+int FindPlayerTag(const GuestMemory& m, u32 tags, const std::u16string& name)
+{
+  int made = -1;
+  for (int i = 0; i < TAG_SLOTS; ++i)
+  {
+    const std::u16string tag = TagAt(m, tags + static_cast<u32>(i) * TAG_SIZE);
+    if (tag == name)
+    {
+      if (made < 0)
+        made = i;
+    }
+    else if (SameName(tag, name))
+    {
+      return i;
+    }
+  }
+  return made;
+}
+
 // Creates a tag in the highest unused slot the way the game does: record cleared, name, rumble on,
 // default controls from CONTROLS_TEMPLATE. -1 when every tag is taken.
 int MakeTag(GuestMemory& m, u32 tags, const std::u16string& name)
@@ -180,8 +223,9 @@ u8 LayoutByte(u32 i, u8 value, u8 default_value)
   return value <= MAX_ACTION ? value : default_value;
 }
 
-// Writes rumble and layout into the tag, only bytes that differ. The caller checked that the
-// defaults are readable.
+// Writes rumble and layout into the tag, only bytes that differ. A flag byte's bits a profile
+// doesn't carry stay as the tag has them (the GameCube page's Save sets 0x01 in its flag byte; it
+// is not tap jump). The caller checked that the defaults are readable.
 void WriteControls(GuestMemory& m, u32 tag, const std::vector<u8>& profile)
 {
   const u8 rumble = profile[0] != 0 ? 1 : 0;
@@ -189,8 +233,11 @@ void WriteControls(GuestMemory& m, u32 tag, const std::vector<u8>& profile)
     m.Write8(tag + TAG_RUMBLE, rumble);
   for (u32 i = 0; i < CONTROLS_LAYOUT_SIZE; ++i)
   {
-    const u8 value = LayoutByte(i, profile[1 + i], m.Read8(CONTROLS_TEMPLATE + i));
-    if (m.Read8(tag + TAG_CONTROLS + i) != value)
+    const u8 current = m.Read8(tag + TAG_CONTROLS + i);
+    u8 value = LayoutByte(i, profile[1 + i], m.Read8(CONTROLS_TEMPLATE + i));
+    if (const u8 bits = FlagBits(i))
+      value = static_cast<u8>((current & ~bits) | value);
+    if (current != value)
       m.Write8(tag + TAG_CONTROLS + i, value);
   }
 }
@@ -343,11 +390,11 @@ int ApplyNameTags(GuestMemory& m, const std::vector<Events::PortInfo>& ports)
       continue;
     }
     std::u16string tag = name;
-    int slot = FindTag(m, tags, tag);
+    int slot = FindPlayerTag(m, tags, tag);
     if (slot >= 0 && WornByAnotherPort(m, task, p.port, slot))
     {
       tag = Variant(name, p.port);
-      slot = FindTag(m, tags, tag);
+      slot = FindPlayerTag(m, tags, tag);
       if (slot >= 0 && WornByAnotherPort(m, task, p.port, slot))
         continue;
     }
@@ -434,6 +481,7 @@ std::vector<u8> ReadOwnControls(const GuestMemory& m, int port, std::string_view
   u32 tags = 0;
   if (!TagTable(m, &tags))
     return {};
+  int slot = -1;
   // On the character select, the tag the port wears is the one they play with.
   u32 task = 0;
   if (port >= 0 && port <= 3 && CharacterSelectTask(m, &task))
@@ -444,13 +492,21 @@ std::vector<u8> ReadOwnControls(const GuestMemory& m, int port, std::string_view
       if (id < static_cast<u32>(TAG_SLOTS))
       {
         if (std::u16string worn = TagAt(m, tags + id * TAG_SIZE); !worn.empty())
+        {
           *last_worn = std::move(worn);
+          slot = static_cast<int>(id);
+        }
       }
     }
   }
-  int slot = last_worn->empty() ? -1 : FindTag(m, tags, *last_worn);
-  if (const std::u16string own = BrawlTag(own_name); slot < 0 && !own.empty())
-    slot = FindTag(m, tags, own);
+  // Elsewhere, the tag they last wore, else their YouGame tag. A last-worn tag that reads as their
+  // YouGame name is looked up as that name, so a tag of that name they type in Options > Controls
+  // after wearing Orca's is the one read (and the one the next character select gives them).
+  const std::u16string own = BrawlTag(own_name);
+  if (slot < 0 && !last_worn->empty() && (own.empty() || !SameName(*last_worn, own)))
+    slot = FindTag(m, tags, *last_worn);
+  if (slot < 0 && !own.empty())
+    slot = FindPlayerTag(m, tags, own);
   if (slot < 0)
     return {};
   const u32 tag = tags + static_cast<u32>(slot) * TAG_SIZE;

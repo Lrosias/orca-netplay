@@ -6,14 +6,16 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstdint>
-#include <deque>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <optional>
+#include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -431,6 +433,30 @@ int FastUntil()
 {
   static const int until = std::atoi(Orca::GetEnv("ORCA_TEST_FAST_UNTIL").c_str());
   return until > 0 && Orca::UX::TestKnobsAllowed() ? until : 0;
+}
+
+// A new history's seed for the game's random numbers (ReplayFrame::seed, UX/OnlineMenu.h
+// FreshMove::ApplySeed): fresh for every boot and every fresh start, so RANDOM on the character
+// select, and every draw the game makes, differ from one match to the next. The host draws it and
+// the replay carries it, so a joiner's rebuild starts from the same numbers. 0 (the canonical
+// boot's own numbers, as every Orca before this) with no YouGame room; offline harness runs have no
+// history at all, so they repeat. In a dev game's room ORCA_TEST_RNG_SEED=<n> (a test knob) fixes
+// it.
+u32 NewHistorySeed()
+{
+  if (Orca::UX::TestKnobsAllowed())
+  {
+    static const std::string fixed = Orca::GetEnv("ORCA_TEST_RNG_SEED");
+    if (!fixed.empty())
+      return static_cast<u32>(std::strtoul(fixed.c_str(), nullptr, 0));
+  }
+  if (!Orca::Online::Enabled())
+    return 0;
+  std::random_device device;
+  u32 seed = 0;
+  while (seed == 0)
+    seed = static_cast<u32>(device());
+  return seed;
 }
 
 // The origin has been captured; frames from it on are recorded.
@@ -1727,6 +1753,13 @@ bool CaptureOrigin(Core::System& system, Match& match, int frame)
   match.replay = {};
   match.replay.origin_hash = match.origin_hash;
   match.replay.first_frame = frame;
+  // The history's seed is its first frame's typed event, applied by that frame's hook (FreshMove),
+  // after this capture: the origin stays every Orca's same canonical one.
+  if (Orca::UX::FreshMove::Supported())
+  {
+    match.replay.frames.resize(1);
+    match.replay.frames[0].seed = NewHistorySeed();
+  }
   match.log.clear();
   match.log_base = frame;
   // Every way into the origin's frame starts with an empty JIT: this one, a fresh start and a
@@ -1783,10 +1816,11 @@ std::optional<int> FreshStart(Core::System& system, Match& match)
   match.replay = {};
   match.replay.origin_hash = match.origin_hash;
   match.replay.first_frame = frame;
-  // The exit is the first frame's typed event; FreshMove applies it at that frame's hook, here and
-  // in every replay of it.
+  // The exit and a new seed are the first frame's typed events; FreshMove applies them at that
+  // frame's hook, here and in every replay of it.
   match.replay.frames.resize(1);
   match.replay.frames[0].menu_exit = exit;
+  match.replay.frames[0].seed = NewHistorySeed();
   match.log.clear();
   match.log_base = frame;
   match.queued_local.clear();

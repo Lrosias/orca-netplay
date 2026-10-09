@@ -82,6 +82,62 @@ TEST(OrcaMusic, OnlyStreamVoicesAreMusic)
   EXPECT_FALSE(Orca::Music::IsMusicVoice(0xFFFF));
 }
 
+// Brawl's menu song on its left stream voice, as a probe saw it in RAM (Orca 0.3.35, idle main
+// menu, frames 7100-7400): a ring buffer at nibbles 0x204BC6C2-0x204F06BF, and at the loop 222
+// frames as a normal voice with the loop's start and end inside the ring.
+constexpr u32 kPb = 0x8049A5C0;
+constexpr u32 kRingLow = 0x204BC6C2, kRingHigh = 0x204F06BF;
+
+TEST(OrcaMusic, AStreamVoiceStaysMusicThroughItsSongsLoop)
+{
+  Orca::Music::StreamVoices voices;
+  EXPECT_TRUE(voices.IsMusic(kPb, 1, kRingLow, kRingHigh, 0x204C0000));
+  // The loop: type 0, loop start 0x204D06C2 and end 0x204CD81D inside the ring.
+  EXPECT_TRUE(voices.IsMusic(kPb, 0, 0x204D06C2, 0x204CD81D, 0x204CC000));
+  // Past the jump: the ring's own bounds again, still type 0.
+  EXPECT_TRUE(voices.IsMusic(kPb, 0, kRingLow, kRingHigh, 0x204D0800));
+  EXPECT_TRUE(voices.IsMusic(kPb, 0, kRingLow, kRingHigh, kRingHigh));
+  EXPECT_TRUE(voices.IsMusic(kPb, 1, kRingLow, kRingHigh, 0x204D2000));
+}
+
+TEST(OrcaMusic, AVoiceThatNeverStreamedIsNoMusic)
+{
+  Orca::Music::StreamVoices voices;
+  // Even inside another voice's ring buffer.
+  EXPECT_TRUE(voices.IsMusic(kPb, 1, kRingLow, kRingHigh, 0x204C0000));
+  EXPECT_FALSE(voices.IsMusic(kPb - 0x140, 0, kRingLow, kRingHigh, 0x204C0000));
+  EXPECT_FALSE(voices.IsMusic(0x80498040, 0, 0x10000000, 0x10001000, 0x10000800));
+}
+
+TEST(OrcaMusic, AStreamVoiceReusedForAnEffectIsNoLongerMusic)
+{
+  Orca::Music::StreamVoices voices;
+  EXPECT_TRUE(voices.IsMusic(kPb, 1, kRingLow, kRingHigh, 0x204C0000));
+  // Freed and acquired for an effect: type 0, its own samples elsewhere.
+  EXPECT_FALSE(voices.IsMusic(kPb, 0, 0x21000000, 0x21004000, 0x21000010));
+  // Forgotten: an effect that later plays at an address inside the old ring is still an effect.
+  EXPECT_FALSE(voices.IsMusic(kPb, 0, kRingLow, kRingHigh, 0x204C0000));
+  // A new song on the same block is music again, with its own ring.
+  EXPECT_TRUE(voices.IsMusic(kPb, 1, 0x204AEB02, 0x204E8301, 0x204B0000));
+  EXPECT_TRUE(voices.IsMusic(kPb, 0, 0x204C0000, 0x204B8000, 0x204E8301));
+  EXPECT_FALSE(voices.IsMusic(kPb, 0, 0x204C0000, 0x204B8000, 0x204E8302));
+}
+
+TEST(OrcaMusic, EachStreamVoiceHasItsOwnRing)
+{
+  Orca::Music::StreamVoices voices;
+  constexpr u32 right = 0x8049A480;
+  EXPECT_TRUE(voices.IsMusic(kPb, 1, kRingLow, kRingHigh, 0x204C0000));
+  EXPECT_TRUE(voices.IsMusic(right, 1, 0x204F5EC2, 0x20529EBF, 0x204F8000));
+  EXPECT_TRUE(voices.IsMusic(right, 0, 0x20509EC2, 0x2050701D, 0x20506000));
+  EXPECT_TRUE(voices.IsMusic(kPb, 0, 0x204D06C2, 0x204CD81D, 0x204CC000));
+  // The left voice in the right one's ring is not the left voice's song.
+  EXPECT_FALSE(voices.IsMusic(kPb, 0, kRingLow, kRingHigh, 0x20506000));
+  EXPECT_TRUE(voices.IsMusic(right, 0, 0x204F5EC2, 0x20529EBF, 0x20510000));
+  voices.Clear();
+  EXPECT_FALSE(voices.IsMusic(right, 0, 0x204F5EC2, 0x20529EBF, 0x20510000));
+}
+
 TEST(OrcaMusic, WithoutMusicTheFrameIsTheOneWrittenToRam)
 {
   std::mt19937 rng(7);

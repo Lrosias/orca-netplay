@@ -2264,6 +2264,141 @@ TEST(OrcaUXNameTags, TheOwnControlsReadComesAfterTheWrites)
   }
 }
 
+namespace
+{
+// A name as the game's own name list types it: full-width characters (A is U+FF21), read from the
+// tags Brawl rev 2 makes in Options > Controls.
+std::u16string Typed(std::u16string_view ascii)
+{
+  std::u16string typed;
+  for (const char16_t c : ascii)
+    typed.push_back(static_cast<char16_t>(c + 0xFEE0));
+  return typed;
+}
+// What the game's Save leaves in a tag after tap jump is turned off on the GameCube page: the
+// default layout with the GameCube flag byte 0x01 (read from Brawl rev 2's RAM after a real Save).
+void SavedTapJumpOff(FakeBrawl& m, int slot)
+{
+  m.Write8(FakeBrawl::Tag(slot) + 0x14 + 11, 0x01);
+}
+}  // namespace
+
+TEST(OrcaUXNameTags, ATagThePlayerTypedInTheGameIsTheirs)
+{
+  {
+    // The player made SANDB in Options > Controls (the game's lowest slot), turned tap jump off and
+    // saved, then joined the character select with nothing carried yet: they wear that tag, as is,
+    // and no second SANDB is made (before: Orca made an ASCII SANDB at the defaults and put them in
+    // it, so tap jump came back on and the Controls list showed SANDB twice).
+    FakeBrawl m;
+    GameMadeTag(m, 0, Typed(u"SANDB"));
+    SavedTapJumpOff(m, 0);
+    const std::array<u8, 0x2D> saved = TagLayout(m, 0);
+    m.Join(0);
+    EXPECT_EQ(ApplyNameTags(m, {{0, "sandbox-ada", false, {}}}), 1);
+    EXPECT_EQ(m.NameId(0), 0);
+    EXPECT_EQ(TagLayout(m, 0), saved);
+    EXPECT_EQ(m.TagName(119), u"");
+    // Any case, and the same bytes whichever machine is remote.
+    FakeBrawl a, b;
+    for (FakeBrawl* x : {&a, &b})
+    {
+      GameMadeTag(*x, 0, Typed(u"sandb"));
+      x->Join(0);
+      x->Join(1);
+    }
+    ApplyNameTags(a, {{0, "sandbox-ada", false}, {1, "sandbox-bo", true}});
+    ApplyNameTags(b, {{0, "sandbox-ada", true}, {1, "sandbox-bo", false}});
+    EXPECT_EQ(a.bytes, b.bytes);
+    EXPECT_EQ(a.NameId(0), 0);
+    EXPECT_EQ(a.TagName(a.NameId(1)), u"SAND2");
+  }
+  {
+    // A tag that only looks close is not theirs: Orca makes their own.
+    FakeBrawl m;
+    GameMadeTag(m, 0, Typed(u"SAND"));
+    GameMadeTag(m, 1, Typed(u"SANDC"));
+    m.Join(0);
+    EXPECT_EQ(ApplyNameTags(m, {{0, "sandbox-ada", false}}), 1);
+    EXPECT_EQ(m.NameId(0), 119);
+    EXPECT_EQ(m.TagName(119), u"SANDB");
+  }
+  {
+    // With controls carried (kept from an earlier run), the typed tag gets them, as Orca's own
+    // would, keeping the game's Save bit; once it holds them, nothing more is written.
+    const std::vector<u8> custom = Profile(0, CustomLayout());
+    FakeBrawl m;
+    GameMadeTag(m, 0, Typed(u"SANDB"));
+    m.Write8(FakeBrawl::Tag(0) + 0x14 + 11, 0x81);  // saved with tap jump on
+    m.Join(0);
+    EXPECT_EQ(ApplyNameTags(m, {{0, "sandbox-ada", false, custom}}), 1);
+    EXPECT_EQ(m.NameId(0), 0);
+    std::array<u8, 0x2D> want = CustomLayout();
+    want[11] = 0x01;  // tap jump off, the Save bit kept
+    EXPECT_EQ(TagLayout(m, 0), want);
+    EXPECT_EQ(m.Read8(FakeBrawl::Tag(0) + 0x0C), 0);
+    EXPECT_EQ(m.TagName(119), u"");
+    m.W32(FakeBrawl::Area(0) + 0x1C8, 0xFFFFFFFF);  // joined again
+    const int writes = m.writes;
+    ApplyNameTags(m, {{0, "sandbox-ada", false, custom}});
+    EXPECT_EQ(m.NameId(0), 0);
+    EXPECT_EQ(m.writes, writes + 2);  // only the tag id
+  }
+}
+
+TEST(OrcaUXNameTags, ControlsSavedInTheGamesMenusArePublishedThere)
+{
+  const std::vector<Orca::Events::PortInfo> ports{{0, "sandbox-ada", false, {}}};
+  {
+    // A fresh run: in Options > Controls (the main menu's scene) the player makes SANDB, which the
+    // game makes at its defaults (nothing to publish), then saves tap jump off: published there,
+    // before any character select, so the first room they join already carries it.
+    FakeBrawl m("muMenuMain");
+    OwnControlsReader reader;
+    EXPECT_FALSE(NameTagsFrame(m, ports, ports, &reader, {}, 0));
+    GameMadeTag(m, 0, Typed(u"SANDB"));
+    EXPECT_FALSE(NameTagsFrame(m, ports, ports, &reader, {}, 0));
+    SavedTapJumpOff(m, 0);
+    const std::optional<std::vector<u8>> saved = NameTagsFrame(m, ports, ports, &reader, {}, 0);
+    ASSERT_TRUE(saved);
+    // Kept as the menus set it (the flag byte's own bits): tap jump off.
+    EXPECT_EQ((*saved)[1 + 11], 0x00);
+    EXPECT_TRUE(ControlsValid(*saved));
+    EXPECT_FALSE(NameTagsFrame(m, ports, ports, &reader, *saved, 0));
+  }
+  {
+    // They wore Orca's SANDB on a character select first, then made their own SANDB in the menus:
+    // that one is read from then on (made at the defaults: no change; their edit: published), and
+    // the next character select puts them in it with what they set. Orca's stays as it was.
+    const std::vector<u8> custom = Profile(0, CustomLayout());
+    FakeBrawl m;
+    m.Join(0);
+    OwnControlsReader reader;
+    const std::vector<Orca::Events::PortInfo> carried{{0, "sandbox-ada", false, custom}};
+    EXPECT_FALSE(NameTagsFrame(m, carried, carried, &reader, custom, 0));
+    ASSERT_EQ(m.TagName(m.NameId(0)), u"SANDB");
+    const std::array<u8, 0x2D> orcas = TagLayout(m, 119);
+    m.W32(FakeBrawl::SCENE, 0x806ff300);  // back in the menus: not the character select
+    GameMadeTag(m, 0, Typed(u"SANDB"));
+    EXPECT_FALSE(NameTagsFrame(m, carried, carried, &reader, custom, 0));
+    SavedTapJumpOff(m, 0);
+    const std::optional<std::vector<u8>> edited =
+        NameTagsFrame(m, carried, carried, &reader, custom, 0);
+    ASSERT_TRUE(edited);
+    std::array<u8, 0x2D> tap_jump_off = FakeBrawl::CONTROLS;
+    tap_jump_off[11] = 0x00;
+    EXPECT_EQ(*edited, Profile(1, tap_jump_off));
+    m.W32(FakeBrawl::SCENE, FakeBrawl::NAME);
+    m.W32(FakeBrawl::Area(0) + 0x1C8, 0xFFFFFFFF);  // joined again
+    const std::vector<Orca::Events::PortInfo> now{{0, "sandbox-ada", false, *edited}};
+    EXPECT_FALSE(NameTagsFrame(m, now, now, &reader, *edited, 0));
+    EXPECT_EQ(m.NameId(0), 0);
+    // Tap jump off, and the game's own Save bit kept.
+    EXPECT_EQ(m.Read8(FakeBrawl::Tag(0) + 0x14 + 11), 0x01);
+    EXPECT_EQ(TagLayout(m, 119), orcas);
+  }
+}
+
 TEST(OrcaUXNameTags, UnmappedPointersWriteNothing)
 {
   {

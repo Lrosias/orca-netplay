@@ -71,6 +71,40 @@ Frame MixFrame(std::span<const int, FRAME_SAMPLES> main_left,
   return out;
 }
 
+bool StreamVoices::IsMusic(u32 pb, u16 is_stream, u32 loop, u32 end, u32 current)
+{
+  Ring* ring = nullptr;
+  for (Ring& r : m_rings)
+  {
+    if (r.used && r.pb == pb)
+      ring = &r;
+  }
+  if (IsMusicVoice(is_stream))
+  {
+    if (!ring)
+    {
+      ring = &m_rings[m_next];
+      m_next = (m_next + 1) % KEPT;
+    }
+    // As a stream the voice loops over its whole ring buffer.
+    *ring = Ring{pb, std::min(loop, end), std::max(loop, end), true};
+    return true;
+  }
+  if (!ring)
+    return false;
+  if (current >= ring->low && current <= ring->high)
+    return true;
+  // Played past its ring buffer: an effect now, or the end of a song that doesn't loop.
+  *ring = Ring{};
+  return false;
+}
+
+void StreamVoices::Clear()
+{
+  m_rings = {};
+  m_next = 0;
+}
+
 void Shadow::Put(u32 address, const Frame& written, const Frame& quiet)
 {
   Entry& e = m_entries[m_next];

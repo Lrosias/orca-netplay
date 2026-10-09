@@ -375,6 +375,17 @@ void Session::ApplyRoster(const std::array<SeatPlan, MAX_SEATS>& roster)
     SeatPlan& mine = m_plan[s];
     if (now == mine)
       continue;
+    // Until the host takes this player in, its roster can still hold whoever had the seat before:
+    // this same player, back after its room connection dropped (bug reports 6afb0948, 22ba6446,
+    // 96e56887), with that stay's plug-in, and its live_from (before the host heard of the drop) or
+    // none (after). The host takes a joiner in from a frame at or after the keyframe this session
+    // starts at, so a seat plan with an earlier live_from, or none, is an earlier stay's. Once the
+    // host has named this player's live frame (m_own_live_from), every change applies.
+    if (s == m_config.local_seat && m_own_live_from == NEVER &&
+        (now.live_from == NEVER || now.live_from < m_config.start_frame))
+    {
+      continue;
+    }
     if (s == m_config.local_seat)
     {
       // This player's own seat. The host names its live frame once; plugs it in once, at a frame

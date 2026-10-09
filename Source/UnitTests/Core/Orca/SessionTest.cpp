@@ -3535,6 +3535,116 @@ TEST(OrcaDropIn, DroppedFriendUnplugsAfterItsLastInput)
   EXPECT_TRUE(IsUnplugged(At(host->game.m_ran_pads, host->session.CurrentFrame() - 1)[1]));
 }
 
+// A friend whose room connection drops comes back to the same seat of the same room (bug reports
+// 6afb0948, 22ba6446, 96e56887: Orca 0.3.30 and 0.3.34, a ranked set's joiner each time). The
+// host's packets reach the friend's new connection before the host takes it in again, and their
+// roster still names the first stay for that seat: as it was while the host waited on the friend
+// (a drop the room hears only when the friend's next connection replaces the dead one), or with
+// the seat unplugged after the drop. Neither is about this stay: the friend plugs in again as any
+// newcomer does, and both run the same frames.
+TEST(OrcaDropIn, FriendBackInTheSameSeatAfterADrop)
+{
+  for (const bool heard_late : {false, true})
+  {
+    SCOPED_TRACE(heard_late ? "the drop heard as the friend comes back" : "the drop heard at once");
+    FakeNet net;
+    net.latency = 4;
+    FakeGame solo;
+    std::vector<Pads> log = PlaySolo(&solo, 0, 120);
+    auto host = std::make_unique<DropInPlayer>(DropInConfig(0, 120), net, 0, 120);
+    host->game.m_state = solo.m_state;
+    host->game.m_history = solo.m_history;
+    host->game.m_ran_pads = solo.m_ran_pads;
+    host->session.SetLog(0, log);
+    host->session.AddPeer(1, 120, 60);
+    auto joiner = std::make_unique<DropInPlayer>(DropInConfig(1, 60), net, 1, 60);
+    joiner->seat = 1;
+    joiner->game.m_state = At(solo.m_history, 60);
+    int t = 0;
+    for (; t < 400; ++t)
+    {
+      net.now = t;
+      host->Tick(t, 1);
+      joiner->Tick(t, joiner->session.CatchingUp() ? 40 : 1);
+    }
+    ASSERT_FALSE(joiner->session.CatchingUp());
+    const int first_plug = host->session.Plan()[1].plug_from;
+    ASSERT_NE(first_plug, NEVER);
+
+    // The connection drops: what was on its way to the friend is lost.
+    joiner.reset();
+    const auto quiet = [&](int ticks) {
+      for (int end = t + ticks; t < end; ++t)
+      {
+        net.now = t;
+        host->Tick(t, 1);
+        net.queues[1].clear();
+      }
+    };
+    // The host's packets reach the friend's new connection.
+    const auto heard = [&](int ticks) {
+      for (int end = t + ticks; t < end; ++t)
+      {
+        net.now = t;
+        host->Tick(t, 1);
+      }
+    };
+    if (heard_late)
+    {
+      // The host waits on the friend (its last inputs), then the new connection replaces the dead
+      // one and the host hears the drop a few frames later.
+      quiet(60);
+      heard(6);
+      ASSERT_NE(host->session.Plan()[1].live_from, NEVER);
+      host->session.DropSeat(1);
+      heard(30);
+    }
+    else
+    {
+      host->session.DropSeat(1);
+      quiet(60);
+      heard(30);
+    }
+    ASSERT_TRUE(host->session.Error().empty()) << host->session.Error();
+    ASSERT_TRUE(host->session.Idle());
+    ASSERT_EQ(host->session.Plan()[1].plug_from, first_plug);
+    ASSERT_FALSE(net.queues[1].empty());
+    // The host takes the friend in again from a keyframe of a final frame; the friend's session
+    // starts once its rebuild is done.
+    const int keyframe = host->session.CurrentFrame() - 1;
+    const int next = host->session.CurrentFrame();
+    host->session.AddPeer(1, next, keyframe);
+    heard(20);
+    auto back = std::make_unique<DropInPlayer>(DropInConfig(1, keyframe), net, 1, keyframe);
+    back->seat = 1;
+    back->game.m_state = At(host->game.m_history, keyframe);
+    for (int end = t + 600; t < end; ++t)
+    {
+      net.now = t;
+      host->Tick(t, 1);
+      back->Tick(t, back->session.CatchingUp() ? 40 : 1);
+      ASSERT_TRUE(host->session.Error().empty()) << host->session.Error();
+      ASSERT_TRUE(back->session.Error().empty()) << back->session.Error();
+    }
+    ASSERT_FALSE(back->session.CatchingUp()) << back->session.Describe();
+    const int plugged_again = host->session.Plan()[1].plug_from;
+    EXPECT_GE(plugged_again, next);
+    EXPECT_EQ(back->session.Plan()[1].plug_from, plugged_again);
+    const int confirmed =
+        std::min({host->session.GetStats().confirmed_frame, host->session.CurrentFrame() - 1,
+                  back->session.GetStats().confirmed_frame, back->session.CurrentFrame() - 1});
+    ASSERT_GT(confirmed, plugged_again + 120);
+    for (int f = keyframe; f <= confirmed; ++f)
+    {
+      ASSERT_EQ(At(host->game.m_history, f), At(back->game.m_history, f)) << "frame " << f;
+      ASSERT_EQ(At(host->game.m_ran_pads, f), At(back->game.m_ran_pads, f)) << "frame " << f;
+    }
+    EXPECT_FALSE(IsUnplugged(At(host->game.m_ran_pads, plugged_again)[1]));
+    EXPECT_TRUE(IsUnplugged(At(host->game.m_ran_pads, plugged_again - 1)[1]));
+    EXPECT_GT(back->session.GetStats().checksums_matched, 2);
+  }
+}
+
 // Session::RequireValues: a newcomer plugs in only once every player, itself included, has
 // acknowledged the port values it plugs in with.
 TEST(OrcaDropIn, PlugInWaitsForEveryPlayerToHoldThePortValues)

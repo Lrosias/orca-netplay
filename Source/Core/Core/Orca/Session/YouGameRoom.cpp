@@ -1616,7 +1616,11 @@ struct YouGameRoom::Impl
     // connection.
     if (dropped)
     {
-      ws.Close(4001);
+      // Tests only (ORCA_TEST_DROP_SILENT=1): a drop the server never sees, as when the network
+      // goes away under the player: no close, and the connection stays open, unread, until the
+      // player's next connection replaces it (Online::TestDropRoom keeps this room).
+      if (Env("ORCA_TEST_DROP_SILENT") != "1")
+        ws.Close(4001);
     }
     else
     {

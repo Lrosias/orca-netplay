@@ -1829,6 +1829,83 @@ TEST(OrcaOnlineMenuFresh, AFreshStartLeavesOnlyABuiltMainMenuWithItsExit)
   }
 }
 
+namespace
+{
+// Brawl's two mtRand objects at their addresses: the vtable word, then the seed.
+FakeMemory Generators(u32 default_seed, u32 menu_seed)
+{
+  FakeMemory m;
+  for (const auto& [rng, seed] :
+       {std::pair{FreshMove::RNG_DEFAULT, default_seed}, std::pair{FreshMove::RNG_MENU, menu_seed}})
+  {
+    m.Fill(rng, 8);
+    m.Write32(rng, FreshMove::RNG_VTABLE);
+    m.Write32(rng + FreshMove::RNG_SEED, seed);
+  }
+  m.writes = 0;
+  return m;
+}
+}  // namespace
+
+TEST(OrcaOnlineMenuFresh, AHistorysSeedStartsBothRandomNumberGenerators)
+{
+  // The canonical boot's own numbers (2026-10-09, P+ through the app: the menus' 207d5b71).
+  FakeMemory m = Generators(0x4C561667, 0x207D5B71);
+  ASSERT_TRUE(FreshMove::ApplySeed(m, 0x12345678));
+  const u32 fight = m.Read32(FreshMove::RNG_DEFAULT + FreshMove::RNG_SEED);
+  const u32 menu = m.Read32(FreshMove::RNG_MENU + FreshMove::RNG_SEED);
+  EXPECT_EQ(fight, FreshMove::RngSeed(0x12345678, FreshMove::RNG_DEFAULT));
+  EXPECT_EQ(menu, FreshMove::RngSeed(0x12345678, FreshMove::RNG_MENU));
+  // Two different seeds, 31 bits each as the game keeps them; the vtables untouched.
+  EXPECT_NE(fight, menu);
+  EXPECT_LE(fight, 0x7FFFFFFFu);
+  EXPECT_LE(menu, 0x7FFFFFFFu);
+  EXPECT_EQ(m.Read32(FreshMove::RNG_DEFAULT), FreshMove::RNG_VTABLE);
+  EXPECT_EQ(m.Read32(FreshMove::RNG_MENU), FreshMove::RNG_VTABLE);
+  // A re-run of the frame ends as the first run did.
+  EXPECT_TRUE(FreshMove::ApplySeed(m, 0x12345678));
+  EXPECT_EQ(m.Read32(FreshMove::RNG_DEFAULT + FreshMove::RNG_SEED), fight);
+  EXPECT_EQ(m.Read32(FreshMove::RNG_MENU + FreshMove::RNG_SEED), menu);
+  // Another history starts elsewhere, from any state.
+  FakeMemory n = Generators(1, 2);
+  ASSERT_TRUE(FreshMove::ApplySeed(n, 0x12345679));
+  EXPECT_NE(n.Read32(FreshMove::RNG_MENU + FreshMove::RNG_SEED), menu);
+  EXPECT_NE(n.Read32(FreshMove::RNG_DEFAULT + FreshMove::RNG_SEED), fight);
+  // 0 is the canonical boot's own numbers: nothing written.
+  FakeMemory zero = Generators(5, 6);
+  EXPECT_FALSE(FreshMove::ApplySeed(zero, 0));
+  EXPECT_EQ(zero.writes, 0);
+  // Never where the generators aren't what Brawl's are: unmapped, or another vtable on either.
+  FakeMemory none;
+  EXPECT_FALSE(FreshMove::ApplySeed(none, 7));
+  EXPECT_EQ(none.writes, 0);
+  for (const u32 rng : {FreshMove::RNG_DEFAULT, FreshMove::RNG_MENU})
+  {
+    FakeMemory other = Generators(5, 6);
+    other.Write32(rng, 0x80001234);
+    other.writes = 0;
+    EXPECT_FALSE(FreshMove::ApplySeed(other, 7)) << std::hex << rng;
+    EXPECT_EQ(other.writes, 0);
+  }
+}
+
+TEST(OrcaOnlineMenuFresh, TheCharacterSelectsRandomDrawsDependOnTheSeed)
+{
+  // The game's own generator (mtRand::generate, 0x8003FAC4) and the character select's first draw
+  // for panel 1 (0x806857F0: randf() * 42, into Project+'s table): from the canonical boot's state
+  // it is the same every match; from different histories' seeds it is not.
+  const auto next = [](u32 seed) { return (seed * 0x41C64E6Du + 12345u) & 0x7FFFFFFFu; };
+  const auto first_draw = [&](u32 menu_seed) {
+    const u32 drawn = next(menu_seed);
+    return static_cast<int>(static_cast<double>(drawn) / 2147483648.0 * 42);
+  };
+  std::set<int> draws;
+  for (u32 seed = 1; seed <= 64; ++seed)
+    draws.insert(first_draw(FreshMove::RngSeed(seed, FreshMove::RNG_MENU)));
+  // 64 histories reach many of the 42 entries; the canonical boot's state reaches one.
+  EXPECT_GT(draws.size(), 10u);
+}
+
 TEST(OrcaOnlineMenuLobby, TheMenusAreTheMainMenuAndACharacterSelect)
 {
   EXPECT_TRUE(MenusScene("muMenuMain", "sqMenuMain"));

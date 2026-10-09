@@ -50,6 +50,7 @@ and why. Paths are relative to `Source/Core/Core/` unless they start with `Sourc
 - [Character select](#character-select)
 - [On-screen UI](#on-screen-ui)
 - [Embedding](#embedding)
+- [Changes by release](#changes-by-release)
 
 ## Building
 
@@ -109,6 +110,7 @@ with the same value meet):
 | `ORCA_TEST_KEYFRAME_DIR` | Keyframes go through this folder instead of YouGame's store. |
 | `ORCA_TEST_LEAVE_AT` | A joined friend leaves at this frame. |
 | `ORCA_TEST_COMMANDS` | `1`: take the embed protocol's stdin commands without embedding, plus test commands: `test-drop-room`, `test-direct off\|on\|in\|out\|rebuild`, `test-shot <name>`. |
+| `ORCA_TEST_DROP_SILENT` | `1`: `test-drop-room` drops the room connection the way a network failure does: no close, the socket stays open and unread, and the server only notices when the player's next connection replaces it. |
 | `ORCA_TEST_PRESENT` | Headless only: `WxH` presents into an offscreen image with the OSD and overlay, so screenshots show what a player sees. |
 | `ORCA_TEST_PADS`, `ORCA_TEST_SKIP_RENDER` | Harness overrides. |
 | `ORCA_TEST_FULL_SNAPSHOTS` | `1`: snapshots copy all of RAM instead of copy-on-write. |
@@ -123,6 +125,7 @@ with the same value meet):
 | `ORCA_TEST_QUEUE`, `ORCA_TEST_QUEUE_PICK` | A queue room's header, and a matched joiner's pick ([Character select](#character-select)). |
 | `ORCA_TEST_CHAR_ORDER`, `ORCA_TEST_SET_RULES` | Run the ranked character order, or set the stock/time rules, without a real room. |
 | `ORCA_UX_TEST_NAMES`, `ORCA_UX_TEST_CONTROLS`, `ORCA_UX_TEST_PLUG_AT` | Names, controls and a plug-in frame for harness ports. |
+| `ORCA_TEST_RNG_SEED` | The seed every history's game starts from in a dev game's room ([Random numbers](#random-numbers)). |
 | `ORCA_TEST_HOLD`, `ORCA_TEST_SHADER_WAIT_MS`, `ORCA_TEST_FXC_FLAGS`, `ORCA_TEST_JITWARM_SLOW_US`, `ORCA_JITWARM_SEED`, `ORCA_JITWARM_LOG`, `ORCA_JITWARM_BUDGET_US` | Knobs for the sections that describe them. |
 | `ORCA_UX_PROBE` | Memory watches, dumps and writes for reverse-engineering game state. |
 | `ORCA_UX_KIT_DEMO`, `ORCA_UX_SETEND_DEMO`, `ORCA_UX_OVERLAY_DEMO` | Draw overlay elements for design checks. |
@@ -403,7 +406,8 @@ pointers, or arbitrary memory writes.
    read takes its origin at its first boundary, with no fresh starts.
 2. **Recording.** The host retains the final controller pads and bounded port metadata for each
    frame. Rollbacks replace predicted inputs with the winning inputs. Typed rules-header and
-   clear-ready events run through the same trusted UI handlers at their original phase.
+   clear-ready events run through the same trusted UI handlers at their original phase. The first
+   frame also carries the history's seed ([Random numbers](#random-numbers)).
 3. **Offer.** A background thread compresses and encrypts a replay through boundary K. The
    canonical id is `replay-<frame>-<first eight hash digits>`. AES-GCM and the transport checksum
    detect corruption; the decoder independently validates every peer-supplied field.
@@ -416,7 +420,11 @@ pointers, or arbitrary memory writes.
    rebased without reporting old events.
 5. **Catch up and plug in.** The normal rollback session starts at K, catches up from live history,
    and both machines plug in the friend's controller at the same agreed future frame. Heartbeats
-   keep the pending seat alive while the replay runs.
+   keep the pending seat alive while the replay runs. The host's packets reach the friend from the
+   moment it is in the room, before the host takes it in; a roster from then that names no live
+   frame for the friend's seat, or one before K, is not about this stay and the friend's session
+   skips that seat (`Session::ApplyRoster`). It matters when a player comes back to the seat it had: until the host
+   takes it in again, the host's roster still names that seat's earlier plug-in.
 6. **Leave.** The existing agreed unplug and solo-return behavior continues. A failed replay does
    not leave the player's machine on partially reconstructed peer history.
 
@@ -444,7 +452,8 @@ ran out of time after 10-12. A fresh start (`OnlineMatch.cpp` `FreshStart`) puts
 its own origin and leaves the main menu for the match's character select with a recorded exit, the
 way the player's own press would (`OnlineMenu.h` `FreshMove`). The exit is a typed event on the
 replay's first frame (`menu_exit`: 25 With Friends, 30 Casual, 31 Ranked), so a joiner replays the
-same move from its own origin. Frame numbers start again at the origin's.
+same move from its own origin. So is a new seed for the game's random numbers
+([Random numbers](#random-numbers)). Frame numbers start again at the origin's.
 
 - **When.** A queue room's host always fresh-starts, once per room, at the first boundary after the
   room's welcome named the queue (`host` arms it). A friend arriving at a host with no session
@@ -480,6 +489,34 @@ origin in place), `ORCA_TEST_FRESH_AFTER=<frames>` (the friends threshold),
 `ORCA_TEST_FAST_UNTIL=<frame>` (solo frames before it run unthrottled, to age a host quickly, until
 its first fresh start or session).
 
+### Random numbers
+
+Brawl and Project+ draw from two generators (`mtRand`, a 31-bit LCG: `seed * 0x41C64E6D + 12345`):
+`g_mtRandDefault` (`0x805A00B8`, everything a fight draws) and the menus' own (`0x805A0420`). The
+character select draws each panel's RANDOM from the menus' generator as it starts (three draws per
+panel, `0x806857F0`; Project+ maps the first through its 42-entry table at `0x80680E80`), and A on
+RANDOM takes that draw. In the menus nothing else draws from the menus' generator, and
+`g_mtRandDefault` moves once per scene change; how long anyone stays on a screen changes neither, and
+nothing reseeds them from the clock after boot (probe watches, 2026-10-09).
+
+Orca pins the clock and boots the same way every time, so both generators start every boot, and
+every fresh start's origin, from the same numbers. Through 0.3.35 that made RANDOM the same
+character in every match: since 0.3.34's fresh starts, game 1 of every Project+ queue match gave
+the host R.O.B. and the joiner King Dedede, and game 2 one of a few characters set by game 1's
+length (the menus' generator moves once every ~5 s of a fight). Before 0.3.34, the same for a given
+player's own image. A fight also began from the same `g_mtRandDefault` state every match.
+
+So every history starts from a seed of its own: a typed event on the replay's first frame
+(`ReplayFrame::seed`, with `menu_exit` on a fresh start), drawn by the host from the system's random
+source for every boot origin and every fresh start (`OnlineMatch.cpp` `NewHistorySeed`). The frame
+hook writes both generators' seed words from it at that frame (`OnlineMenu.h`
+`FreshMove::ApplySeed`), after the origin is captured, so every Orca's origin stays the canonical
+one, and a joiner's rebuild plays the same event from its own origin. The origin's checksum and the
+rebuild's checksum at K still refuse any difference. A seed rides only on a replay's first frame;
+the decoder refuses it anywhere else. With no YouGame room there is no history and nothing is
+written, so harness runs and hash logs repeat; in a dev game's room `ORCA_TEST_RNG_SEED=<n>` (a
+test knob) fixes the seed.
+
 ### Port values: each player's name and controls
 
 A joiner reconstructs the host's input history, so its own name tags are not there.
@@ -509,6 +546,13 @@ the page shows what Orca plays.
   into it on the character select, in the same frame (`ApplyNameTags`), and the read of the
   player's own controls comes after the writes (`NameTagsFrame`), so a tag made again plays with
   their controls and never replaces them with the defaults. The tags themselves are not kept.
+- **A tag the player typed is theirs.** The game types names in full-width characters (`A` is
+  `0xFF21`) and Orca's own tags are ASCII, so names match as they read: full-width folded to ASCII,
+  one case (`NameTags.h`). A tag the player named like their YouGame username in Options >
+  Controls is found as theirs, preferred over Orca's own copy (`FindPlayerTag`), and is the one their
+  port wears on the character select and their own controls are read from. Since 0.3.37; before, Orca
+  made a second tag of that name at the game's defaults and put the player in it, so controls set in
+  the game (tap jump off) never reached an online game.
 
 - **Solo**, the own port's values carry them from the frame they change, so the YouGame tag gets them
   on every character select: Training, the queue's own select, With Friends. A friend who joins
@@ -852,6 +896,12 @@ Offered for Brawl (any revision) and Project+; without the cap the line answers 
   main left, one on main right, no AUX sends. Sound effects are normal voices (type 0), looping ones
   too. Seen on every voice of the default Brawl and Project+ runs (menus, character and stage
   select, a match).
+- **Through a song's loop.** At each loop the stream player makes the pair normal voices for 0.5-5
+  s (loop start and end moved inside the ring buffer, so the DSP takes the loop's ADPCM context at
+  the jump), then stream voices again. A voice that played as a stream stays music while it plays
+  inside the ring buffer it had then (`Orca::Music::StreamVoices`); an effect that reuses its
+  parameter block plays from elsewhere and is an effect. Before this (0.3.30-0.3.35) the music came
+  back at full volume for those seconds at every loop.
 - **RAM gets the same mix.** AX HLE mixes every voice as before and writes the frame (96 samples,
   3 ms) to RAM as before. With the switch off it also keeps what the stream voices added to the
   main bus (a voice's share is additive, `MixAdd`), gives that the compressor's gain too, and mixes
@@ -882,6 +932,15 @@ Offered for Brawl (any revision) and Project+; without the cap the line answers 
   stream pair too (the announcer and the crowd are normal voices), and no stream voice of the run
   sends to an AUX bus. Cost: instructions retired by the whole run to frame 9000 (a snapshot every
   frame from 5900) are the same on and off, within the 0.1% between runs.
+
+Through loops (2026-10-09, Mac, branch `music-loop-0335`): idle on the main menu with it off, the
+menu song loops every 91 s and 0.3.35's dump has the music back for 3.8, 5.2 and 0.7 s (Brawl) and
+3.8, 5.2, 0.7 and 2.1 s (Project+), exactly while a RAM watch shows the pair as type 0; with the fix
+the dump is silent the whole 6-7 minutes. Over the default inputs it is off the same as 0.3.35
+except at a loop (Project+ 136 s: 0.3.35 played the music, the fix doesn't; Brawl 131 s, in the
+match: the effects only), on it is sample-identical, and hashlogs (fix off, 0.3.35 on) are equal on
+every frame (Brawl 0-10813, Project+ 0-9001). Sync tests off: 0 RAM mismatches (Brawl 29351 re-run
+frames, Project+ 19901).
 
 ### The game's Sound slider
 
@@ -1101,8 +1160,9 @@ away.
 | `+0x290`-`+0x297` | A friend's move from the menus |
 
 Any new header (another mode, ruleset, coin or room) starts every track's state fresh. Compatibility:
-anything that changes what the game computes bumps `UX::kCompatVersion` (currently `ux=25`, since
-0.3.34), which is in the compatibility key.
+anything that changes what the game computes bumps `UX::kCompatVersion` (currently `ux=26`, since
+0.3.37: the history's seed, [Random numbers](#random-numbers), and tags typed in the game,
+[Port values](#port-values-each-players-name-and-controls)), which is in the compatibility key.
 
 ## Input gate
 
@@ -1678,7 +1738,8 @@ The page owns the room: Orca never leaves on a skip or a timeout by itself.
   presses Start. Casual's later games have no timer: players can talk; ranked's go through the
   character order.
 - **Random** is a pick like any character (`0x29`); the game resolves it from its own RNG, which is
-  emulated state, so both machines resolve the same character.
+  emulated state, so both machines resolve the same character, and starts from each history's own
+  seed, so it differs from match to match ([Random numbers](#random-numbers)).
 - **Ranked has no skip** (`Queue::MaySkip`): a ranked match must be played.
 - **After the room** (a skip, a timeout, the opponent gone, a set over), the session loads the
   **queue image**, the player's own game as it was when `host` or `join` came (a machine image and
@@ -1905,3 +1966,19 @@ size asks at once). The game, and an online match, carry on. stderr says so once
 (`Orca: the picture's swap chain has no buffers after a resize ...`, with the window's size and the
 error code) and again when the picture works. A lost graphics device still ends Orca, after saying
 so. Since 0.3.35; before, a refused resize ended Orca (exit `0x80000003`).
+
+## Changes by release
+
+What each release changed for players, in plain words.
+
+### 0.3.37
+
+- **Music stays off.** With the Music switch off, the music no longer comes back for a few seconds
+  each time a song loops.
+- **Random is random again.** Picking Random on the character select gives a different fighter from
+  match to match, instead of the same ones every time.
+- **Reconnecting to a ranked set no longer closes Orca.** If your connection drops mid-set and you
+  come back to the same room, you rejoin the set instead of Orca stopping.
+- **Your in-game name tag and controls carry into online games.** A name tag you make in the game's
+  Controls menu, named like your YouGame name, is now used as yours, so its controls (tap jump off,
+  your C-stick) play online instead of the defaults, and the name no longer shows up twice.

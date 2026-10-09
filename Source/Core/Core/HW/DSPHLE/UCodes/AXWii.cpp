@@ -468,8 +468,13 @@ void AXWiiUCode::ProcessPBList(u32 pb_addr)
     ReadPB(memory, pb_addr, pb);
 
     // A music voice mixes as any other; its share of the main bus is what it added there. Not
-    // checked for running: an old AXWii's per-ms updates can start it mid-frame.
-    const bool music = m_music_split && Orca::Music::IsMusicVoice(pb.is_stream);
+    // checked for running: an old AXWii's per-ms updates can start it mid-frame. A stream voice
+    // stays music through its song's loops, when the game makes it a normal voice for a moment.
+    const bool music =
+        m_stream_voices.IsMusic(pb_addr, pb.is_stream, HILO_TO_32(pb.audio_addr.loop_addr),
+                                HILO_TO_32(pb.audio_addr.end_addr),
+                                HILO_TO_32(pb.audio_addr.cur_addr)) &&
+        m_music_split;
     // The main buffers are sized for AX GC's 5 ms; a Wii frame uses the first 3 ms.
     std::array<int, Orca::Music::FRAME_SAMPLES> left_before, right_before;
     static_assert(Orca::Music::FRAME_SAMPLES <= std::extent_v<decltype(m_samples_main_left)> &&
