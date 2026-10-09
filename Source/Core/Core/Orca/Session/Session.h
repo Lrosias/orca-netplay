@@ -523,6 +523,9 @@ private:
   std::array<int, MAX_SEATS> m_history_sent{-1, -1, -1, -1};
   std::array<int, MAX_SEATS> m_history_acked{-1, -1, -1, -1};
   std::array<int, MAX_SEATS> m_history_stuck{0, 0, 0, 0};
+  // A joining player: its own live frame as the host first named it (NEVER: not yet). History is
+  // accepted only for frames before it.
+  int m_own_live_from = NEVER;
   bool m_leaving = false;
   // Port values: per seat, the version every player must hold before it plugs in (host), and the
   // newest each player acknowledged (host); then the newest this machine holds.

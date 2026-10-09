@@ -8,8 +8,9 @@ its builds do not use Dolphin's name or logo.
 
 How Orca's rollback works and how it compares with Slippi and Brawlback: [ORCA_ARCHITECTURE.md](ORCA_ARCHITECTURE.md).
 
-- **Base:** Dolphin release `2609` (`f84df02`). The `upstream` remote is `dolphin-emu/dolphin`;
-  Orca is rebased onto later releases deliberately.
+- **Base:** Dolphin release `2609` (`f84df02`), plus the four security fixes of the `2609a` hotfix
+  (cherry-picked with `-x` in Orca 0.3.36). The `upstream` remote is `dolphin-emu/dolphin`; Orca is
+  rebased onto later releases deliberately.
 - **Design:** an exact whole-machine snapshot at each frame boundary; controller input injected at
   the SI device; re-run frames that parse the GPU command stream but skip host rendering; per-game
   profiles. Super Smash Bros. Brawl (`RSBE01` rev 2, and rev 1 played as rev 2) and Project+ v3.2 (a

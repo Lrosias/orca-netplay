@@ -3638,6 +3638,383 @@ TEST(OrcaDropIn, PlanSurvivesTheGuestFloatMode)
   EXPECT_EQ(plan[2], SeatPlan{});
 }
 
+// ---- Rosters and history outside the drop-in rules ----
+
+namespace
+{
+// A pad no player in these tests holds otherwise.
+constexpr Pad SCRIPTED_PAD{0x03, 0x00, 0xEE, 0x00, 0x7F, 0x00, 0x00, 0x00};
+
+// A drop-in up to the joiner playing live, after which the test writes the host's (seat 0) packets
+// itself.
+struct ScriptedHost
+{
+  ScriptedHost()
+  {
+    net.latency = 4;
+    FakeGame solo;
+    std::vector<Pads> log = PlaySolo(&solo, 0, 300);
+    host = std::make_unique<DropInPlayer>(DropInConfig(0, 300), net, 0, 300);
+    host->game.m_state = solo.m_state;
+    host->game.m_history = solo.m_history;
+    host->game.m_ran_pads = solo.m_ran_pads;
+    host->session.SetLog(0, log);
+    host->session.AddPeer(1, 300, KEYFRAME);
+    joiner = std::make_unique<DropInPlayer>(DropInConfig(1, KEYFRAME), net, 1, KEYFRAME);
+    joiner->seat = 1;
+    joiner->game.m_state = At(solo.m_history, KEYFRAME);
+  }
+  // Both play until the joiner has played `live` frames of its own.
+  void PlayUntilLive(int live)
+  {
+    for (; t < 3000; ++t)
+    {
+      net.now = t;
+      host->Tick(t, 1);
+      const bool behind = joiner->session.CatchingUp() ||
+                          joiner->session.AuthorityFrame() - joiner->session.CurrentFrame() > 12;
+      joiner->Tick(t, behind ? 40 : 1);
+      ASSERT_TRUE(host->session.Error().empty()) << host->session.Error();
+      ASSERT_TRUE(joiner->session.Error().empty()) << joiner->session.Error();
+      if (!joiner->session.CatchingUp() &&
+          joiner->session.CurrentFrame() > joiner->session.Plan()[1].plug_from + live)
+      {
+        break;
+      }
+    }
+    ASSERT_FALSE(joiner->session.CatchingUp());
+    roster = host->session.Plan();
+    from_frame = joiner->session.CurrentFrame();
+    // From here on the host's own session is silent; nothing it sent is still on the way.
+    net.queues[1].clear();
+  }
+  Packet Scripted(std::optional<std::array<SeatPlan, MAX_SEATS>> with_roster) const
+  {
+    Packet p;
+    p.seat = 0;
+    p.first_frame = 0;
+    p.ack = {-1, joiner->session.CurrentFrame() - 1, -1, -1};
+    p.current_frame = joiner->session.CurrentFrame();
+    p.roster = with_roster;
+    return p;
+  }
+  // History for the joiner from its log's end on, with the scripted pad in the joiner's seat.
+  Packet ScriptedHistory(std::optional<std::array<SeatPlan, MAX_SEATS>> with_roster,
+                       int first = -1) const
+  {
+    Packet p = Scripted(with_roster);
+    p.history_seat = 1;
+    p.history_first = first >= 0 ? first : joiner->session.LogEnd();
+    for (int i = 0; i < MAX_HISTORY_IN_PACKET; ++i)
+    {
+      Pads pads;
+      pads.fill(UNPLUGGED_PAD);
+      pads[0] = Pad{0, 0, 0, 0, 9, 0, 0, 0};
+      pads[1] = SCRIPTED_PAD;
+      p.history.push_back(pads);
+    }
+    return p;
+  }
+  // Delivers `packet` to the joiner and lets it step once.
+  void Send(Packet packet)
+  {
+    packet.sequence = ++sequence;
+    net.now = t;
+    net.queues[1].push_back({t, std::move(packet)});
+    joiner->Tick(t, 1);
+    net.queues[0].clear();
+    ++t;
+  }
+  // Frames from from_frame on that the joiner ran with the scripted pad in its own seat.
+  int ScriptedFrames() const
+  {
+    int n = 0;
+    for (int f = from_frame; f < joiner->session.CurrentFrame(); ++f)
+    {
+      const auto it = joiner->game.m_ran_pads.find(f);
+      if (it != joiner->game.m_ran_pads.end() && it->second[1] == SCRIPTED_PAD)
+        ++n;
+    }
+    return n;
+  }
+
+  static constexpr int KEYFRAME = 240;
+  FakeNet net;
+  std::unique_ptr<DropInPlayer> host;
+  std::unique_ptr<DropInPlayer> joiner;
+  std::array<SeatPlan, MAX_SEATS> roster{};
+  int t = 0;
+  int sequence = 1 << 20;
+  int from_frame = 0;
+};
+}  // namespace
+
+// History is the host's game before the joiner plays in it, so it ends before the joiner's live
+// frame; history past it ends the session.
+TEST(OrcaDropIn, HistoryPastTheJoinersLiveFrameEndsTheSession)
+{
+  ScriptedHost h;
+  h.PlayUntilLive(60);
+  if (::testing::Test::HasFatalFailure())
+    return;
+  for (int i = 0; i < 3 && h.joiner->session.Error().empty(); ++i)
+    h.Send(h.ScriptedHistory(h.roster));
+  EXPECT_NE(h.joiner->session.Error().find("past this player's live frame"), std::string::npos)
+      << h.joiner->session.Error();
+  // The first such packet ends it: no frame ran (or ran again) with the scripted pad.
+  EXPECT_EQ(h.ScriptedFrames(), 0);
+}
+
+// The host plugs this player's controller in once and names its live frame once; a roster that
+// changes either ends the session.
+TEST(OrcaDropIn, RosterThatTakesBackTheJoinersSeatEndsTheSession)
+{
+  {
+    SCOPED_TRACE("plug and live frame reset");
+    ScriptedHost h;
+    h.PlayUntilLive(60);
+    if (::testing::Test::HasFatalFailure())
+      return;
+    auto reset = h.roster;
+    reset[1] = {NEVER, NEVER, NEVER};
+    h.Send(h.Scripted(reset));
+    EXPECT_NE(h.joiner->session.Error().find("plug-in"), std::string::npos)
+        << h.joiner->session.Error();
+    EXPECT_FALSE(h.joiner->session.CatchingUp());
+  }
+  {
+    SCOPED_TRACE("plug moved later");
+    ScriptedHost h;
+    h.PlayUntilLive(60);
+    if (::testing::Test::HasFatalFailure())
+      return;
+    auto moved = h.roster;
+    moved[1].plug_from = h.joiner->session.CurrentFrame() + 4096;
+    h.Send(h.Scripted(moved));
+    EXPECT_NE(h.joiner->session.Error().find("plug-in"), std::string::npos)
+        << h.joiner->session.Error();
+  }
+  {
+    SCOPED_TRACE("live frame moved");
+    ScriptedHost h;
+    h.PlayUntilLive(60);
+    if (::testing::Test::HasFatalFailure())
+      return;
+    auto moved = h.roster;
+    moved[1].live_from = h.joiner->session.CurrentFrame() + 4096;
+    h.Send(h.Scripted(moved));
+    EXPECT_NE(h.joiner->session.Error().find("live frame"), std::string::npos)
+        << h.joiner->session.Error();
+  }
+  {
+    // A reset, history ahead, a plug-in again just past the joiner's frame: it ends at the first
+    // step.
+    SCOPED_TRACE("reset, history, plug again");
+    ScriptedHost h;
+    h.PlayUntilLive(60);
+    if (::testing::Test::HasFatalFailure())
+      return;
+    auto reset = h.roster;
+    reset[1] = {NEVER, NEVER, NEVER};
+    h.Send(h.Scripted(reset));
+    for (int i = 0; i < 10; ++i)
+      h.Send(h.ScriptedHistory(reset));
+    auto again = h.roster;
+    again[1].plug_from = h.joiner->session.CurrentFrame() + 1;
+    for (int i = 0; i < 300; ++i)
+      h.Send(h.Scripted(again));
+    EXPECT_FALSE(h.joiner->session.Error().empty());
+    EXPECT_EQ(h.ScriptedFrames(), 0);
+  }
+  {
+    // Dropping the joiner (its live frame back to NEVER, the plug-in kept) is what a host does when
+    // it loses a friend: not an error.
+    SCOPED_TRACE("dropped");
+    ScriptedHost h;
+    h.PlayUntilLive(60);
+    if (::testing::Test::HasFatalFailure())
+      return;
+    auto dropped = h.roster;
+    dropped[1].live_from = NEVER;
+    dropped[1].unplug_from = h.joiner->session.CurrentFrame() + 40;
+    h.Send(h.Scripted(dropped));
+    EXPECT_TRUE(h.joiner->session.Error().empty()) << h.joiner->session.Error();
+  }
+}
+
+// The joiner is plugged in only once it holds the history up to its live frame: a plug-in roster
+// before that ends the session, whatever follows it.
+TEST(OrcaDropIn, PlugInBeforeTheJoinerHoldsItsHistoryEndsTheSession)
+{
+  ScriptedHost h;
+  h.from_frame = ScriptedHost::KEYFRAME;
+  std::array<SeatPlan, MAX_SEATS> roster{};
+  roster[0] = {0, NEVER, 0};
+  roster[1] = {NEVER, NEVER, 1 << 29};
+  // A little of the host's game as history, the joiner's seat unplugged.
+  Packet first = h.ScriptedHistory(roster);
+  first.history.resize(20);
+  for (Pads& pads : first.history)
+    pads[1] = UNPLUGGED_PAD;
+  h.Send(std::move(first));
+  ASSERT_TRUE(h.joiner->session.Error().empty()) << h.joiner->session.Error();
+  ASSERT_EQ(h.joiner->session.LogEnd(), ScriptedHost::KEYFRAME + 20);
+
+  auto plugged = roster;
+  plugged[1].plug_from =
+      std::max(h.joiner->session.CurrentFrame(), h.joiner->session.LogEnd()) + 10;
+  h.Send(h.Scripted(plugged));
+  EXPECT_NE(h.joiner->session.Error().find("plug-in"), std::string::npos)
+      << h.joiner->session.Error();
+  // Rosters and history after it change nothing.
+  auto unplugged = plugged;
+  unplugged[1].unplug_from = h.joiner->session.LogEnd();
+  for (int i = 0; i < 4; ++i)
+    h.Send(h.ScriptedHistory(unplugged));
+  for (int i = 0; i < 300; ++i)
+    h.Send(h.Scripted(plugged));
+  EXPECT_FALSE(h.joiner->session.Error().empty());
+  EXPECT_EQ(h.joiner->session.LogEnd(), ScriptedHost::KEYFRAME + 20);
+  EXPECT_EQ(h.ScriptedFrames(), 0);
+}
+
+// The host only ever brings this player's unplug frame earlier (it leaves, or the host drops it); a
+// roster that moves it later, or back to never, ends the session.
+TEST(OrcaDropIn, JoinersUnplugOnlyComesEarlier)
+{
+  for (const bool back_to_never : {true, false})
+  {
+    SCOPED_TRACE(back_to_never ? "back to never" : "later");
+    ScriptedHost h;
+    h.PlayUntilLive(60);
+    if (::testing::Test::HasFatalFailure())
+      return;
+    auto leaving = h.roster;
+    leaving[1].unplug_from = h.joiner->session.CurrentFrame() + 40;
+    h.Send(h.Scripted(leaving));
+    ASSERT_TRUE(h.joiner->session.Error().empty()) << h.joiner->session.Error();
+    auto earlier = leaving;
+    earlier[1].unplug_from -= 10;
+    h.Send(h.Scripted(earlier));
+    ASSERT_TRUE(h.joiner->session.Error().empty()) << h.joiner->session.Error();
+    auto moved = earlier;
+    moved[1].unplug_from = back_to_never ? NEVER : earlier[1].unplug_from + 400;
+    h.Send(h.Scripted(moved));
+    EXPECT_NE(h.joiner->session.Error().find("unplug"), std::string::npos)
+        << h.joiner->session.Error();
+  }
+  {
+    // Plugged in and unplugged at the same frame, then history from the live frame on: refused like
+    // any other history past the live frame.
+    SCOPED_TRACE("plugged and unplugged at once");
+    ScriptedHost h;
+    h.from_frame = ScriptedHost::KEYFRAME;
+    std::array<SeatPlan, MAX_SEATS> roster{};
+    roster[0] = {0, NEVER, 0};
+    roster[1] = {NEVER, NEVER, ScriptedHost::KEYFRAME};
+    h.Send(h.Scripted(roster));
+    const int plug = h.joiner->session.CurrentFrame() + 10;
+    roster[1].plug_from = plug;
+    roster[1].unplug_from = plug;
+    h.Send(h.Scripted(roster));
+    ASSERT_TRUE(h.joiner->session.Error().empty()) << h.joiner->session.Error();
+    h.Send(h.ScriptedHistory(roster));
+    EXPECT_NE(h.joiner->session.Error().find("past this player's live frame"), std::string::npos)
+        << h.joiner->session.Error();
+    roster[1].unplug_from = NEVER;
+    for (int i = 0; i < 60; ++i)
+      h.Send(h.Scripted(roster));
+    EXPECT_EQ(h.ScriptedFrames(), 0);
+  }
+}
+
+// A host whose plug-in roster is the first one the joiner hears (a live frame at the keyframe, so no
+// history; the host's earlier packets lost): the joiner holds everything before its live frame, takes
+// the plug-in and plays.
+TEST(OrcaDropIn, PlugInAsTheFirstRosterTheJoinerHears)
+{
+  FakeNet net;
+  net.latency = 4;
+  FakeGame solo;
+  std::vector<Pads> log = PlaySolo(&solo, 0, 300);
+  DropInPlayer host(DropInConfig(0, 300), net, 0, 300);
+  host.game.m_state = solo.m_state;
+  host.game.m_history = solo.m_history;
+  host.game.m_ran_pads = solo.m_ran_pads;
+  host.session.SetLog(0, log);
+  host.session.AddPeer(1, 300, 300);
+  DropInPlayer joiner(DropInConfig(1, 300), net, 1, 300);
+  joiner.seat = 1;
+  joiner.game.m_state = solo.m_state;
+  bool heard_plug = false;
+  int t = 0;
+  for (; t < 2000; ++t)
+  {
+    net.now = t;
+    host.Tick(t, 1);
+    // Everything the host sends before the plug-in is lost on the way.
+    if (host.session.Plan()[1].plug_from == NEVER)
+      net.queues[1].clear();
+    const bool behind = joiner.session.CatchingUp() ||
+                        joiner.session.AuthorityFrame() - joiner.session.CurrentFrame() > 12;
+    joiner.Tick(t, behind ? 40 : 1);
+    ASSERT_TRUE(host.session.Error().empty()) << host.session.Error();
+    ASSERT_TRUE(joiner.session.Error().empty()) << joiner.session.Error();
+    if (!heard_plug && joiner.session.Plan()[1].plug_from != NEVER)
+    {
+      heard_plug = true;
+      EXPECT_EQ(joiner.session.Plan()[1].plug_from, host.session.Plan()[1].plug_from);
+    }
+    if (heard_plug && joiner.session.CurrentFrame() > joiner.session.Plan()[1].plug_from + 120)
+      break;
+  }
+  EXPECT_TRUE(heard_plug);
+  EXPECT_FALSE(joiner.session.CatchingUp());
+  EXPECT_GT(joiner.session.CurrentFrame(), joiner.session.Plan()[1].plug_from + 120);
+}
+
+// While catching up, the joiner keeps at most HISTORY_AHEAD (4096) frames of history past the frame
+// it is at, whatever live frame the roster names.
+TEST(OrcaDropIn, HistoryAheadOfTheJoinerIsBounded)
+{
+  FakeNet net;
+  net.latency = 4;
+  constexpr int KEYFRAME = 240;
+  DropInPlayer joiner(DropInConfig(1, KEYFRAME), net, 1, KEYFRAME);
+  joiner.seat = 1;
+  std::array<SeatPlan, MAX_SEATS> roster{};
+  roster[0] = {0, NEVER, 0};
+  roster[1] = {NEVER, NEVER, 1 << 29};
+  int sequence = 0;
+  int t = 0;
+  for (int i = 0; i < 2000 && joiner.session.Error().empty(); ++i, ++t)
+  {
+    Packet p;
+    p.seat = 0;
+    p.sequence = ++sequence;
+    p.ack = {-1, -1, -1, -1};
+    p.current_frame = joiner.session.CurrentFrame();
+    p.roster = roster;
+    p.history_seat = 1;
+    p.history_first = joiner.session.LogEnd();
+    for (int k = 0; k < MAX_HISTORY_IN_PACKET; ++k)
+    {
+      Pads pads;
+      pads.fill(UNPLUGGED_PAD);
+      pads[0] = Pad{static_cast<u8>(k % 4), 0, 0, 0, 9, 0, 0, 0};
+      p.history.push_back(pads);
+    }
+    net.now = t;
+    net.queues[1].push_back({t, std::move(p)});
+    joiner.Tick(t, 1);
+    net.queues[0].clear();
+  }
+  EXPECT_TRUE(joiner.session.Error().empty()) << joiner.session.Error();
+  EXPECT_TRUE(joiner.session.CatchingUp());
+  EXPECT_LE(joiner.session.LogEnd(), joiner.session.CurrentFrame() + 4096 + 1);
+  EXPECT_GT(joiner.session.LogEnd(), KEYFRAME + 4096 - MAX_HISTORY_IN_PACKET);
+}
+
 // ---- Direct links (YouGameRoom's DirectLink beside the relay) ----
 
 // Packets arrive twice and out of order (direct copy and coalesced relay copy). Any copy adds
