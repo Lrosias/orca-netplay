@@ -112,6 +112,19 @@ FreshStep DecideFreshStart(const FreshInputs& in);
 // (UX/OnlineMenu.h CssPick), so Play again re-arms there, else With Friends.
 u8 FriendsFreshExit(std::optional<bool> css_pick_ranked);
 
+// A queue room's fresh start also runs its hold for the room's header and port 1's own pick being
+// put back unseen and unthrottled, as its tail does: the host's picture comes back with its pick
+// already in, about a second sooner, and the keyframe follows at once. A friend's fresh start has
+// neither. These frames are first runs (the hook writes and records as always), only not shown or
+// timed. At most FRESH_UNSEEN_LIMIT frames past the tail; the rest of a hold or steer that takes
+// longer shows as before.
+constexpr int FRESH_UNSEEN_LIMIT = 120;
+// Whether the next frame past the tail still runs unseen: `frames` have run unseen so far.
+bool FreshUnseen(bool queue_room, int frames);
+// While a port catches up, the frame hook may write the room's header only during that unseen
+// hold (never in a tail, which re-runs, nor in a joiner's rebuild).
+bool HeaderFreeWhileCatchingUp(bool unseen_hold, bool in_tail, bool joining);
+
 // True when `frame` belongs to this player alone: playing solo, no drop-in pending, and no fresh
 // keyframe a joining friend would replay from. Only then may the UI announce things.
 bool AloneAt(int frame, bool solo_idle, bool drop_in_pending, std::optional<int> stored_keyframe);
@@ -139,6 +152,11 @@ constexpr int HEADER_FAIL_BOUNDARIES = 300;
 // `someone_waiting`: a friend waits for a keyframe; `queue_room`: this game hosts a matchmade room.
 // `*waited` counts the boundaries waited so far.
 HeaderWait StepHeaderWait(int* waited, bool in_place, bool someone_waiting, bool queue_room);
+// StepHeaderWait at a host's boundary: a fresh start's tail never counts, and neither does its
+// unseen hold (FreshUnseen) until the header is in, so the limit is never reached sooner in real
+// time because those frames run unthrottled.
+HeaderWait HeaderWaitAt(int* waited, bool in_tail, bool unseen, bool in_place, bool someone_waiting,
+                        bool queue_room);
 
 // Coming home: a player who joined a friend's game and then went solo (the host left, it left, or
 // its session ended) still plays on the port it was given, with no room. Nobody can drop in, and

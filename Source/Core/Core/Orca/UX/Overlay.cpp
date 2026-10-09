@@ -700,9 +700,12 @@ Scene Gather(double now)
     s.f.waiting.clear();
   // The matchmaking search lines, replaced by the queue's character select lines when it has any.
   std::tie(s.search, s.search_note) = Search::Lines();
+  // A matched joiner's "Opponent found" lines win over its own select's search lines, which the
+  // game's bar (and the queue's lines) still show until the host's game is loaded.
+  const bool joining = Search::Joining();
   {
     std::lock_guard lk(s_queue_lock);
-    if (!s_queue_line.empty() || !s_queue_note.empty())
+    if (!joining && (!s_queue_line.empty() || !s_queue_note.empty()))
     {
       s.search = s_queue_line;
       s.search_note = s_queue_note;
@@ -731,9 +734,10 @@ Scene Gather(double now)
     if (native & (1 << port))
       s.labels[port].clear();
   }
-  if (native & NativeText::SHOWN_RULES)
+  if ((native & NativeText::SHOWN_RULES) && !joining)
   {
-    // On the solo queue character select the bar says it all.
+    // On the solo queue character select the bar says it all (but a matched joiner's bar still
+    // says it is searching).
     s.hint = Queue::OnSoloCss() ? std::string() : std::move(s.search_note);
     s.search.clear();
     s.search_note.clear();

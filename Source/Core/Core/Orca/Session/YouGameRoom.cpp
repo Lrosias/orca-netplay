@@ -31,6 +31,7 @@
 #include "Core/Orca/Session/Replay.h"
 #include "Core/Orca/Status.h"
 #include "Core/Orca/UX/Overlay.h"
+#include "Core/Orca/UX/Probe.h"
 #include "Core/Orca/UX/Queue.h"
 #include "Core/Orca/UX/RankedSet.h"
 #include "Core/Orca/UX/SetEnd.h"
@@ -689,6 +690,144 @@ bool DecodePacket(const std::string& json, Packet* packet)
   if (!ParseJson(json, &value) || !value.is<picojson::object>())
     return false;
   return PacketFromJson(value.get<picojson::object>(), packet);
+}
+
+bool InlineKeyframe(u64 size)
+{
+  static const bool off = Orca::GetEnv("ORCA_TEST_INLINE") == "off" && Orca::UX::TestKnobsAllowed();
+  return !off && size > 0 && size <= INLINE_KEYFRAME_MAX;
+}
+
+namespace
+{
+constexpr char BASE64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+int Base64Value(char c)
+{
+  if (c >= 'A' && c <= 'Z')
+    return c - 'A';
+  if (c >= 'a' && c <= 'z')
+    return c - 'a' + 26;
+  if (c >= '0' && c <= '9')
+    return c - '0' + 52;
+  if (c == '+')
+    return 62;
+  if (c == '/')
+    return 63;
+  return -1;
+}
+}  // namespace
+
+std::string EncodeInlineKeyframe(const std::vector<u8>& blob)
+{
+  std::string out;
+  out.reserve((blob.size() + 2) / 3 * 4);
+  for (size_t i = 0; i < blob.size(); i += 3)
+  {
+    const u32 a = blob[i];
+    const u32 b = i + 1 < blob.size() ? blob[i + 1] : 0;
+    const u32 c = i + 2 < blob.size() ? blob[i + 2] : 0;
+    const u32 n = (a << 16) | (b << 8) | c;
+    out.push_back(BASE64[(n >> 18) & 63]);
+    out.push_back(BASE64[(n >> 12) & 63]);
+    out.push_back(i + 1 < blob.size() ? BASE64[(n >> 6) & 63] : '=');
+    out.push_back(i + 2 < blob.size() ? BASE64[n & 63] : '=');
+  }
+  return out;
+}
+
+std::optional<std::vector<u8>> DecodeInlineKeyframe(std::string_view text, u64 size)
+{
+  // Bounded before anything is decoded: the size the offer states, and the one text length that
+  // can hold exactly that many bytes.
+  if (size == 0 || size > INLINE_KEYFRAME_MAX || text.size() > INLINE_KEYFRAME_MAX_TEXT ||
+      text.size() != (size + 2) / 3 * 4)
+  {
+    return std::nullopt;
+  }
+  std::vector<u8> out;
+  out.reserve(static_cast<size_t>(size));
+  for (size_t i = 0; i < text.size(); i += 4)
+  {
+    const bool last = i + 4 == text.size();
+    int v[4];
+    for (int k = 0; k < 4; ++k)
+    {
+      // Padding only at the very end: "xx==" or "xxx=".
+      if (text[i + k] == '=' && last && k >= 2 && (k == 3 || text[i + 3] == '='))
+        v[k] = -2;
+      else
+        v[k] = Base64Value(text[i + k]);
+      if (v[k] == -1)
+        return std::nullopt;
+    }
+    if (v[0] < 0 || v[1] < 0)
+      return std::nullopt;
+    const u32 n = (static_cast<u32>(v[0]) << 18) | (static_cast<u32>(v[1]) << 12) |
+                  (static_cast<u32>(std::max(v[2], 0)) << 6) | static_cast<u32>(std::max(v[3], 0));
+    out.push_back(static_cast<u8>(n >> 16));
+    if (v[2] >= 0)
+      out.push_back(static_cast<u8>(n >> 8));
+    else if ((n & 0xFFFF) != 0)
+      return std::nullopt;
+    if (v[3] >= 0)
+      out.push_back(static_cast<u8>(n));
+    else if ((n & 0xFF) != 0)
+      return std::nullopt;
+  }
+  if (out.size() != size)
+    return std::nullopt;
+  return out;
+}
+
+picojson::object KeyframeOfferToJson(const KeyframeInfo& info)
+{
+  picojson::object d;
+  d["k"] = picojson::value("kf");
+  d["f"] = picojson::value(static_cast<double>(info.frame));
+  d["id"] = picojson::value(info.id);
+  d["n"] = picojson::value(static_cast<double>(info.size));
+  d["x"] = picojson::value(info.hash);
+  d["key"] = picojson::value(info.key);
+  d["nm"] = NamesToJson(info.names);
+  d["nv"] = picojson::value(static_cast<double>(info.names_version));
+  if (!info.inline_blob.empty())
+    d["b"] = picojson::value(EncodeInlineKeyframe(info.inline_blob));
+  return d;
+}
+
+std::optional<KeyframeInfo> KeyframeOfferFromJson(const picojson::object& d)
+{
+  KeyframeInfo info;
+  const auto frame = Int(d, "f", 0, MAX_FRAME);
+  // YouGame's store accepts at most 128 MB.
+  const auto size = Int(d, "n", 1, 128 << 20);
+  info.id = Str(d, "id");
+  info.hash = Str(d, "x");
+  info.key = Str(d, "key");
+  if (!frame || *frame > static_cast<int>(MAX_REPLAY_FRAMES) || !size || !ValidReplayId(info.id) ||
+      info.hash.size() != 16 || info.key.size() != 64 ||
+      info.id != fmt::format("replay-{}-{}", *frame, info.hash.substr(0, 8)))
+  {
+    return std::nullopt;
+  }
+  info.frame = *frame;
+  info.size = static_cast<u64>(*size);
+  // The replay inline: bounded by length before it is decoded, and only ever the stated size.
+  if (const auto b = d.find("b"); b != d.end())
+  {
+    if (!b->second.is<std::string>() ||
+        b->second.get<std::string>().size() > INLINE_KEYFRAME_MAX_TEXT)
+      return std::nullopt;
+    auto blob = DecodeInlineKeyframe(b->second.get<std::string>(), info.size);
+    if (!blob)
+      return std::nullopt;
+    info.inline_blob = std::move(*blob);
+  }
+  info.names = NamesFromJson(d);
+  if (const auto version = Int(d, "nv", 0, MAX_FRAME))
+    info.names_version = *version;
+  return info;
 }
 
 bool TicketAllowsDirect(const picojson::object& reply)
@@ -2582,16 +2721,9 @@ struct YouGameRoom::Impl
         if (const auto offer = offers.find(peer.slot);
             offer != offers.end() && peer.heard && !peer.sent_packet)
         {
-          picojson::object d;
-          d["k"] = picojson::value("kf");
-          d["f"] = picojson::value(static_cast<double>(offer->second.frame));
-          d["id"] = picojson::value(offer->second.id);
-          d["n"] = picojson::value(static_cast<double>(offer->second.size));
-          d["x"] = picojson::value(offer->second.hash);
-          d["key"] = picojson::value(offer->second.key);
-          d["nm"] = NamesToJson(offer->second.names);
-          d["nv"] = picojson::value(static_cast<double>(offer->second.names_version));
-          SendTo(id, d);
+          // With a small replay inline (`b`), the offer is all a joiner needs
+          // (KeyframeOfferToJson).
+          SendTo(id, KeyframeOfferToJson(offer->second));
         }
       }
     }
@@ -3070,28 +3202,18 @@ struct YouGameRoom::Impl
       // Only from the host, to a joiner.
       if (!peer.drop_in_host || !joining)
         return;
-      KeyframeInfo info;
-      const auto frame = Int(d, "f", 0, MAX_FRAME);
-      // YouGame's store accepts at most 128 MB.
-      const auto size = Int(d, "n", 1, 128 << 20);
-      info.id = Str(d, "id");
-      info.hash = Str(d, "x");
-      info.key = Str(d, "key");
-      if (!frame || *frame > MAX_REPLAY_FRAMES || !size || !ValidReplayId(info.id) ||
-          info.hash.size() != 16 || info.key.size() != 64 ||
-          info.id != fmt::format("replay-{}-{}", *frame, info.hash.substr(0, 8)))
+      // The same offer comes every second until this player's first packet: once is enough.
+      if (peer.keyframe && peer.keyframe->id == Str(d, "id"))
+        return;
+      // A malformed offer, or a replay inline that's too long or not what it says, is ignored.
+      std::optional<KeyframeInfo> info = KeyframeOfferFromJson(d);
+      if (!info)
       {
+        WARN_LOG_FMT(NETPLAY, "Orca room: ignored a malformed keyframe offer from the host");
         return;
       }
-      info.frame = *frame;
-      info.size = static_cast<u64>(*size);
-      info.names = NamesFromJson(d);
-      if (const auto version = Int(d, "nv", 0, MAX_FRAME))
-        info.names_version = *version;
-      if (peer.keyframe && peer.keyframe->id == info.id)
-        return;
-      peer.keyframe = info;
-      Emit({PeerEvent::Kind::Keyframe, peer.slot, true, peer.name, {}, info});
+      peer.keyframe = *info;
+      Emit({PeerEvent::Kind::Keyframe, peer.slot, true, peer.name, {}, std::move(*info)});
       return;
     }
     if (kind == "dl" || kind == "dlc" || kind == "dlr")

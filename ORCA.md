@@ -56,7 +56,13 @@ and why. Paths are relative to `Source/Core/Core/` unless they start with `Sourc
 
 Orca builds like Dolphin (CMake). The targets that matter are `dolphin-emu-nogui` (what the YouGame
 desktop app runs) and `tests`. On macOS, `Tools/orca-package-macos.sh` makes **Orca.app**, the
-bundle the desktop app starts.
+bundle the desktop app starts. On Linux (x86-64), `Tools/orca-package-linux.sh` makes the
+`Orca/` folder the app's `linux-x64` build unpacks: `Orca/orca` (the NoGUI program), `Sys/`
+and the licences. It builds with no Qt, Vulkan, ALSA, PulseAudio (Cubeb opens the system's sound
+server itself, so its PulseAudio headers must be there at build time), BlueZ, evdev or libudev,
+links libstdc++ statically, and refuses a program that needs a library beyond glibc, X11 and
+EGL/OpenGL, one that lacks X11, Xi or EGL, or a glibc newer than `ORCA_GLIBC_MAX` (2.35, Ubuntu
+22.04's). Build it on a distribution that old, with GCC 12 or newer, so it runs on the ones since.
 
 Differences from a stock Dolphin build:
 
@@ -275,6 +281,37 @@ with dev tickets (nothing is recorded). Each takes one to three minutes.
 All take `<dolphin-emu-nogui> <disc>`, and `--pplus "<dir>/Project+ Netplay Launcher.dol"` for
 Project+.
 
+### Match start timing
+
+How long a queue match takes from "matched" (the page's `/match` socket) to both players in control
+on the room's character select, phase by phase. `Tools/orca/match-latency.mjs` drives two headless
+Orcas through YouGame's real queue, rooms and keyframe store as the desktop app's page does (the
+in-process bridge of `queue-e2e.mjs`), as two `/sandbox` roster players, N matches in a row; it
+records every line both print, with times. `match-latency-report.mjs` cuts each match into phases
+(the matched room's ticket, the room connect, the host's fresh start and unseen hold, the replay's
+way over, the joiner's rebuild and catch-up, both picks) and prints p50/p90 per phase, the replay's
+size and whether it went inline or through the store, and fails the run (exit 1) on any broken join:
+a replay that didn't reproduce the host's game, `orca error mismatch`, `not_seated`, the host's header
+never landing, a live frame moved, or a desync. `--max-p50`/`--max-p90`/`--min-ok` gate the total.
+
+```bash
+node Tools/orca/match-latency-session.mjs <YouGame checkout> <sess> cy di   # roster cookies, mode 600
+ML_BIN=<Orca> ML_BUILD=<version>:<commit> ML_DISC=<Brawl> ML_PPLUS=<dol> ML_SESS=<sess> \
+  Tools/orca/match-latency-run.sh perf cb10 casual brawl 10 [--gap 90]
+node Tools/orca/match-latency-report.mjs [--detail] match-latency-runs/cb10
+```
+
+- `match-latency-run.sh <check|perf> <tag> <casual|ranked|friends> <brawl|pplus> <n>`: both Orcas on
+  this Mac, through `run-lock.py` (`perf` for timing, on AC power), SDL HIDAPI off, and the test mark
+  `ORCA_TEST_NET_DELAY_MS=0`, so test Orcas only meet each other.
+- `match-latency-xplat.sh`: one Orca on the Mac and one on a PC over SSH (`match-latency-pc.ps1`
+  there); `MACLAG=<s>` makes the PC host.
+- `--gap <s>` idles between matches so the rooms Worker's isolates go cold, as between real
+  players' matches; `--video Metal --shots 100` adds a screenshot request every 100 ms, and
+  `match-latency-shots.py <run>` turns them into the frozen-picture gaps and contact sheets.
+- Both Mac sides share one machine and one network (a direct link of ~0 ms); a PC on the same LAN
+  adds a slower machine, not a longer path.
+
 ### Release checklist
 
 Every release candidate passes, for Brawl and for Project+:
@@ -296,7 +333,8 @@ Every release candidate passes, for Brawl and for Project+:
    (both Orcas print `K checksums matched` with K > 0), no `Desync at frame`, no `orca error`. A
    sync test runs one game against itself, so only this shows races between two peers' messages.
 6. **Mac and PC:** `xplat.py` with one Orca on each. Two Orcas on one machine share a compiler, an
-   architecture and a JIT; only this run sees two builds disagree.
+   architecture and a JIT; only this run sees two builds disagree. A release with a Linux build also
+   runs `xplat.py` between Linux and the PC: GCC builds that one, MSVC the PC's.
 
 Releases that could affect netcode performance also run a two-Orca performance comparison against
 the live build.
@@ -474,6 +512,15 @@ same move from its own origin. So is a new seed for the game's random numbers
   until the costume matches; at most 10 s, and the player's controller takes over once a session
   starts. These are ordinary inputs, recorded and sent as such. The opponent's pick is steered in as
   before.
+- **Unseen hold.** That hold and steer run unseen and unthrottled too, like the tail (`FreshUnseen`,
+  at most `FRESH_UNSEEN_LIMIT` = 120 frames past the tail, then the rest shows as before): the
+  host's picture comes back with its pick already in, about a second sooner on a Mac, and its
+  keyframe follows at the next boundary. Unlike the tail these are first runs: the hook writes and
+  records the room's header and the steer's inputs as always (`SoloQuiet` lets the header in while
+  the port catches up only here, `HeaderFreeWhileCatchingUp`), so the joiner replays exactly what it
+  did before, only sooner. Its boundaries don't count toward the header's limit until the header
+  is in (`HeaderWaitAt`), so a queue room never fails sooner in real time, and no stats line counts
+  them. A friend's fresh start has no hold.
 - **What it costs.** The host's picture holds for the restore and the tail (a few hundred frames,
   unthrottled). Its history restarts, so a join replays only the tail, the header and the seconds
   since: how long either player played before no longer matters. After a queue room the player's own
@@ -646,6 +693,16 @@ dev tickets.
 - **GET** streams with `Content-Length` (for join progress); Orca checks size and hash, then
   decrypts. 404 `gone` means expired.
 - **DELETE** by the joiner after rebuilding, best effort; by the host when replacing or leaving.
+- **Inline replays.** A sealed replay of at most `INLINE_KEYFRAME_MAX` (32 KB) never goes to the store:
+  it travels in the room's `kf` offer itself (`b`, base64, `KeyframeOfferToJson`), so a queue match
+  (a few KB) makes no PUT, GET or DELETE. The joiner refuses an offer whose `b` is longer than
+  `INLINE_KEYFRAME_MAX_TEXT`, isn't the canonical base64 of exactly `n` bytes, or comes with `n` over
+  the cap, before decoding anything (`KeyframeOfferFromJson`), and checks the bytes exactly as a
+  download (`OpenKeyframe`: size, hash, decryption, unpacking). Only the room's host sends a `kf` a
+  joiner reads (`drop_in_host`), as before; the relay delivers it only to sockets the room admitted,
+  and the room's pause still stops it. A larger replay (a host with a long history since its last
+  start) goes through the store as before. `ORCA_TEST_INLINE=off` (a test knob) sends every replay
+  through the store.
 - Network errors, 429 and 5xx retry 4 times with 0.5/1/2 s backoff; anything else is final. A host
   whose keyframe is refused for good (a refusal with YouGame's code; a bare 4xx from the edge only
   fails that keyframe) makes no more for the friends waiting: it drops them with
@@ -659,7 +716,8 @@ Relayed `msg` (`Orca/Session/YouGameRoom.cpp`):
 
 - `hello {c, r, h, dl}`: key, heard-you, is-host, offers direct links. Sent until answered.
 - `dl`, `dlc`, `dlr`: direct-link signalling, only between two Orcas that both offered links.
-- `kf {f, id, n, x, key}`: the keyframe offer, every second until the joiner's first packet.
+- `kf {f, id, n, x, key, nm, nv, b?}`: the keyframe offer, every second until the joiner's first
+  packet; `b` is the sealed replay itself when it is small enough (Keyframe store, "Inline replays").
 - `drop {r}`: the host unplugged this joiner (`desync`, `stalled`, `network`).
 - `p`: session packets. `q` is the sender's packet count; a stale copy still contributes inputs,
   acknowledgements and checksums, never roster or timing. Drop-in adds `ro` (roster), `ha`
@@ -1803,7 +1861,7 @@ overlay docks its lines on the bar instead), native words on the results screen,
 
 The YouGame desktop app shows Orca inside its own window, at the page's player box, using the same
 line protocol as its libretro host. Code: `Source/Core/DolphinNoGUI/Embed.*`, `Platform.cpp`
-(commands), `PlatformWin32.cpp` and `PlatformMacos.mm` (the window). Test hosts:
+(commands), `PlatformWin32.cpp`, `PlatformMacos.mm` and `PlatformX11.cpp` (the window). Test hosts:
 `Tools/orca/embed-test-host.m` (macOS) and `embed-test-host-win.cpp`.
 
 ```
@@ -1812,7 +1870,8 @@ Orca --embed --parent <handle> --rect X Y W H [-u <user>] -e <disc> [-C ...]
 
 - `--parent`: on Windows the HWND as a decimal number; on macOS the window's **CGWindowID** (in
   Electron, the middle field of `win.getMediaSourceId()`), since an `NSView*` means nothing to
-  another process.
+  another process; on Linux the X11 window id (Electron's `getNativeWindowHandle()` when the app
+  runs as an X11 client: the YouGame app always does, through XWayland on a Wayland desktop).
 - Orca never shows dialogs while embedded: alerts go to stderr. stdin must stay open; a closed stdin
   means the app is gone, and Orca quits. When the app's window goes away without a `quit`, Orca
   stops too.
@@ -1827,8 +1886,10 @@ Orca --embed --parent <handle> --rect X Y W H [-u <user>] -e <disc> [-C ...]
 **Coordinates** are physical pixels (the box's CSS pixels times `devicePixelRatio`). On Windows
 `rect` is relative to the parent's client area and Orca's window is a `WS_CHILD`, so it moves and
 clips with the parent. On macOS `rect` is relative to the parent's frame (title bar included; the app
-adds the title bar's height to Y), and Orca polls the window's bounds at 120 Hz. The app sends `rect`
-only when the box moves inside the window.
+adds the title bar's height to Y), and Orca polls the window's bounds at 120 Hz. On Linux `rect` is
+relative to the parent X window (the app adds its menu bar's height to Y) and Orca's window is its
+child, so it moves, clips and hides with it as on Windows. The app sends `rect` only when the box
+moves inside the window.
 
 ### stdin
 
@@ -1875,7 +1936,7 @@ never pauses Orca: the page sends `blur`, the player's pad goes neutral, and the
 | `state running` / `state paused` | The answer to `pause` and `resume`. |
 | `unsupported <command> [N]` | A refused command. Not an error. |
 | `key escape` / `key fullscreen` | Windows only, if Orca's window somehow has the keyboard. |
-| `orca click` | Windows only: a mouse press on Orca's window, which the page never sees; the app focuses its page and sends `focus`. |
+| `orca click` | Windows only: a mouse press on Orca's window, which the page never sees; the app focuses its page and sends `focus`. On macOS and Linux the press reaches the page. |
 | `error <sentence>` | Something failed. Each `orca error` also gets an `error` twin. |
 | `orca state <state>` / `orca error <code> <sentence>` | Session status (`Orca/Status.h`). Forward every line that starts with `orca `. |
 | `orca menu ...`, `orca result ...`, `orca queue ...` | See [Online menu](#online-menu) and [Matchmaking](#matchmaking-and-results). |
@@ -1936,6 +1997,26 @@ background input, so that rule always applies.
   through (`ignoresMouseEvents`). Orca reads the keyboard from the HID state and pads through SDL;
   input counts while the last command was `focus`, the view is shown and the app is frontmost. The
   page sends `blur` when it wants keys for itself.
+- **Linux:** as on macOS, Orca never takes the keyboard or the mouse: its child window has an empty
+  input shape (the pointer passes through it, and through the GL child inside it, to the app's
+  window) and selects no key or button events, so the page sees clicks on the picture itself (no
+  `orca click`). The page sends the keyboard as a pad, as
+  on Windows. Input counts while the last command was `focus`, the view is shown and the X server
+  has the keyboard in the app's window (its focus events, checked twice a second too).
+
+### Linux window behaviour
+
+Orca's window is an X11 child of the app's window, in a 24-bit visual of its own (so the app's
+window may have any depth), black until the first frame and raised above the app's other children
+on every `rect` and `show`; Dolphin's GL context makes its own child inside it
+(`Common/GL/GLX11Window.cpp`, which no longer discards the connection's queued events: it shares
+the connection with the main loop). The app forces
+itself onto X11 (`--ozone-platform=x11`), so a Wayland desktop runs both through XWayland. X errors
+are logged to stderr instead of ending Orca, because the app's window can go away between two
+requests that name it (the first 20, then one in a thousand); Orca stops when that window is
+destroyed, as on Windows. While Orca's window is hidden or the app's window is not viewable
+(minimized, another workspace: checked twice a second too), the presenter is told the surface is
+out of sight. With `ORCA_TEST_COMMANDS` and no embedding, the window commands do nothing.
 
 ### macOS window behaviour
 
@@ -1970,6 +2051,16 @@ so. Since 0.3.35; before, a refused resize ended Orca (exit `0x80000003`).
 ## Changes by release
 
 What each release changed for players, in plain words.
+
+### 0.3.38
+
+- **Matches start about 2 seconds sooner.** Once the queue finds you an opponent, you are both in
+  control of your fighters about 2 seconds earlier, and the player joining sees "Opponent found ·
+  joining" and the opponent's name while the match loads.
+- **Linux: an experimental build.** The YouGame app on Linux (x86-64, X11 or XWayland) can now run
+  Orca inside its window. It is an early test and may still have problems.
+- **Small fixes from upstream Dolphin.** A crash when the system's language setting is invalid, a
+  counter overflow in the graphics statistics, and extra checks in the GameCube microphone.
 
 ### 0.3.37
 

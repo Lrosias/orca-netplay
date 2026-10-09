@@ -82,8 +82,6 @@ struct KeyframeJob
   Orca::Net::KeyframeInfo info;
   double capture_ms = 0, pack_ms = 0, put_ms = 0;
   u64 raw_size = 0;
-  // NAND bytes sent as hashes only; the joiner's own boot writes them.
-  u64 referenced = 0;
   // The header generation wanted at capture (UX/OnlineRules.h WantedGeneration).
   u64 generation = 0;
   std::string error;
@@ -288,6 +286,11 @@ struct Match
     // Frames in a row the tail has seen the character select up.
     int css_streak = 0;
     Clock::time_point started{};
+    // A queue room's hold and steer run unseen past the tail (FreshUnseen): whether they still do,
+    // how many frames have, and when the tail ended.
+    bool unseen = false;
+    int unseen_frames = 0;
+    Clock::time_point tail_end{};
   };
   std::optional<Fresh> fresh;
   // ORCA_TEST_FAST_UNTIL: solo frames run unthrottled, until then or the first fresh start or
@@ -477,6 +480,31 @@ bool InTail(const Match& match)
   return match.fresh && match.fresh->phase == Match::Fresh::Phase::Tail;
 }
 
+// A queue room's fresh start runs its hold or steer unseen and unthrottled (FreshUnseen).
+bool Unseen(const Match& match)
+{
+  return match.fresh && match.fresh->unseen && !InTail(match) && match.port &&
+         match.port->CatchingUp();
+}
+
+// The unseen hold or steer is over: from the next frame the game shows and keeps time again.
+void ShowFresh(Match& match, const char* why)
+{
+  if (!match.fresh || !match.fresh->unseen)
+    return;
+  Match::Fresh& fresh = *match.fresh;
+  fresh.unseen = false;
+  if (!InTail(match) && match.port)
+    match.port->SetCatchingUp(false);
+  // The stats line's frame rate starts over: the unseen frames weren't this machine's pace.
+  match.stats_frame = -1;
+  NOTICE_LOG_FMT(ROLLBACK,
+                 "Drop-in: the fresh start shows again at frame {} after {} unseen "
+                 "frames past its tail ({:.0f} ms){}{}",
+                 match.running + 1, fresh.unseen_frames, MsSince(fresh.tail_end), why ? ": " : "",
+                 why ? why : "");
+}
+
 // A round-trip sample the session has not seen yet (the room numbers its samples).
 std::optional<int> NewRoundTrip(u32* last_sequence)
 {
@@ -533,6 +561,7 @@ Orca::Net::Config SessionConfig()
 // hook, with every earlier frame final.
 void StartKeyframe(Core::System& system, Match& match, int frame)
 {
+  const auto capture_start = Clock::now();
   auto job = std::make_unique<KeyframeJob>();
   job->frame = frame;
   // The replay holds this game's frames from its origin (or its last fresh start) on.
@@ -551,11 +580,13 @@ void StartKeyframe(Core::System& system, Match& match, int frame)
   auto& memory = system.GetMemory();
   replay.target_hash = RamChecksum({memory.GetRAM(), memory.GetRamSize()},
                                   {memory.GetEXRAM(), memory.GetEXRAM() ? memory.GetExRamSize() : 0});
+  job->capture_ms = MsSince(capture_start);
   KeyframeJob* const raw = job.get();
   Orca::Net::KeyframeStore* const store = match.store.get();
   raw->thread = std::thread([raw, store, replay = std::move(replay)] {
     try
     {
+      const auto pack_start = Clock::now();
       std::vector<u8> blob = Orca::Net::PackKeyframe(raw->frame, replay);
       raw->raw_size = replay.frames.size() * sizeof(Orca::Net::ReplayFrame);
       if (blob.empty())
@@ -565,15 +596,28 @@ void StartKeyframe(Core::System& system, Match& match, int frame)
       }
       if (raw->error.empty() && !Orca::Net::EncryptKeyframe(raw->frame, &blob, &raw->info.key))
         raw->error = "encryption failed";
+      raw->pack_ms = MsSince(pack_start);
       if (raw->error.empty())
       {
         raw->info.frame = raw->frame;
         raw->info.size = blob.size();
         raw->info.hash = Orca::Net::KeyframeHash(blob);
         raw->info.id = fmt::format("replay-{}-{}", raw->frame, raw->info.hash.substr(0, 8));
-        raw->ok = store->Put(raw->info, blob, &raw->error);
-        if (!raw->ok)
-          raw->refusal = Orca::Net::LastRefusal();
+        if (Orca::Net::InlineKeyframe(blob.size()))
+        {
+          // Small enough to travel in the room's offer itself (Keyframe.h INLINE_KEYFRAME_MAX):
+          // nothing goes to the store, so there is nothing to delete later either.
+          raw->info.inline_blob = std::move(blob);
+          raw->ok = true;
+        }
+        else
+        {
+          const auto put_start = Clock::now();
+          raw->ok = store->Put(raw->info, blob, &raw->error);
+          raw->put_ms = MsSince(put_start);
+          if (!raw->ok)
+            raw->refusal = Orca::Net::LastRefusal();
+        }
       }
     }
     catch (const std::exception&)
@@ -653,16 +697,36 @@ void StepTail(Match& match, int frame)
   }
   NOTICE_LOG_FMT(ROLLBACK, "Drop-in: the fresh start's tail ran frames {}-{} in {:.0f} ms",
                  match.origin_frame, frame, MsSince(fresh.started));
-  match.port->SetCatchingUp(false);
   // The readers start over on the character select, silently.
   Orca::Events::NoteResync();
   match.stats_frame = -1;
-  // A queue room's host holds port 1 until the room's header is in (FreshPad); a friend's fresh
-  // start is over.
+  // A queue room's host holds port 1 until the room's header is in, then puts its own pick back
+  // (FreshPad), still unseen and unthrottled (FreshUnseen); a friend's fresh start is over.
   if (fresh.queue)
+  {
     fresh.phase = Match::Fresh::Phase::Hold;
+    fresh.unseen = FreshUnseen(true, 0);
+    fresh.unseen_frames = 0;
+    fresh.tail_end = Clock::now();
+    if (!fresh.unseen)
+      match.port->SetCatchingUp(false);
+  }
   else
+  {
+    match.port->SetCatchingUp(false);
     match.fresh.reset();
+  }
+}
+
+// One frame of the unseen hold or steer ran: past FRESH_UNSEEN_LIMIT the rest shows as before.
+void StepUnseen(Match& match)
+{
+  if (!match.fresh || !match.fresh->unseen || InTail(match))
+    return;
+  Match::Fresh& fresh = *match.fresh;
+  ++fresh.unseen_frames;
+  if (!FreshUnseen(fresh.queue, fresh.unseen_frames))
+    ShowFresh(match, "its unseen frames ran out");
 }
 
 void RunSolo(Match& match, const std::function<Pad(int)>& local_pad)
@@ -702,6 +766,8 @@ void RunSolo(Match& match, const std::function<Pad(int)>& local_pad)
   match.port->SetPads(frame, pads);
   match.log.push_back(pads);
   match.running = frame;
+  // Before StepTail: the tail's own last frame isn't one of the unseen hold's.
+  StepUnseen(match);
   StepTail(match, frame);
   // No keyframe stored or in progress: only the newest frames can serve the next, so cap the log.
   if (!match.keyframe && !match.job && match.log.size() > 4 * KEYFRAME_FRESH_FRAMES)
@@ -771,6 +837,14 @@ std::unique_ptr<Orca::Net::KeyframeStore> MakeStore()
       });
 }
 
+// Deletes a keyframe from the store, unless it travelled inline in the room's offer and so was
+// never stored (Keyframe.h INLINE_KEYFRAME_MAX).
+void DeleteStored(Match& match, const Orca::Net::KeyframeInfo& info)
+{
+  if (match.store && info.inline_blob.empty())
+    match.store->Delete(info.id);
+}
+
 // The fresh start's hold or steer is over (a tail always runs to its end: StepTail).
 void EndFresh(Match& match, const char* why)
 {
@@ -782,6 +856,8 @@ void EndFresh(Match& match, const char* why)
                              "({})",
                    match.running + 1, why);
   }
+  // An unseen hold or steer ends with it: the player sees and plays from this frame.
+  ShowFresh(match, nullptr);
   if (match.fresh->phase == Match::Fresh::Phase::Steer)
     Orca::UX::Queue::DisarmOwnPick();
   match.fresh.reset();
@@ -796,8 +872,8 @@ void ResetDropIn(Match& match)
   match.fresh_pending = 0;
   match.fresh_queue_armed = false;
   EndFresh(match, "the room is left");
-  if (match.keyframe && match.store)
-    match.store->Delete(match.keyframe->id);
+  if (match.keyframe)
+    DeleteStored(match, *match.keyframe);
   match.keyframe.reset();
   if (match.store)
     match.store->Cancel();
@@ -883,8 +959,7 @@ void DropStaleKeyframe(Match& match)
   }
   NOTICE_LOG_FMT(ROLLBACK, "Drop-in: keyframe of frame {} dropped: made for another header",
                  match.keyframe->frame);
-  if (match.store)
-    match.store->Delete(match.keyframe->id);
+  DeleteStored(match, *match.keyframe);
   match.keyframe.reset();
   if (!match.waiting.empty())
     match.keyframe_wanted = true;
@@ -894,7 +969,9 @@ void DropStaleKeyframe(Match& match)
 bool SoloQuiet(const Match& match)
 {
   return match.started && !match.finished && match.port && !match.session && !match.joining &&
-         !match.download && !match.job && match.plugging.empty() && !match.port->CatchingUp();
+         !match.download && !match.job && match.plugging.empty() &&
+         (!match.port->CatchingUp() ||
+          HeaderFreeWhileCatchingUp(Unseen(match), InTail(match), match.joining));
 }
 
 // Host of a queue room whose game never carried the room's header while the opponent waited: the
@@ -1095,6 +1172,7 @@ void BecomeSolo(Match& match, const char* why, const char* state, bool own_boot 
   match.last_percent = -1;
   match.later_names.reset();
   OSD::DiscardTypedMessage(OSD::MessageType::OrcaJoin);
+  Orca::UX::Search::JoinOver();
   match.port->SetCatchingUp(false);
   ResetDropIn(match);
   if (!keep_room)
@@ -1257,15 +1335,14 @@ void HostEvents(Core::System& system, Match& match)
     else
     {
       NOTICE_LOG_FMT(ROLLBACK,
-                     "Drop-in: keyframe of frame {}: {:.1f} MB raw ({:.1f} MB of NAND named, not "
-                     "sent), {:.1f} MB stored; capture {:.1f} ms, pack and compress {:.0f} ms, "
-                     "store {:.0f} ms",
-                     job->frame, job->raw_size / 1e6, job->referenced / 1e6, job->info.size / 1e6,
-                     job->capture_ms,
-                     job->pack_ms, job->put_ms);
+                     "Drop-in: keyframe of frame {}: {} bytes raw, {} bytes {}; capture {:.1f} ms, "
+                     "pack and encrypt {:.1f} ms, store {:.0f} ms",
+                     job->frame, job->raw_size, job->info.size,
+                     job->info.inline_blob.empty() ? "stored" : "inline in the room's offer",
+                     job->capture_ms, job->pack_ms, job->put_ms);
       // An earlier keyframe nobody took (say, an invite not accepted yet) is replaced.
-      if (match.keyframe && match.store)
-        match.store->Delete(match.keyframe->id);
+      if (match.keyframe)
+        DeleteStored(match, *match.keyframe);
       match.keyframe = job->info;
       match.keyframe_generation = job->generation;
       if (!match.session && job->frame >= match.log_base &&
@@ -1347,10 +1424,9 @@ void HostEvents(Core::System& system, Match& match)
   const u64 generation = Orca::UX::Rules::WantedGeneration();
   const bool in_place = Orca::UX::Rules::HeaderInPlace();
   // A fresh start's tail can't write the header (it runs as a re-run), so its boundaries don't
-  // count toward the header's limit.
-  const HeaderWait header = InTail(match) ? HeaderWait::Wait :
-                                            StepHeaderWait(&match.header_waited, in_place,
-                                                           !match.waiting.empty(), InQueueRoom());
+  // count toward the header's limit; nor do its unseen hold's, which run unthrottled.
+  const HeaderWait header = HeaderWaitAt(&match.header_waited, InTail(match), Unseen(match),
+                                         in_place, !match.waiting.empty(), InQueueRoom());
   if (header == HeaderWait::Fail)
   {
     FailHeaderWait(match);
@@ -1507,13 +1583,24 @@ void StartDownload(Match& match, const Orca::Net::KeyframeInfo& info)
     {
       const auto start = Clock::now();
       std::string error;
-      auto blob = store->Get(
-          raw->info,
-          [raw](u64 done, u64 total) {
-            raw->percent = static_cast<int>(done * 100 / std::max<u64>(total, 1));
-            return !raw->cancel.load();
-          },
-          &error);
+      std::optional<std::vector<u8>> blob;
+      if (!raw->info.inline_blob.empty())
+      {
+        // It came inline in the host's offer (Keyframe.h INLINE_KEYFRAME_MAX): the same checks
+        // follow as for a download.
+        blob = raw->info.inline_blob;
+        raw->percent = 100;
+      }
+      else
+      {
+        blob = store->Get(
+            raw->info,
+            [raw](u64 done, u64 total) {
+              raw->percent = static_cast<int>(done * 100 / std::max<u64>(total, 1));
+              return !raw->cancel.load();
+            },
+            &error);
+      }
       raw->transfer_ms = MsSince(start);
       if (!blob)
       {
@@ -1521,21 +1608,12 @@ void StartDownload(Match& match, const Orca::Net::KeyframeInfo& info)
         raw->refusal = Orca::Net::LastRefusal();
         raw->done = true;
         return;
-    }
-    std::vector<u8> plain = std::move(*blob);
-    if (Orca::Net::KeyframeHash(plain) != raw->info.hash ||
-        !Orca::Net::DecryptKeyframe(raw->info.frame, raw->info.key, &plain))
-    {
-      raw->error = "the keyframe arrived damaged";
-      raw->done = true;
-      return;
-    }
-    const auto unpack_start = Clock::now();
-    raw->ok = Orca::Net::UnpackKeyframe(plain, &raw->frame, &raw->replay) &&
-              raw->frame == raw->info.frame;
-    raw->unpack_ms = MsSince(unpack_start);
-    if (!raw->ok)
-      raw->error = "the keyframe doesn't unpack";
+      }
+      // Downloaded or inline, the same checks: size, hash, decryption, unpacking.
+      const auto unpack_start = Clock::now();
+      raw->ok = Orca::Net::OpenKeyframe(raw->info, std::move(*blob), &raw->frame, &raw->replay,
+                                        &raw->error);
+      raw->unpack_ms = MsSince(unpack_start);
     }
     catch (const std::exception&)
     {
@@ -1624,8 +1702,9 @@ JoinPump PumpJoin(Match& match, std::string* last_status)
         match.host_holding = false;
         match.offered_time = Clock::now();
         match.host_seat = event.seat;
-        NOTICE_LOG_FMT(ROLLBACK, "Drop-in: the host offers keyframe {} (frame {}, {:.1f} MB)",
-                       event.keyframe.id, event.keyframe.frame, event.keyframe.size / 1e6);
+        NOTICE_LOG_FMT(ROLLBACK, "Drop-in: the host offers keyframe {} (frame {}, {} bytes, {})",
+                       event.keyframe.id, event.keyframe.frame, event.keyframe.size,
+                       event.keyframe.inline_blob.empty() ? "from the store" : "inline");
         StartDownload(match, event.keyframe);
       }
     }
@@ -1807,8 +1886,8 @@ std::optional<int> FreshStart(Core::System& system, Match& match)
   }
   system.GetJitInterface().ClearSafe();
   // A keyframe of the game left behind serves nobody now.
-  if (match.keyframe && match.store)
-    match.store->Delete(match.keyframe->id);
+  if (match.keyframe)
+    DeleteStored(match, *match.keyframe);
   match.keyframe.reset();
   match.keyframe_wanted = !match.waiting.empty();
   match.header_waited = 0;
@@ -1933,6 +2012,8 @@ Load LoadKeyframe(Core::System& system, Match& match, int* frame_out)
   Orca::UX::Tracker().Reset();
   Orca::Events::NoteResync();
   Orca::UX::Rules::MemoryReplaced();
+  // The host's game is here: the next picture shown is the room's select, not this player's own.
+  Orca::UX::Search::JoinOver();
   *frame_out = match.origin_frame;
   return Load::Done;
 }
@@ -1941,8 +2022,7 @@ void FinishReplay(Match& match)
 {
   const Download& download = *match.replaying;
   const int frame = download.frame;
-  if (match.store)
-    match.store->Delete(download.info.id);
+  DeleteStored(match, download.info);
   match.local_seat = Orca::Online::Seat();
   if (match.later_names && match.later_names->names_version > download.info.names_version)
     SetNames(match, *match.later_names);
@@ -2242,8 +2322,13 @@ void JoinInPlay(Match& match, const std::string& code)
   ResetDropIn(match);
   ForgetRoom(match);
   match.linger_until.reset();
-  // A queue match: the join's own messages replace the search's.
+  // A queue match: the join's own messages replace the search's, and the overlay says the opponent
+  // was found until the host's game is loaded (queue2 searches from the queue's own select, which
+  // Search doesn't track, so the queue's state counts too).
+  const bool queued = QueueOrSearch();
   Orca::UX::Search::Matched(false);
+  if (queued)
+    Orca::UX::Search::JoinStarted();
   Orca::Online::ShutdownInBackground();
   Orca::Online::StartRoom(code, true);
   NOTICE_LOG_FMT(ROLLBACK, "Drop-in: joining room {} during play, frame {}", code, match.running + 1);
@@ -3520,8 +3605,9 @@ std::optional<int> Boundary(Core::System& system,
     if (!match.session)
     {
       RunSolo(match, local_pad);
-      // A fresh start's tail runs unthrottled: its frames aren't this machine's frame rate.
-      if (!InTail(match))
+      // A fresh start's tail and unseen hold run unthrottled: their frames aren't this machine's
+      // frame rate.
+      if (!InTail(match) && !Unseen(match))
         PublishStats(match);
       return rewound_to;
     }
@@ -4036,8 +4122,8 @@ void End(const char* reason)
   match.download.reset();
   match.replaying.reset();
   match.job.reset();
-  if (match.keyframe && match.store)
-    match.store->Delete(match.keyframe->id);
+  if (match.keyframe)
+    DeleteStored(match, *match.keyframe);
   Orca::Online::Shutdown();
 }
 
@@ -4155,6 +4241,24 @@ u8 FriendsFreshExit(std::optional<bool> css_pick_ranked)
   if (!css_pick_ranked)
     return Orca::Net::MENU_EXIT_FRIENDS;
   return *css_pick_ranked ? Orca::Net::MENU_EXIT_RANKED : Orca::Net::MENU_EXIT_CASUAL;
+}
+
+bool FreshUnseen(bool queue_room, int frames)
+{
+  return queue_room && frames < FRESH_UNSEEN_LIMIT;
+}
+
+bool HeaderFreeWhileCatchingUp(bool unseen_hold, bool in_tail, bool joining)
+{
+  return unseen_hold && !in_tail && !joining;
+}
+
+HeaderWait HeaderWaitAt(int* waited, bool in_tail, bool unseen, bool in_place, bool someone_waiting,
+                        bool queue_room)
+{
+  if (in_tail || (unseen && !in_place))
+    return HeaderWait::Wait;
+  return StepHeaderWait(waited, in_place, someone_waiting, queue_room);
 }
 
 HeaderWait StepHeaderWait(int* waited, bool in_place, bool someone_waiting, bool queue_room)

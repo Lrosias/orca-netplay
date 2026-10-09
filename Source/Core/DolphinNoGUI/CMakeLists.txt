@@ -10,6 +10,12 @@ add_executable(dolphin-nogui
 if(X11_FOUND)
   target_sources(dolphin-nogui PRIVATE PlatformX11.cpp)
   target_link_libraries(dolphin-nogui PRIVATE PkgConfig::XRANDR PkgConfig::X11)
+  # Orca: the embedded view's empty input shape (PlatformX11.cpp InitEmbedded).
+  pkg_check_modules(XEXT xext IMPORTED_TARGET)
+  if(XEXT_FOUND)
+    target_compile_definitions(dolphin-nogui PRIVATE HAVE_XSHAPE=1)
+    target_link_libraries(dolphin-nogui PRIVATE PkgConfig::XEXT)
+  endif()
 endif()
 
 if(WIN32)

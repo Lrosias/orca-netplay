@@ -81,14 +81,26 @@ enum class State
   Found,
 };
 void Begin(bool ranked);
-// The app matched this game: Found when hosting, None when joining.
+// The app matched this game: Found when hosting, None when joining. A joiner that was searching
+// shows "Opponent found · joining <host>…" (Joining) until JoinOver, so its own select's search
+// lines don't stay up while the host's game comes over.
 void Matched(bool hosting);
-// The opponent plugged in, the app ended the search, or the room went away.
+// The opponent plugged in, the app ended the search, or the room went away. Ends Joining too.
 void End();
 State Current();
 bool Ranked();
+// A matched join began while this player was searching or on the queue's own select: the overlay
+// says the opponent was found until JoinOver (or End).
+void JoinStarted();
+// A joiner's "Opponent found" lines are up: from a matched join until the host's game is loaded
+// (JoinOver) or the join ends. Display only: Current() stays None meanwhile.
+bool Joining();
+// The joiner loaded the host's game, or its join ended.
+void JoinOver();
 // The overlay's two lines (empty: nothing to show).
 std::pair<std::string, std::string> Lines();
+// Lines() for the joining state, given the host's name (empty while the room hasn't named it).
+std::pair<std::string, std::string> JoiningLines(const std::string& host, bool ranked);
 }  // namespace Search
 
 class OnlineMenuReader

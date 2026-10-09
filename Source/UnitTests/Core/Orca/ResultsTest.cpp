@@ -476,6 +476,40 @@ TEST(OrcaMatchmakingMenu, TheSearchLinesFollowTheQueue)
   EXPECT_EQ(Search::Current(), Search::State::None);
 }
 
+// A matched joiner sees that the opponent was found from its `join` until the host's game is loaded
+// (or the join ends), over its own select's search lines; Current() stays None meanwhile, so
+// nothing that reads the search state changes.
+TEST(OrcaMatchmakingMenu, AMatchedJoinerSaysTheOpponentWasFound)
+{
+  Search::End();
+  Search::Begin(false);
+  Search::Matched(false);
+  EXPECT_EQ(Search::Current(), Search::State::None);
+  EXPECT_TRUE(Search::Joining());
+  // No room yet: the host has no name.
+  EXPECT_EQ(Search::Lines().first, "Opponent found · joining their game…");
+  EXPECT_EQ(Search::JoiningLines("Cy", false),
+            (std::pair<std::string, std::string>{"Opponent found · joining Cy…", ""}));
+  EXPECT_EQ(Search::JoiningLines("Cy", true).second, "RANKED BETA");
+  Search::JoinOver();
+  EXPECT_FALSE(Search::Joining());
+  EXPECT_TRUE(Search::Lines().first.empty());
+  // The queue's own select (queue2) searches without Search: the join says so all the same.
+  Search::Matched(false);
+  EXPECT_FALSE(Search::Joining());
+  Search::JoinStarted();
+  EXPECT_TRUE(Search::Joining());
+  Search::End();
+  EXPECT_FALSE(Search::Joining());
+  // A new search, or hosting, is never "joining".
+  Search::JoinStarted();
+  Search::Begin(true);
+  EXPECT_FALSE(Search::Joining());
+  Search::Matched(true);
+  EXPECT_FALSE(Search::Joining());
+  Search::End();
+}
+
 TEST(OrcaMatchmakingMenu, HostIsACapResultsOnlyWithAVerifiedReader)
 {
   // No profile here: host is offered, results is not.

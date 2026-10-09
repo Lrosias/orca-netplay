@@ -58,6 +58,12 @@ std::string KeyframeHash(const std::vector<u8>& blob);
 bool EncryptKeyframe(int frame, std::vector<u8>* blob, std::string* key_hex);
 bool DecryptKeyframe(int frame, const std::string& key_hex, std::vector<u8>* blob);
 
+// A joiner's checks on the host's encrypted replay, whether downloaded from the store or inline in
+// the offer (KeyframeInfo::inline_blob): the size and hash the offer named, decryption with its
+// key, and unpacking at its frame. False, with `error` saying which, on any mismatch.
+bool OpenKeyframe(const KeyframeInfo& info, std::vector<u8> blob, int* frame, ReplayArchive* replay,
+                  std::string* error);
+
 // Where keyframes travel: the host puts one, the joiner gets it, and it's deleted once loaded. Put
 // and Get block, so call them on their own thread; the progress callback can return false to abort.
 // Delete never blocks.

@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <picojson.h>
@@ -70,7 +71,28 @@ struct KeyframeInfo
   // The host's count of changes to `names` (Session::RequireValues). Players acknowledge the newest
   // they hold, and the host plugs a newcomer in only once every player holds its values.
   int names_version = 0;
+  // The encrypted replay itself, when it is small enough to travel in the offer (`kf` field `b`,
+  // INLINE_KEYFRAME_MAX) instead of through YouGame's store; empty otherwise. The joiner checks it
+  // exactly as a download: size, hash, then decryption and unpacking.
+  std::vector<u8> inline_blob;
 };
+
+// A small replay travels inline in the room's `kf` offer instead of through YouGame's keyframe
+// store: at most this many bytes of the encrypted blob, as base64 at most INLINE_KEYFRAME_MAX_TEXT
+// characters, so the offer stays well under the rooms Worker's 64 KB cap on an Orca `msg` (its
+// ORCA_MESSAGE_BYTES). A queue match's replay is a few KB; a larger one (a host with a long history
+// since its last start) still goes through the store.
+constexpr size_t INLINE_KEYFRAME_MAX = 32 * 1024;
+constexpr size_t INLINE_KEYFRAME_MAX_TEXT = (INLINE_KEYFRAME_MAX + 2) / 3 * 4;
+// Whether a keyframe of `size` bytes travels inline. ORCA_TEST_INLINE=off (a test knob,
+// UX/Probe.h TestKnobsAllowed) sends every one through the store.
+bool InlineKeyframe(u64 size);
+// Standard base64 with padding.
+std::string EncodeInlineKeyframe(const std::vector<u8>& blob);
+// The blob from `text`, only if `size` is at most INLINE_KEYFRAME_MAX, `text` is exactly the
+// canonical base64 length of `size` bytes (checked before anything is decoded), and it decodes to
+// exactly `size` bytes; otherwise nothing.
+std::optional<std::vector<u8>> DecodeInlineKeyframe(std::string_view text, u64 size);
 
 // Max wire size of a port's controls (UX/NameTags.h's profile is 46).
 constexpr size_t MAX_CONTROLS = 64;
@@ -293,6 +315,12 @@ bool DecodePacket(const std::string& json, Packet* packet);
 // read; oversized or non-hex controls or queue identities are treated as none.
 picojson::value NamesToJson(const std::vector<KeyframeInfo::Name>& names);
 std::vector<KeyframeInfo::Name> NamesFromJson(const picojson::object& message);
+// The host's keyframe offer, the room's "kf" message (exposed for tests): {k, f, id, n, x, key, nm,
+// nv}, plus `b` with the replay inline (InlineKeyframe). Reading refuses the whole offer when a
+// field is malformed, or when `b` is too long for INLINE_KEYFRAME_MAX, isn't the base64 of exactly
+// `n` bytes, or comes with an `n` over INLINE_KEYFRAME_MAX.
+picojson::object KeyframeOfferToJson(const KeyframeInfo& info);
+std::optional<KeyframeInfo> KeyframeOfferFromJson(const picojson::object& message);
 // A packet from a direct link to the player at `slot`: as through the relay, only for that player's
 // own seat, and never with drop-in history (only the relay carries that, in order).
 bool DecodeDirectPacket(const std::string& payload, int slot, Packet* packet);

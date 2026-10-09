@@ -632,6 +632,23 @@ std::string KeyframeHash(const std::vector<u8>& blob)
   return fmt::format("{:016x}", XXH3_64bits(blob.data(), blob.size()));
 }
 
+bool OpenKeyframe(const KeyframeInfo& info, std::vector<u8> blob, int* frame, ReplayArchive* replay,
+                  std::string* error)
+{
+  if (blob.size() != info.size || KeyframeHash(blob) != info.hash ||
+      !DecryptKeyframe(info.frame, info.key, &blob))
+  {
+    *error = "the keyframe arrived damaged";
+    return false;
+  }
+  if (!UnpackKeyframe(blob, frame, replay) || *frame != info.frame)
+  {
+    *error = "the keyframe doesn't unpack";
+    return false;
+  }
+  return true;
+}
+
 namespace
 {
 // LastRefusal, per thread: the job and the download threads each read their own.

@@ -185,3 +185,54 @@ TEST(OrcaFreshStart, AFriendLandsOnTheSelectTheHostIsOn)
   EXPECT_FALSE(Orca::Net::ValidMenuExit(0));
   EXPECT_FALSE(Orca::Net::ValidMenuExit(24));
 }
+
+// A queue room's host runs its hold for the room's header and its own pick being put back unseen
+// and unthrottled, like the tail, but never longer than FRESH_UNSEEN_LIMIT frames; a friend's fresh
+// start has neither, so nothing of it runs unseen past the tail.
+TEST(OrcaFreshStart, AQueueHostsHoldAndSteerRunUnseenUpToALimit)
+{
+  for (int frames = 0; frames < FRESH_UNSEEN_LIMIT; ++frames)
+    EXPECT_TRUE(FreshUnseen(true, frames)) << frames;
+  EXPECT_FALSE(FreshUnseen(true, FRESH_UNSEEN_LIMIT));
+  EXPECT_FALSE(FreshUnseen(true, FRESH_UNSEEN_LIMIT + 1000));
+  EXPECT_FALSE(FreshUnseen(false, 0));
+  // About two seconds at 60 fps, well past the ~70 frames the steer takes, far short of the
+  // steer's own 10 s limit, which would freeze the picture for seconds.
+  EXPECT_GE(FRESH_UNSEEN_LIMIT, 100);
+  EXPECT_LE(FRESH_UNSEEN_LIMIT, 180);
+}
+
+// The header goes in during the unseen hold (it is a first run, so the hook writes and records it),
+// never in a tail (a re-run) or a joiner's rebuild.
+TEST(OrcaFreshStart, TheHeaderGoesInOnlyDuringTheUnseenHold)
+{
+  EXPECT_TRUE(HeaderFreeWhileCatchingUp(true, false, false));
+  EXPECT_FALSE(HeaderFreeWhileCatchingUp(false, false, false));
+  EXPECT_FALSE(HeaderFreeWhileCatchingUp(true, true, false));
+  EXPECT_FALSE(HeaderFreeWhileCatchingUp(true, false, true));
+  EXPECT_FALSE(HeaderFreeWhileCatchingUp(false, true, true));
+}
+
+// The queue room's header limit counts only boundaries that run at the game's pace: a tail's and
+// an unseen hold's don't count, so the join never fails sooner in real time because they ran
+// unthrottled. Once the header is in, the hold is ready at once, unseen or not.
+TEST(OrcaFreshStart, UnseenBoundariesNeverCountTowardTheHeaderLimit)
+{
+  int waited = 0;
+  for (int i = 0; i < 10 * HEADER_FAIL_BOUNDARIES; ++i)
+  {
+    ASSERT_EQ(HeaderWaitAt(&waited, true, false, false, true, true), HeaderWait::Wait);
+    ASSERT_EQ(HeaderWaitAt(&waited, false, true, false, true, true), HeaderWait::Wait);
+  }
+  EXPECT_EQ(waited, 0);
+  EXPECT_EQ(HeaderWaitAt(&waited, false, true, true, true, true), HeaderWait::Ready);
+  // Shown again with the header still not in: the usual limit, counted from there.
+  for (int i = 0; i < HEADER_FAIL_BOUNDARIES; ++i)
+    ASSERT_EQ(HeaderWaitAt(&waited, false, false, false, true, true), HeaderWait::Wait) << i;
+  EXPECT_EQ(HeaderWaitAt(&waited, false, false, false, true, true), HeaderWait::Fail);
+  // Unchanged outside a fresh start: a friends room makes the keyframe anyway after its wait.
+  waited = 0;
+  for (int i = 0; i < HEADER_WAIT_BOUNDARIES; ++i)
+    ASSERT_EQ(HeaderWaitAt(&waited, false, false, false, true, false), HeaderWait::Wait) << i;
+  EXPECT_EQ(HeaderWaitAt(&waited, false, false, false, true, false), HeaderWait::Ready);
+}

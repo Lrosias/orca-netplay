@@ -26,7 +26,8 @@ struct Rect
 struct Options
 {
   bool enabled = false;
-  // HWND on Windows, CGWindowID (the window number) on macOS, as a decimal number.
+  // HWND on Windows, CGWindowID (the window number) on macOS, the X11 window id on Linux, as a
+  // decimal number.
   unsigned long long parent = 0;
   Rect rect;
   // The requested --rect was TooSmall, so rect was raised to MIN_SIDE and the view starts hidden.

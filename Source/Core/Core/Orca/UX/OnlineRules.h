@@ -177,7 +177,7 @@ struct CssToken
   bool in_hand = true;   // +0x1F8
   bool flying = false;   // +0x1F9: moving up or down
   // Placed on a character and still: B picks it up.
-  bool Down() const { return valid && human && character != 0x28 && !in_hand && !flying; }
+  constexpr bool Down() const { return valid && human && character != 0x28 && !in_hand && !flying; }
   bool operator==(const CssToken&) const = default;
 };
 // Port `port`'s (0-3) token on the character select; invalid anywhere else.

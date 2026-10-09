@@ -102,6 +102,8 @@ add_library(common
   Lazy.h
   LinearDiskCache.h
   UnixUtil.h
+  LocaleUtil.cpp
+  LocaleUtil.h
   Logging/ConsoleListener.h
   Logging/Log.h
   Logging/LogManager.cpp

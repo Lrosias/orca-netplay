@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -459,6 +460,189 @@ TEST(OrcaKeyframe, EncryptionRoundTripsAndRefusesTampering)
   EXPECT_FALSE(DecryptKeyframe(77, key, &opened));
   opened = sealed;
   EXPECT_FALSE(DecryptKeyframe(77, key.substr(0, 63) + "g", &opened));
+}
+
+namespace
+{
+// A sealed replay of `frames` frames as the host offers it: packed, encrypted and named.
+KeyframeInfo Sealed(int frames, std::vector<u8>* blob_out = nullptr)
+{
+  std::vector<u8> blob = PackKeyframe(frames, Replay(static_cast<size_t>(frames)));
+  KeyframeInfo info;
+  EXPECT_TRUE(EncryptKeyframe(frames, &blob, &info.key));
+  info.frame = frames;
+  info.size = blob.size();
+  info.hash = KeyframeHash(blob);
+  info.id = "replay-" + std::to_string(frames) + "-" + info.hash.substr(0, 8);
+  info.names = {{0, 12, "cy", {}}, {1, 140, "di", {1, 2, 3}}};
+  info.names_version = 2;
+  if (blob_out)
+    *blob_out = blob;
+  return info;
+}
+
+// The offer as the joiner's room reads it back off the wire.
+std::optional<KeyframeInfo> OverTheWire(const picojson::object& offer)
+{
+  const std::string text = picojson::value(offer).serialize();
+  picojson::value parsed;
+  EXPECT_TRUE(picojson::parse(parsed, text).empty());
+  return KeyframeOfferFromJson(parsed.get<picojson::object>());
+}
+}  // namespace
+
+// Base64 as the offer carries it: standard alphabet, padded, and only the canonical text of the
+// stated size decodes.
+TEST(OrcaKeyframe, InlineBase64IsStrict)
+{
+  const std::string foobar = "foobar";
+  for (size_t n = 1; n <= foobar.size(); ++n)
+  {
+    const std::vector<u8> bytes(foobar.begin(), foobar.begin() + n);
+    const std::string text = EncodeInlineKeyframe(bytes);
+    static const char* const want[] = {"Zg==", "Zm8=", "Zm9v", "Zm9vYg==", "Zm9vYmE=", "Zm9vYmFy"};
+    EXPECT_EQ(text, want[n - 1]);
+    const auto decoded = DecodeInlineKeyframe(text, n);
+    ASSERT_TRUE(decoded) << text;
+    EXPECT_EQ(*decoded, bytes);
+    // The wrong size, even by one, decodes nothing.
+    EXPECT_FALSE(DecodeInlineKeyframe(text, n + 1));
+    if (n > 1)
+      EXPECT_FALSE(DecodeInlineKeyframe(text, n - 1));
+  }
+  std::mt19937 rng(7);
+  for (const size_t n :
+       {size_t{2}, size_t{3}, size_t{1000}, INLINE_KEYFRAME_MAX - 1, INLINE_KEYFRAME_MAX})
+  {
+    std::vector<u8> bytes(n);
+    for (u8& b : bytes)
+      b = static_cast<u8>(rng());
+    const std::string text = EncodeInlineKeyframe(bytes);
+    EXPECT_EQ(text.size(), (n + 2) / 3 * 4);
+    EXPECT_LE(text.size(), INLINE_KEYFRAME_MAX_TEXT);
+    const auto decoded = DecodeInlineKeyframe(text, n);
+    ASSERT_TRUE(decoded) << n;
+    EXPECT_EQ(*decoded, bytes) << n;
+  }
+  // Not base64, padding inside or misplaced, padding bits set, URL-safe letters, whitespace.
+  for (const char* bad :
+       {"Zm9v!g==", "Zg=v", "Z===", "Zh==", "Zm9=", "Zm-v", "Zm_v", "Zm9 ", "Zm9v\n"})
+  {
+    EXPECT_FALSE(DecodeInlineKeyframe(bad, 3)) << bad;
+    EXPECT_FALSE(DecodeInlineKeyframe(bad, 1)) << bad;
+  }
+  EXPECT_FALSE(DecodeInlineKeyframe("", 0));
+}
+
+// The host sends a replay of at most INLINE_KEYFRAME_MAX bytes in the offer itself, and a larger
+// one through the store; the offer with it fits the rooms Worker's 64 KB Orca message cap.
+TEST(OrcaKeyframe, ASmallReplayTravelsInTheOffer)
+{
+  EXPECT_FALSE(InlineKeyframe(0));
+  EXPECT_TRUE(InlineKeyframe(1));
+  EXPECT_TRUE(InlineKeyframe(INLINE_KEYFRAME_MAX));
+  EXPECT_FALSE(InlineKeyframe(INLINE_KEYFRAME_MAX + 1));
+  EXPECT_FALSE(InlineKeyframe(u64{128} << 20));
+
+  // A queue match's replay: a fresh start's ~140 frames are a few KB sealed.
+  std::vector<u8> blob;
+  KeyframeInfo info = Sealed(140, &blob);
+  EXPECT_LT(blob.size(), INLINE_KEYFRAME_MAX / 2) << blob.size();
+  info.inline_blob = blob;
+  std::optional<KeyframeInfo> got = OverTheWire(KeyframeOfferToJson(info));
+  ASSERT_TRUE(got);
+  EXPECT_EQ(got->frame, info.frame);
+  EXPECT_EQ(got->id, info.id);
+  EXPECT_EQ(got->size, info.size);
+  EXPECT_EQ(got->hash, info.hash);
+  EXPECT_EQ(got->key, info.key);
+  EXPECT_EQ(got->names, info.names);
+  EXPECT_EQ(got->names_version, info.names_version);
+  EXPECT_EQ(got->inline_blob, blob);
+  int frame = -1;
+  ReplayArchive replay;
+  std::string error;
+  ASSERT_TRUE(OpenKeyframe(*got, got->inline_blob, &frame, &replay, &error)) << error;
+  EXPECT_EQ(frame, 140);
+  EXPECT_EQ(replay.frames.size(), 140u);
+
+  // Without `b` the offer is the store's, as before.
+  info.inline_blob.clear();
+  got = OverTheWire(KeyframeOfferToJson(info));
+  ASSERT_TRUE(got);
+  EXPECT_TRUE(got->inline_blob.empty());
+  EXPECT_EQ(picojson::value(KeyframeOfferToJson(info)).serialize().find("\"b\""),
+            std::string::npos);
+
+  // The largest inline offer, with every port named, stays well under 64 KB.
+  KeyframeInfo big = info;
+  big.size = INLINE_KEYFRAME_MAX;
+  big.inline_blob.assign(INLINE_KEYFRAME_MAX, 0xAB);
+  for (int seat = 0; seat < 4; ++seat)
+    for (int k = 0; k < 4; ++k)
+      big.names.push_back({seat, k, std::string(64, 'n'), std::vector<u8>(MAX_CONTROLS, 1),
+                           std::vector<u8>(MAX_QUEUE, 2)});
+  picojson::object wire;
+  wire["t"] = picojson::value("msg");
+  wire["to"] = picojson::value(std::string(64, 'p'));
+  wire["d"] = picojson::value(KeyframeOfferToJson(big));
+  EXPECT_LT(picojson::value(wire).serialize().size(), 56u * 1024);
+}
+
+// The joiner refuses an inline replay before decoding it when it is longer than the cap allows or
+// than the size the offer states, and refuses the whole offer then (so it never joins on it); a
+// tampered one fails the same checks as a damaged download.
+TEST(OrcaKeyframe, AnInlineReplayIsBoundedAndChecked)
+{
+  std::vector<u8> blob;
+  KeyframeInfo info = Sealed(100, &blob);
+  info.inline_blob = blob;
+  const picojson::object good = KeyframeOfferToJson(info);
+  ASSERT_TRUE(OverTheWire(good));
+
+  // Longer than any inline replay may be, whatever `n` says: refused unread.
+  picojson::object offer = good;
+  offer["b"] = picojson::value(std::string(INLINE_KEYFRAME_MAX_TEXT + 4, 'A'));
+  EXPECT_FALSE(OverTheWire(offer));
+  offer["n"] = picojson::value(static_cast<double>(INLINE_KEYFRAME_MAX + 3));
+  EXPECT_FALSE(OverTheWire(offer));
+  // `n` over the cap with `b`: refused, even with text of the right length for it.
+  offer = good;
+  offer["n"] = picojson::value(static_cast<double>(INLINE_KEYFRAME_MAX + 1));
+  offer["b"] = picojson::value(std::string((INLINE_KEYFRAME_MAX + 1 + 2) / 3 * 4, 'A'));
+  EXPECT_FALSE(OverTheWire(offer));
+  // Text that isn't the stated size, isn't base64, or isn't a string.
+  offer = good;
+  offer["b"] = picojson::value(EncodeInlineKeyframe(std::vector<u8>(blob.size() + 3, 1)));
+  EXPECT_FALSE(OverTheWire(offer));
+  offer["b"] = picojson::value(std::string((blob.size() + 2) / 3 * 4, '*'));
+  EXPECT_FALSE(OverTheWire(offer));
+  offer["b"] = picojson::value(1.0);
+  EXPECT_FALSE(OverTheWire(offer));
+
+  // One flipped bit: the offer reads (it is well formed), and the joiner's checks refuse it as a
+  // damaged download.
+  std::vector<u8> tampered = blob;
+  tampered[tampered.size() / 2] ^= 1;
+  offer = good;
+  offer["b"] = picojson::value(EncodeInlineKeyframe(tampered));
+  std::optional<KeyframeInfo> got = OverTheWire(offer);
+  ASSERT_TRUE(got);
+  int frame = -1;
+  ReplayArchive replay;
+  std::string error;
+  EXPECT_FALSE(OpenKeyframe(*got, got->inline_blob, &frame, &replay, &error));
+  EXPECT_EQ(error, "the keyframe arrived damaged");
+  // The right bytes under another key or frame: refused too.
+  got = OverTheWire(good);
+  ASSERT_TRUE(got);
+  got->key[0] = got->key[0] == 'a' ? 'b' : 'a';
+  EXPECT_FALSE(OpenKeyframe(*got, got->inline_blob, &frame, &replay, &error));
+  got = OverTheWire(good);
+  ASSERT_TRUE(got);
+  EXPECT_FALSE(
+      OpenKeyframe(*got, std::vector<u8>(blob.begin(), blob.end() - 1), &frame, &replay, &error));
+  EXPECT_TRUE(OpenKeyframe(*got, got->inline_blob, &frame, &replay, &error)) << error;
 }
 
 // The HTTP store against Tools/orca/fake_keyframes.py (set ORCA_TEST_KEYFRAME_SERVER to its URL):
